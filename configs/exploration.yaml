@@ -1,0 +1,82 @@
+# RAPS contact exploration in WallCabinetTwoItems-v1.
+policy: ppo
+seed: 0
+primitives: 100
+max_primitives_per_episode: 40
+max_low_level_steps_per_episode: 1000
+
+# SAPIEN simulation and rendering.
+sim_backend: cpu
+shader: default
+headless: true
+# Set by policy=visualize to render off-screen frames for a GIF.
+render_mode: null
+pause: false
+
+# Lowering sim_freq reduces PhysX substeps per 20 Hz control action. Keep
+# control_freq fixed so primitive parameters and policy timing do not change.
+sim:
+  sim_freq: 100
+  control_freq: 20
+
+reward:
+  approach_progress: 0.5
+  contact_started: 2.0
+  new_object_contact: 5.0
+  meaningful_contact: 0.2
+  grasp_alignment: 1.0
+  grasped_object: 2.0
+  moved_object: 3.0
+  # Prevent collisions/pushing from earning movement reward before grasping.
+  moved_object_requires_grasp: true
+  primitive_duration: 0.005
+  primitive_timeout: 0.5
+  ee_outside: 1.0
+  contact_force_threshold: 0.0001
+  terminate_when_all_grasped: true
+  terminate_on_object_failure: true
+
+ppo:
+  # PPO needs only one high-level transition and contact labels, not PointWorld frames.
+  record_dense_trajectory: false
+  # Contact/grasp checks are still forced on the final low-level step.
+  contact_check_interval: 2
+  # Each worker owns one independent CPU simulation.
+  num_envs: 4
+  rollout_steps: 64
+  num_updates: 1000
+  hidden_size: 256
+  learning_rate: 0.0003
+  action_std: 0.6
+  gamma: 0.8
+  gae_lambda: 0.95
+  clip_param: 0.2
+  ppo_epochs: 10
+  num_mini_batch: 8
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  # Object-relative state expands the policy input from 32 to 38 dimensions,
+  # so keep its checkpoints separate from prior robot-only policies.
+  checkpoint_dir: logs/ppo_cabinet_object_state_hybrid
+  checkpoint_name: policy.pt
+  # One row per PPO update. contact_rate is the share of high-level
+  # primitives with at least one observed fingertip/object contact.
+  metrics_filename: training_metrics.csv
+  save_interval: 50
+  eval_episodes: 20
+
+scripted:
+  target_object: cabinet_item_16
+  seeds: [0, 1, 2, 3, 4]
+
+visualize:
+  gif_path: artifacts/policy_rollout.gif
+  max_primitives: 40
+  num_rollouts: 5
+  fps: 4
+  deterministic: true
+
+hydra:
+  job:
+    chdir: false

@@ -1,0 +1,32 @@
+# 厨房环境动态配置文件
+
+# 1. 自定义环境配置
+mini_env:
+  enabled: true
+  spawn_pos: [2.0, -1.0]    # 机器人初始 XY 坐标，需要时按场景调整
+  # 场景选择：no_island / island / random
+  scene_mode: no_island
+  layout_ids: [0, 1]        # random 时：0=无岛台，1=有岛台
+  style_ids: [0]            # 0=工业风
+  fixed_base: true           # 固定底盘；动作空间不暴露底盘控制
+  fixed_body: true           # 固定头部和 torso；只暴露 [dx, dy, dz, gripper]
+
+# 物品摆放位置：通过每个物体的 placement.fixture 和 placement.pos 指定
+# largest_counter 会选择隔离区内面积最大的台面，通常就是中间的大桌面。
+placement:
+  fixture: random
+  largest_counter_weight: 8
+
+# 2. 物品清单
+# 每个物体可以单独指定放置家具和局部位置。
+# pos 的范围约为 [-1, 1]：x=-1 左侧，x=0 中间，x=1 右侧；y 同理。
+objects:
+  - group: apple
+    placement:
+      fixture: counter_main
+      pos: [-0.65, 0.0]
+
+  - group: banana
+    placement:
+      fixture: counter_main
+      pos: [0.25, 0.0]

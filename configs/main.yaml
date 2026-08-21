@@ -1,0 +1,274 @@
+# ---------------------------------------------------------
+# ========== Default entry point ==========
+# Run `python main.py` without a subcommand. Change this field to switch the
+# workflow; command-specific parameters remain in the sections below.
+main_command: "collect-raps"
+
+# Export one recorded frame as a standard PLY point cloud.
+raps_visualization:
+  mode: "raw" # raw or processed
+  source_tar: "data/robocasa_raps/bootstrap_train.tar"
+  sample_key: "primitive_000000"
+  frame_index: 0
+  include_robot: true
+  component: "all" # all, scene, or robot
+  max_points: 0 # 0 = keep all valid points
+  output_ply: "logs/collection/head_hand_primitive_000000_frame_00.ply"
+
+# ---------------------------------------------------------
+# ========== RoboCasa Visualization Settings ==========
+# Used by: python main.py robocasa / python main.py collect
+robocasa_visualization:
+  seed: 0
+  object_group: "all"
+  steps: 15000
+  shader: "default" # default / minimal / rt / rt-fast
+  sim_backend: "auto" # auto / cpu / gpu
+  render_backend: "gpu" # gpu / cpu / none
+  pause: false
+  explorer: "primitive" # primitive / random
+  primitive_seed: 0
+  primitive_verbose: true
+  # Agent-centric RAPS actions: no object ID or simulator object pose is used.
+  primitive_weights:
+    move_delta_ee_pose: 0.15
+    top_grasp: 0.10
+    lift: 0.12
+    drop: 0.08
+    move_left: 0.10
+    move_right: 0.10
+    move_forward: 0.10
+    move_backward: 0.10
+    open_gripper: 0.05
+    close_gripper: 0.10
+
+# ---------------------------------------------------------
+# ========== RAPS Bootstrap Collection ==========
+# All bootstrap collection parameters live here.  The normal entry point is
+# simply `python main.py`; set main_command above to select this workflow.
+raps_collection:
+  enabled: True
+  env_id: "RoboCasaKitchenCustom-v1"
+  num_primitives: 1       # one-sample camera/PCL preprocessing smoke test
+  horizon: 11              # PointWorld temporal contract
+  seed: 0
+  test_split_ratio: 0.2
+  max_primitives_per_episode: 40
+  max_low_level_steps_per_episode: 1000
+  # Robot-centric collection: exclude the global base_camera.
+  camera_names:
+    - fetch_head
+    - fetch_hand
+  # Diagnostic point-cloud GIFs, one file per collected primitive.
+  save_gif: false
+  gif_dir: "logs/collection"
+  gif_fps: 5
+  gif_max_points: 12000
+  gif_point_size: 2.0
+  object_group: "all"
+  kitchen_config: "configs/kitchen_custom.yaml"
+  train_tar: "data/robocasa_raps/bootstrap_train.tar"
+  test_tar: "data/robocasa_raps/bootstrap_test.tar"
+  # Temporary preprocessing smoke-test checkpoint. It is not Fetch-trained;
+  # it only supplies PointWorld's model/config contract while the Fetch
+  # canonical scene/robot fields are generated.
+  pointworld_checkpoint: "PointWorld/train_logs/pointworld_maniskill_peg_small_balanced/model-last.pt"
+  sim_backend: "auto"
+  render_backend: "gpu"
+
+# ---------------------------------------------------------
+# ========== Pipeline Settings ==========
+# train / eval / curriculum_preview
+pipeline_mode: "eval"
+collect_data: true # true 时，train 模式先采集当前 curriculum，再开始训练
+# eval 时要加载的 PointWorld 实验目录名；null 时回退到下面的 exp_name。
+# 对应模型路径：PointWorld/<log_dir>/<eval_exp_name>/model-last.pt
+eval_exp_name: null
+eval_viz_num: 10 # 跑验证时可视化的样本数量，-1 表示关闭可视化，正数（如 10）表示开启并在浏览器查看
+eval_viz_gif: False # true: 离线生成多帧 GIF；false: 使用网页端 Viser 查看
+eval_viz_gif_fps: 5.0
+
+# Curriculum random-policy GIF preview. Used when pipeline_mode is
+# "curriculum_preview". Set output_dir to null for an automatic timestamp dir.
+curriculum_preview_stage: "all" # all / grasp_contact / object_transport / insertion_boundary
+curriculum_preview_num_episodes: 5
+# null means use episode_len - 1 (11 frames -> 10 actions per episode).
+curriculum_preview_steps_per_episode: 50
+curriculum_preview_fps: 8
+curriculum_preview_seed: 42
+curriculum_preview_output_dir: null # e.g. "logs/my_curriculum_gifs"
+curriculum_preview_sim_backend: "auto" # auto / cpu / gpu
+curriculum_preview_render_backend: "gpu" # cpu / gpu
+
+# ---------------------------------------------------------
+# ========== Data Collection Settings ==========
+# Set to one of: grasp_contact / object_transport / insertion_boundary.
+# Keep null to use the original full-task collection below.
+curriculum_stage: null
+# Optional automatic continual-learning order. When non-null, run_pipeline.py
+# iterates this list, collects each stage (if collect_data=true), trains it, and
+# passes its model-last.pt to the next stage. Keep null for single-stage mode.
+curriculum_env_list:
+  - grasp_contact
+  - object_transport
+  - insertion_boundary
+curriculum_skip_existing_data: true
+curriculum_save_root: "data/PegInsertionSide-curricula"
+# Pure random mini-env policy: every action comes from env.action_space.sample().
+# The successful demo is used only to reset into the selected phase; its actions are never replayed.
+curriculum_policy: "random" # random / curriculum (curriculum = demo action + noise)
+curriculum_control_mode: "pd_joint_delta_pos"
+curriculum_action_noise: 0.003 # only used when curriculum_policy is "curriculum"
+require_curriculum_success: true
+max_collection_attempts_multiplier: 5
+# Optional external initialization checkpoint. Keep null for a self-contained
+# continual-learning loop: stage 1 starts from scratch when its own checkpoint
+# is absent, while later stages chain from the previous stage automatically.
+curriculum_resume_from: null
+# If true, resume an interrupted checkpoint already present in the current
+# continual stage folder. If false, ignore that folder and start the stage
+# from the previous stage checkpoint (or curriculum_resume_from for stage 1).
+curriculum_resume_existing: true
+# Defaults to "${exp_name}_${curriculum_stage}" when null.
+curriculum_exp_name: null
+# Keep false when resuming so all stages use the original normalization contract.
+curriculum_regenerate_norm_stats: false
+# Automatic current/replay mixture. The current stage receives this share and
+# the remaining share is sampled uniformly from the global replay reservoir.
+# The first stage automatically uses 100% current-stage data.
+curriculum_current_data_weight: 0.5
+
+# Fast end-to-end pipeline check. It uses separate *_smoke checkpoint folders,
+# so it cannot overwrite the formal continual-learning experiments. Set false
+# for the full 5000-transition / 5000-step experiment below.
+curriculum_smoke_test: False
+curriculum_smoke_num_transitions: 100
+curriculum_smoke_train_steps: 20
+# Pipeline smoke tests accept every rollout so random-policy success filtering
+# cannot prevent the infrastructure check from completing.
+curriculum_smoke_require_success: false
+
+# Log all curriculum stages into one continuous W&B run. The generated run ID
+# is persisted under PointWorld/<log_dir>/<run_name>[_smoke]/wandb_run_id.txt,
+# allowing an interrupted pipeline to resume the same W&B run.
+curriculum_wandb_single_run: true
+curriculum_wandb_run_name: "pointworld_peg_continual"
+curriculum_wandb_run_id: null
+
+# Explicit continual-learning experiment/folder names. These become directories
+# under PointWorld/<log_dir>/ and are chained automatically in env-list mode.
+curriculum_exp_names:
+  grasp_contact: "pointworld_peg_continual_grasp"
+  object_transport: "pointworld_peg_continual_transport"
+  insertion_boundary: "pointworld_peg_continual_insertion"
+
+# General continual-learning optimizer-step budget applied to every stage.
+# Loading a checkpoint from a different stage starts stage_step at 0; loading
+# the same stage resumes from its saved stage_step.
+curriculum_train_steps: 10000
+curriculum_base_lr: 0.0005
+continual_reapply_lr: true
+
+# Global bounded historical replay. All historical train samples compete for
+# one stratified reservoir; test samples are never scanned or replayed. Within
+# the moved/static strata, samples use standard reservoir replacement. Capacity
+# is measured in T=11 WDS sequences (1200 = 12000 saved transitions).
+# Historical source weights are derived from retained counts.
+continual_replay_enabled: true
+replay_population: "stratified_reservoir"
+replay_total_capacity: 1200
+# Requested composition inside the global reservoir.
+replay_moved_fraction: 0.7
+replay_static_fraction: 0.3 # Documentation/check only; equals 1 - moved_fraction.
+replay_motion_threshold: 0.005 # A point moved >= 5 mm between adjacent frames.
+replay_moved_min_point_fraction: 0.01 # Moved episode if >=1% points move in any frame.
+replay_seed: 42
+replay_manifest_dir: "data/replay_manifests"
+# Primary collection budgets. One T=11 sequence contains 10 transitions.
+# General saved-transition budget applied independently to every curriculum stage.
+curriculum_num_transitions: 5000
+# Full target-env baseline budget. 15000 equals the total budget of 3 × 5000
+# curriculum transitions, so both experiments save 13500 train + 1500 test
+# transitions when test_split_ratio=0.1.
+target_num_transitions: 15000
+
+# Legacy/fallback episode controls. They are used only when the corresponding
+# transition budget above is null. In expert replay mode, num_episodes is also
+# the maximum number of source demonstrations available to inspect.
+curriculum_num_episodes: null
+num_episodes: 300
+episode_len: 11          # MUST BE 11! PointWorld hardcodes a Linear layer for T=11 (10 future frames).
+test_split_ratio: 0.1    # Episode-level split: 100 episodes -> 90 train / 10 test.
+split_seed: 42           # Keeps the selected test episodes deterministic across recollection.
+
+# The curriculum env uses these trajectories only as phase-reset snapshots when
+# curriculum_policy is "random"; demonstration actions are not replayed.
+# Outside curriculum mode, this still enables normal expert dataset replay.
+replay_demo_dir: "/home/siyao/.maniskill/demos/PegInsertionSide-v1/motionplanning"
+
+# Environment settings
+env_id: "PegInsertionSide-v1"
+save_dir: "data/PegInsertionSide-v1"
+collect_scene_voxel_size: 0.008 # Collection-time voxel size; smaller keeps denser small-object point clouds.
+collect_max_scene_points: 12000
+# Robot-flow adapter used by PointWorldWrapper: droid_panda / fetch.
+# Keep droid_panda for the current Panda peg-insertion pipeline. For RoboCasa
+# Fetch collection, select fetch and point robot_urdf_path at fetch/fetch.urdf.
+robot_type: "droid_panda"
+robot_urdf_path: "domain/ManiSkill/mani_skill/assets/robots/panda/panda_v2.urdf"
+# ---------------------------------------------------------
+# ========== Visualization Settings ==========
+# Change this to true if you want to verify data alignment in the browser!
+# Once true, run `python main.py collect` and open http://localhost:8090
+visualize_alignment: False # debug the axes misalignment
+visualize_port: 8080
+visualize_point_size: 0.006
+visualize_crop_radius: 0.0
+visualize_show_tcp: false
+visualize_all_steps: true
+visualize_step_stride: 1
+visualize_sample_index: 26
+
+# ---------------------------------------------------------
+# 2. PointWorld Training Parameters
+# ---------------------------------------------------------
+# Model / Network Size (Choices: "tiny", "small", "base", "large")
+ptv3_size: "small"
+predictor_dim: 64
+
+# Optimization & Batching
+batch_size: 8
+max_scene_points: 6000 # PointWorld default is 12000; 6000 keeps more small-object points while staying lighter.
+num_epochs: 50
+base_lr: 0.0001
+weight_decay: 0.01
+# Stabilize the sparse moved-point objective: when a batch contains both
+# groups, allocate 70% of point weight to moved points and 30% to static.
+moved_loss_fraction: 0.7
+
+# One epoch is ceil(4100 / 4) = 1025 train batches. Evaluate the complete
+# 493-sample test split (124 batches) and save once per epoch.
+eval_freq: 1025
+num_train_eval_batches: 10
+num_eval_batches: 124
+save_freq: 1025
+
+# Logging & Environment
+exp_name: "pointworld_maniskill_peg_small_balanced" # model trained on expert traj: "pointworld_maniskill_peg_small_balanced" | curriculum: 
+log_dir: "../logs/pointworld_train"
+data_dirs: "/home/siyao/phd_file/Research/rlPractice/3d_world_model/data/PegInsertionSide-v1"
+domains: "maniskill"
+norm_stats_path: "stats/maniskill_peg"
+# Recompute norm_stats.json from the current train split before training.
+generate_norm_stats: true
+
+# Keep Hydra's own run metadata under the single project log root.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: "logs/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+
+# DDP Configuration
+distributed: "false"
+num_workers: 16

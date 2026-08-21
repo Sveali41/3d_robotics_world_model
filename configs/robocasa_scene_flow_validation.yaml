@@ -1,0 +1,22 @@
+seed: 13
+horizon: 11
+scene_voxel_size: 0.02
+max_scene_points_per_camera: 2500
+robot_points: 500
+cameras:
+  - base_camera
+  - fetch_head
+  - fetch_hand
+thresholds:
+  static_false_motion_max_m: 1.0e-7
+  dynamic_epe_max_m: 2.0e-6
+  rigidity_error_max_m: 2.0e-6
+  translation_error_max_m: 2.0e-6
+  rotation_error_max_m: 2.0e-6
+  robot_scene_leakage_max_points: 0
+  minimum_occluded_existing_points: 1
+  minimum_invalid_depth_existing_points: 1
+  camera_visibility_min:
+    base_camera: 0.05
+    fetch_head: 0.50
+    fetch_hand: 0.30

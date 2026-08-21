@@ -1,0 +1,38 @@
+seed: 7
+num_robot_points: 10000
+camera_names:
+  - fetch_head
+  - fetch_hand
+critical_links:
+  - base_link
+  - torso_lift_link
+  - head_pan_link
+  - head_tilt_link
+  - shoulder_pan_link
+  - shoulder_lift_link
+  - upperarm_roll_link
+  - elbow_flex_link
+  - forearm_roll_link
+  - wrist_flex_link
+  - wrist_roll_link
+  - gripper_link
+  - r_gripper_finger_link
+  - l_gripper_finger_link
+thresholds:
+  base_translation_drift_max_m: 1.0e-6
+  base_rotation_drift_max_rad: 1.0e-6
+  body_joint_drift_max_rad: 1.0e-6
+  link_translation_mae_max_m: 1.0e-5
+  link_translation_max_m: 1.0e-4
+  link_rotation_mean_max_rad: 1.0e-3
+  link_rotation_max_rad: 2.0e-3
+  ee_relative_trajectory_epe_max_m: 2.0e-3
+  robot_point_epe_mean_max_m: 1.0e-5
+  robot_point_epe_max_m: 1.0e-4
+  finger_separation_margin_min_m: 1.0e-3
+  overlay_robot_mask_overlap_min:
+    fetch_head: 0.90
+    fetch_hand: 0.65
+overlay:
+  robot_mask_dilation_pixels: 2
+  projected_point_radius_pixels: 1

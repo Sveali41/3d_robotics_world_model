@@ -18,6 +18,26 @@ import torch
 
 MOVED_OBJECT_THRESHOLD = 0.015
 
+
+def update_cumulative_lifts(reference_heights, before_positions, after_positions,
+                            stable_frames, held_ids):
+    """Track lift from the start of each uninterrupted grasp, not one EE tick."""
+    for object_id in list(reference_heights):
+        if stable_frames.get(object_id, 0) <= 0 or object_id not in after_positions:
+            del reference_heights[object_id]
+    for object_id, frames in stable_frames.items():
+        if frames > 0 and object_id in before_positions and object_id in after_positions:
+            reference_heights.setdefault(object_id, float(before_positions[object_id][2]))
+    displacements = {
+        object_id: float(after_positions[object_id][2]) - height
+        for object_id, height in reference_heights.items()
+    }
+    lifted = sorted(object_id for object_id in held_ids
+                    if stable_frames.get(object_id, 0) >= 4
+                    and displacements.get(object_id, 0.0) >= 0.01)
+    return lifted, displacements
+
+
 SUPPORTED_PRIMITIVE_ROBOTS = ("fetch", "panda")
 _ROBOT_ALIASES = {
     "fetch": "fetch",
@@ -89,9 +109,17 @@ RAPS_PRIMITIVE_SPECS = (
             PrimitiveParameter("dz", 0.12),
         ),
     ),
-    # Kept under the original action index for checkpoint/wrapper
-    # compatibility. In the cabinet task this is a horizontal side grasp.
-    PrimitiveSpec("top_grasp", (PrimitiveParameter("x_forward", 0.25),)),
+    # Cabinet task: horizontal side-grasp. Approach is always along robot-base
+    # +x. The policy learns y_offset and z_offset to aim at the target object
+    # (directly readable from tcp_to_mug / tcp_to_bowl in the observation).
+    PrimitiveSpec(
+        "top_grasp",
+        (
+            PrimitiveParameter("x_forward", 0.35),  # push depth along +x (covers full drift range)
+            PrimitiveParameter("y_offset", 0.20),   # lateral offset to target
+            PrimitiveParameter("z_offset", 0.12),   # vertical offset to target
+        ),
+    ),
     PrimitiveSpec("lift", (PrimitiveParameter("z_dist", 0.16),)),
     PrimitiveSpec("drop", (PrimitiveParameter("z_dist", 0.16),)),
     PrimitiveSpec("move_left", (PrimitiveParameter("y_dist", 0.15),)),
@@ -114,7 +142,7 @@ class RAPSActionSchema:
         self.primitive_names = tuple(spec.name for spec in self.specs)
         self.num_primitives = len(self.specs)
         official_indices = {
-            "move_delta_ee_pose": [0, 1, 2], "top_grasp": [3],
+            "move_delta_ee_pose": [0, 1, 2], "top_grasp": [3, 4, 5],
             "lift": [4], "drop": [5], "move_left": [6], "move_right": [7],
             "move_forward": [8], "move_backward": [9],
             "open_gripper": [], "close_gripper": [],
@@ -212,8 +240,10 @@ class ObjectState:
 class PrimitiveContext:
     """Robot state for control and optional dense-trajectory recording."""
 
-    def __init__(self, env, *, robot: str = "fetch", record_state: bool = True):
+    def __init__(self, env, *, robot: str = "fetch", record_state: bool = True,
+                 project_goals_to_region: bool = False):
         self.env = env.unwrapped if hasattr(env, "unwrapped") else env
+        self.project_goals_to_region = bool(project_goals_to_region)
         self.robot = normalize_primitive_robot(robot)
         self.agent = self.env.agent
         self.arm_controller = self.agent.controller.controllers["arm"]
@@ -242,6 +272,31 @@ class PrimitiveContext:
             ).astype(np.float32)
             self.body_qpos = self._body_qpos()
         self.objects = self._read_objects()
+
+    def project_goal(self, goal: np.ndarray) -> np.ndarray:
+        """Clamp a controller-root goal in the actual cabinet-local volume."""
+        goal = np.asarray(goal, dtype=np.float32)
+        if not self.project_goals_to_region:
+            return goal.copy()
+        if not hasattr(self.env, "cabinet") or not hasattr(
+            self.env, "exploration_region_bounds_local"
+        ):
+            raise RuntimeError(
+                "Goal projection requires cabinet.pose and exploration_region_bounds_local"
+            )
+        root_world = _numpy(
+            self.arm_controller.root_link.pose.to_transformation_matrix()
+        ).reshape(-1, 4, 4)[0]
+        cabinet_world = _numpy(
+            self.env.cabinet.pose.to_transformation_matrix()
+        ).reshape(-1, 4, 4)[0]
+        root_to_cabinet = np.linalg.inv(cabinet_world) @ root_world
+        local = (root_to_cabinet @ np.append(goal, 1.0))[:3]
+        lower, upper = self.env.exploration_region_bounds_local
+        clamped = np.clip(local, lower, upper)
+        if np.array_equal(local, clamped):
+            return goal.copy()
+        return (np.linalg.inv(root_to_cabinet) @ np.append(clamped, 1.0))[:3].astype(np.float32)
 
     def _body_qpos(self) -> np.ndarray:
         controllers = getattr(self.agent.controller, "controllers", {})
@@ -366,6 +421,8 @@ class Primitive:
     def reset(self, context: PrimitiveContext):
         self.steps = 0
         self.status = "running"
+        self.requested_goals = {}
+        self.executed_goals = {}
         self.initial_object_positions = {
             object_id: state.position_root.copy()
             for object_id, state in context.objects.items()
@@ -376,6 +433,19 @@ class Primitive:
         self.grasped_object_ids = set()
         self.stable_grasp_frames = {object_id: 0 for object_id in context.objects}
         self.lifted_object_ids = set()
+        self.initial_object_positions_world = {
+            object_id: state.position_world.copy()
+            for object_id, state in context.objects.items()
+            if hasattr(state, "position_world")
+        }
+
+    def _set_goal(self, context, name: str):
+        requested = np.asarray(getattr(self, name), dtype=np.float32).copy()
+        project = getattr(context, "project_goal", None)
+        executed = project(requested) if project is not None else requested.copy()
+        setattr(self, name, executed)
+        self.requested_goals[name] = requested.tolist()
+        self.executed_goals[name] = executed.tolist()
 
     def observe(self, context: PrimitiveContext) -> dict[str, Any]:
         # Object state is never used to choose or control an action.  It is read
@@ -447,15 +517,41 @@ class Primitive:
             for object_id, force in self.max_finger_contact_force.items()
             if max(force) > 1e-4
         ]
+        held = {
+            object_id
+            for object_id in context.objects
+            if self.stable_grasp_frames.get(object_id, 0) >= 4
+            and context.is_grasping(object_id)
+        }
+        self.lifted_object_ids = set()
         for object_id, initial in self.initial_object_positions.items():
             state = context.objects.get(object_id)
-            if state is None or object_id not in self.grasped_object_ids:
+            if state is None or object_id not in held:
                 continue
             if float(state.position_root[2] - initial[2]) >= 0.01:
                 self.lifted_object_ids.add(object_id)
         return {
             "primitive_type": self.name,
             "parameters": self.parameters,
+            "requested_goals": self.requested_goals,
+            "executed_goals": self.executed_goals,
+            "changed_goal_count": sum(
+                self.requested_goals[name] != goal
+                for name, goal in self.executed_goals.items()
+            ),
+            "initial_object_positions_root": {
+                key: value.tolist() for key, value in self.initial_object_positions.items()
+            },
+            "final_object_positions_root": {
+                key: state.position_root.tolist() for key, state in context.objects.items()
+            },
+            "initial_object_positions_world": {
+                key: value.tolist() for key, value in self.initial_object_positions_world.items()
+            },
+            "final_object_positions_world": {
+                key: state.position_world.tolist() for key, state in context.objects.items()
+                if hasattr(state, "position_world")
+            },
             "high_level_action": self.action.to_vector().tolist(),
             "final_tcp_position": context.ee_position.tolist(),
             "duration_steps": self.steps,
@@ -473,6 +569,7 @@ class Primitive:
                 for object_id in contacted
             },
             "grasped_object_ids": sorted(self.grasped_object_ids),
+            "held_object_ids": sorted(held),
             "lifted_object_ids": sorted(self.lifted_object_ids),
             "stable_grasp_frames": dict(self.stable_grasp_frames),
         }
@@ -487,6 +584,7 @@ class MoveDeltaPrimitive(Primitive):
             [self.parameters["dx"], self.parameters["dy"], self.parameters["dz"]],
             dtype=np.float32,
         )
+        self._set_goal(context, "goal")
         self.max_steps = 100
         self.stage = "move"
 
@@ -511,6 +609,7 @@ class LiftPrimitive(Primitive):
         self.goal = context.ee_position + np.array(
             [0.0, 0.0, abs(self.parameters["z_dist"])], dtype=np.float32
         )
+        self._set_goal(context, "goal")
         self.max_steps = 60
         self.stage = "lift"
 
@@ -535,6 +634,7 @@ class DropPrimitive(Primitive):
         self.goal = context.ee_position + np.array(
             [0.0, 0.0, -abs(self.parameters["z_dist"])], dtype=np.float32
         )
+        self._set_goal(context, "goal")
         self.max_steps = 60
         self.stage = "drop"
 
@@ -585,14 +685,31 @@ class TopGraspPrimitive(Primitive):
 
     def reset(self, context):
         super().reset(context)
-        # The reset pose fixes the Panda wrist horizontally. Approach along
-        # robot-base +x, then close between the fingers; do not descend.
-        self.grasp_goal = context.ee_position + np.array(
-            [abs(self.parameters["x_forward"]), 0.0, 0.0], dtype=np.float32
+        # RAPS-style goal-directed grasp for horizontal cabinet approach.
+        # The approach direction is always robot-base +x (fixed by cabinet
+        # geometry).  PPO learns y_offset and z_offset from the observation
+        # vectors tcp_to_mug / tcp_to_bowl to aim at the desired object.
+        #
+        # Stage 1 "align"  : move EE to (ee_x, ee_y + y_offset, ee_z + z_offset)
+        # Stage 2 "approach": advance +x by x_forward until contact
+        # Stage 3 "close"  : close gripper 30 steps
+        ee = context.ee_position
+        y_offset = float(self.parameters["y_offset"])
+        z_offset = float(self.parameters["z_offset"])
+        x_forward = abs(float(self.parameters["x_forward"]))
+
+        self.align_goal = np.array(
+            [ee[0], ee[1] + y_offset, ee[2] + z_offset], dtype=np.float32
         )
-        self.max_steps = 80
+        self.grasp_goal = np.array(
+            [ee[0] + x_forward, ee[1] + y_offset, ee[2] + z_offset],
+            dtype=np.float32,
+        )
+        self._set_goal(context, "align_goal")
+        self._set_goal(context, "grasp_goal")
+        self.max_steps = 150
         self.close_steps = 0
-        self.stage = "approach"
+        self.stage = "align"
 
     def observe(self, context):
         snapshot = super().observe(context)
@@ -600,8 +717,8 @@ class TopGraspPrimitive(Primitive):
             # Stop as soon as both fingertips have a light contact. Waiting
             # for both sides avoids closing on a one-sided collision while
             # preventing the high-force push seen with the old threshold.
-            for force in self.max_finger_contact_force.values():
-                if float(force[0]) >= 0.05 and float(force[1]) >= 0.05:
+            for state in snapshot["objects"].values():
+                if float(state["left_force"]) >= 0.05 and float(state["right_force"]) >= 0.05:
                     self.stage = "close"
                     break
         return snapshot
@@ -609,6 +726,13 @@ class TopGraspPrimitive(Primitive):
     def next_action(self, context):
         if not self._tick():
             return None
+        if self.stage == "align":
+            action, reached = self._move_to(
+                context, self.align_goal, 1.0, tolerance=0.015, speed=0.30
+            )
+            if reached:
+                self.stage = "approach"
+            return action
         if self.stage == "approach":
             action, reached = self._move_to(
                 context, self.grasp_goal, 1.0, tolerance=0.012, speed=0.08
@@ -616,13 +740,16 @@ class TopGraspPrimitive(Primitive):
             if reached:
                 self.stage = "close"
             return action
+        # stage == "close"
         self.close_steps += 1
         if self.close_steps >= 30:
-            self.status = "success" if self.grasped_object_ids else "no_stable_grasp"
+            held = any(
+                frames >= 4 and context.is_grasping(object_id)
+                for object_id, frames in self.stable_grasp_frames.items()
+            )
+            self.status = "success" if held else "no_stable_grasp"
             return None
-        return np.array(
-            [0.0, 0.0, 0.0, -1.0], dtype=np.float32
-        )
+        return np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 
 
 class DirectionalMovePrimitive(Primitive):
@@ -634,6 +761,7 @@ class DirectionalMovePrimitive(Primitive):
         # Direction is selected by the primitive type; the scalar parameter is
         # a magnitude even though the shared normalized bank spans [-1, 1].
         self.goal = context.ee_position + self.direction * abs(self.parameters[self.parameter_name])
+        self._set_goal(context, "goal")
         self.max_steps = 70
         self.stage = "move"
 

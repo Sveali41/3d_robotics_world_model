@@ -17,17 +17,28 @@ SCRIPTED_MUG_SEQUENCE = (
     # The reset pose is aligned with cabinet_item_16 at seed 0-4:
     # x needs about 10 cm of insertion and z only about 3 cm of correction.
     ("move_delta_ee_pose", {"dx": 0.0, "dy": 0.0, "dz": 0.03}),
-    # Horizontal side grasp: TopGrasp stops on first fingertip contact and
-    # closes while holding the TCP position.
-    ("top_grasp", {"x_forward": 0.10}),
+    # Horizontal side grasp: stop on simultaneous two-finger contact and
+    # close while holding the TCP position.
+    ("top_grasp", {"x_forward": 0.10, "y_offset": 0.0, "z_offset": 0.0}),
     ("lift", {"z_dist": 0.10}),
 )
+
+SCRIPTED_GRASP_SEQUENCES = {
+    "cabinet_item_16": SCRIPTED_MUG_SEQUENCE,
+    "cabinet_item_17": (
+        ("open_gripper", {}),
+        # Grasp the resized bowl above its center to clear the shelf.
+        ("top_grasp", {"x_forward": 0.10, "y_offset": 0.109, "z_offset": 0.02}),
+        ("lift", {"z_dist": 0.10}),
+    ),
+}
 
 
 def run_scripted_grasp(cfg: DictConfig, env_factory: Callable[[DictConfig], object]) -> int:
     """Run a fixed one-object grasp attempt for each configured seed."""
-    env = env_factory(cfg)
     target_object = str(cfg.scripted.target_object)
+    sequence = SCRIPTED_GRASP_SEQUENCES[target_object]
+    env = env_factory(cfg)
     successes = 0
     try:
         for seed in cfg.scripted.seeds:
@@ -38,7 +49,7 @@ def run_scripted_grasp(cfg: DictConfig, env_factory: Callable[[DictConfig], obje
             timeout = False
             final_tcp = None
             for primitive_index, (name, parameters) in enumerate(
-                SCRIPTED_MUG_SEQUENCE, start=1
+                sequence, start=1
             ):
                 action = PrimitiveAction(name, parameters).to_vector()
                 _, _, terminated, truncated, info = env.step(action)

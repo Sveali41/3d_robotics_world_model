@@ -549,7 +549,7 @@ class WallCabinetEnv(BaseEnv):
                         center_height = half_height
                     elif item_kind == 5:
                         # A shallow bowl with a contrasting inner surface.
-                        radius = 0.044
+                        radius = 0.036  # Leave clearance inside Panda's 8 cm opening.
                         half_height = 0.038
                         builder.add_cylinder_collision(
                             pose=upright_cylinder_pose,
@@ -864,13 +864,8 @@ class WallCabinetEnv(BaseEnv):
     def _get_obs_extra(self, info: dict):
         obs = {
             "tcp_pose": self.agent.tcp.pose.raw_pose,
-            "door_angle": info["door_angle"],
         }
         if "state" in self.obs_mode:
-            obs.update(
-                handle_position=info["handle_position"],
-                tcp_to_handle=info["handle_position"] - self.agent.tcp.pose.p,
-            )
             if self._two_item_observation_actors:
                 # PrimitiveContext controls in the arm controller's base
                 # frame. Keep object-relative observations in that same frame

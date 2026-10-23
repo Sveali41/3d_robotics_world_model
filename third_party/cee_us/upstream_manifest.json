@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/martius-lab/cee-us",
+  "commit": "b0beaed1e9c3fe03d99aa300faae063dc208941e",
+  "sha256": {
+    "mbrl/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "mbrl/base_types.py": "6994835ec6c9849e31b92156b013a07a474c647c31ffb530d212ff8e16aecd1e",
+    "mbrl/controllers/__init__.py": "8f7d3dda32c926ed7a0f1a4f64e920fbd7dd7a3308482c929bf23ebbaeff1e0f",
+    "mbrl/controllers/abstract_controller.py": "95e17a2fda7eccc6bd515c33f8349a6b92007b3c76ab4beeb5b6ac78d9ee8e8b",
+    "mbrl/controllers/colored_noise.py": "ac96a9727a7b0abbbf81773d034afefc50628be28d08fb01615675f8b6e20841",
+    "mbrl/controllers/mpc.py": "ddc5066216a8a707a286b85da60b2d5498c50898b7bbe0e34ae12f218020f5e6",
+    "mbrl/controllers/mpc_torch.py": "868254ab3c8903f13b1321fc3dcd6035fe52df789fdc9a8ed01a26586e52e008",
+    "mbrl/controllers/mpc_torch_curiosity.py": "0a625a8b874281ac0d78473b72f9f211b92f48378fc76ef9c6567ec0e184961a",
+    "mbrl/controllers/utils.py": "0f9b356bf425d7bb9ec6266fba0d326fa5281bd200a4a6e1dd17297878446425",
+    "mbrl/environments/__init__.py": "f9884eddde7991b98c2e1643ad7b87e5b3395562b7559c9e62b7d21999bc9770",
+    "mbrl/environments/abstract_environments.py": "7d4a7a57678ba1ffd63435b08d57b5d69a736b703342c535de3c15e055e3dd62",
+    "mbrl/helpers.py": "40683a4d01212710051964b644cde27858dbdc1da577c919eb7b911ad17e8a52",
+    "mbrl/models/__init__.py": "224815dad5bd90cc60b49116f53b9cf86adba96c0861b058f0514f03ea844306",
+    "mbrl/models/abstract_models.py": "6a1d4d8e741618e41da7ca952a26331408c8e61ad2f2a59e246a6445e1b92e02",
+    "mbrl/models/gnn_ensemble.py": "2f4f6e52bb254c9941850b2ab900d33085f86f2838e2d5c28808e5549907ba20",
+    "mbrl/models/spectral_normalization.py": "a1c8c312e9f4db3e2f9efdd67e3c7c33f30eaf09d4cfbc5a00d9bf74f7c61f51",
+    "mbrl/models/torch_parallel_ensembles/__init__.py": "4baa76cfcf2925bbf65f2651207bf2e4b73cf5787b62f94994f6b9972257eb20",
+    "mbrl/models/torch_parallel_ensembles/gnn_modules.py": "729ca2dbeca720edf1db6345f9181b2cea059efff3251f936d27f18aa0e7defb",
+    "mbrl/models/torch_parallel_ensembles/simple.py": "58c94a8c7257f9b41d02c1bf4508e5374f28b36803dc812bc372171da3e79369",
+    "mbrl/models/torch_parallel_ensembles/utils.py": "a695593484c1da77c448bacc65f1358fb1bd6fc1c10c98869639b720f9168585",
+    "mbrl/models/utils.py": "c0b8b1236da5169095cf4ff194880bc0d7b6a07ec1035e05e71c64ac7c327630",
+    "mbrl/rolloutbuffer.py": "0dd5278cf1eaab3a6c4c30c28cd8a9609115ce09b5734bdf37dc152cc9b0772a",
+    "mbrl/torch_helpers.py": "da5e2d935bba2b8846bf4d5c7cb97b3b2cff0a71934f8dfa2332c2d25bb97406"
+  }
+}

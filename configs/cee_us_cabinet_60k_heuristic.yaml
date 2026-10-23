@@ -1,0 +1,22 @@
+# Matched 60k curiosity + object approach progress; contact is measured, not predicted.
+seed: 0
+device: cuda
+bootstrap_steps: 1000
+rounds: 59
+steps_per_round: 1000
+evaluation_steps: 1000
+epochs: 25
+planner_candidates: 128
+execution: cuda_graph
+cpu_threads: 1
+action_mode: ee_delta
+exploration_mode: baseline
+project_goals_to_region: false
+sim_freq: 100
+control_freq: 20
+object_heuristic:
+  approach_weight: 50.0
+  distance_scale_m: 0.1
+  object_weights:
+    cabinet_item_16: 1.0
+    cabinet_item_17: 1.0

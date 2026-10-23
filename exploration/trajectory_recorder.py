@@ -110,6 +110,7 @@ class PrimitiveRecord:
         self,
         low_action: np.ndarray,
         *,
+        full_controller_action: Any = None,
         contact_event: dict[str, Any] | None = None,
     ) -> None:
         """Store PPO reward diagnostics without copying a full simulator state."""
@@ -120,7 +121,12 @@ class PrimitiveRecord:
             raise ValueError(
                 f"low-level RAPS action must be finite shape (4,), got {action.shape}"
             )
+        full_action = np.asarray(action if full_controller_action is None else full_controller_action,
+                                 dtype=np.float32)
+        if full_action.ndim != 1 or not np.isfinite(full_action).all():
+            raise ValueError("full controller action must be a finite one-dimensional array")
         self.low_actions.append(action.copy())
+        self.full_controller_actions.append(full_action.copy())
         self.contact_events.append(copy.deepcopy(contact_event or {}))
 
     def _validate_prefix_lengths(self) -> None:
@@ -155,9 +161,10 @@ class PrimitiveRecord:
     def validate(self, *, finalized: bool = True) -> None:
         """Raise when a primitive record violates its storage contract."""
         action = np.asarray(self.raps_action_normalized)
-        if action.shape != (20,) or not np.isfinite(action).all():
+        expected_shape = (4,) if self.schema_version == "cabinet-ee-delta-v1" else (20,)
+        if action.shape != expected_shape or not np.isfinite(action).all():
             raise RuntimeError(
-                "record RAPS action must be finite shape (20,), "
+                f"record action must be finite shape {expected_shape}, "
                 f"got {action.shape}"
             )
         H = self.duration_low_steps
@@ -197,6 +204,8 @@ class PrimitiveRecord:
             raise RuntimeError("finalized primitive record still has running status")
 
     def phase_view(self, horizon: int = 11) -> dict[str, Any]:
+        if self.schema_version == "cabinet-ee-delta-v1":
+            raise ValueError("ee_delta records are not RAPS PointWorld samples; use raw transitions")
         if horizon < 2:
             raise ValueError("horizon must be at least 2")
         if not self.dense_trajectory:

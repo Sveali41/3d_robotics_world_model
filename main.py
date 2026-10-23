@@ -27,6 +27,14 @@ def build_env(cfg: DictConfig):
     )
     from omegaconf import OmegaConf
 
+    action_mode = str(getattr(cfg, "action_mode", "primitives"))
+    if action_mode not in {"primitives", "ee_delta"}:
+        raise ValueError("action_mode must be primitives or ee_delta")
+
+    exploration_mode = str(getattr(cfg, "exploration_mode", "baseline"))
+    if exploration_mode not in {"baseline", "D"}:
+        raise ValueError("exploration_mode must be baseline or D")
+
     render_mode = cfg.render_mode or (None if cfg.headless else "human")
     base_env = gym.make(
         "WallCabinetTwoItems-v1",
@@ -45,8 +53,12 @@ def build_env(cfg: DictConfig):
     raps_env = RAPSEnvWrapper(
         base_env,
         robot="panda",
+        action_mode=action_mode,
+        project_goals_to_region=(exploration_mode == "D"
+                                or bool(getattr(cfg, "project_goals_to_region", False))),
         max_primitives_per_episode=cfg.max_primitives_per_episode,
         max_low_level_steps_per_episode=cfg.max_low_level_steps_per_episode,
+        max_ee_steps_per_episode=int(getattr(cfg, "max_ee_steps_per_episode", 100)),
         render_during_primitive=not cfg.headless,
         record_dense_trajectory=cfg.ppo.record_dense_trajectory,
         contact_check_interval=cfg.ppo.contact_check_interval,
@@ -54,6 +66,9 @@ def build_env(cfg: DictConfig):
     reward_cfg = ContactExplorationRewardConfig(
         **OmegaConf.to_container(cfg.reward, resolve=True)
     )
+    if exploration_mode == "D":
+        from exploration.contact_reward import interaction_reward_config
+        reward_cfg = interaction_reward_config(reward_cfg)
     return ContactExplorationRewardWrapper(raps_env, reward_cfg)
 
 
@@ -75,6 +90,9 @@ def main(cfg: DictConfig) -> int:
         from exploration.ppo_adapter import run_evaluation
 
         return run_evaluation(cfg, build_env)
+
+    if cfg.policy in {"scripted", "scripted_gif"} and str(cfg.action_mode) != "primitives":
+        raise ValueError("scripted grasp sequences require action_mode=primitives")
 
     if cfg.policy == "scripted":
         from exploration.scripted_grasp import run_scripted_grasp
@@ -104,6 +122,7 @@ def main(cfg: DictConfig) -> int:
     from domain.robocasa.primitives import UniformPrimitiveExplorer
 
     explorer = UniformPrimitiveExplorer(seed=cfg.seed, verbose=False)
+    env.action_space.seed(int(cfg.seed))
     viewer = None
     total_reward = 0.0
 
@@ -118,7 +137,8 @@ def main(cfg: DictConfig) -> int:
             if viewer is not None and viewer.closed:
                 break
 
-            action = explorer.sample_high_level_action()
+            action = (env.action_space.sample() if str(cfg.action_mode) == "ee_delta"
+                      else explorer.sample_high_level_action())
             _, reward, terminated, truncated, info = env.step(action)
             total_reward += float(np.asarray(reward).mean())
             report = info["exploration_reward"]

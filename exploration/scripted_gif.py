@@ -11,7 +11,7 @@ import torch
 from omegaconf import DictConfig
 
 from domain.robocasa.primitives import PrimitiveAction
-from .scripted_grasp import SCRIPTED_MUG_SEQUENCE
+from .scripted_grasp import SCRIPTED_GRASP_SEQUENCES
 
 
 def _frame(value) -> np.ndarray:
@@ -29,13 +29,14 @@ def _frame(value) -> np.ndarray:
 def run_scripted_gif(
     cfg: DictConfig, env_factory: Callable[[DictConfig], object]
 ) -> int:
+    sequence = SCRIPTED_GRASP_SEQUENCES[str(cfg.scripted.target_object)]
     env = env_factory(cfg)
     output_path = Path(str(cfg.visualize.gif_path))
     frames = []
     try:
         env.reset(seed=int(cfg.seed))
         frames.append(_frame(env.render()))
-        for index, (name, parameters) in enumerate(SCRIPTED_MUG_SEQUENCE, start=1):
+        for index, (name, parameters) in enumerate(sequence, start=1):
             action = PrimitiveAction(name, parameters).to_vector()
             _, _, terminated, truncated, info = env.step(action)
             frames.append(_frame(env.render()))

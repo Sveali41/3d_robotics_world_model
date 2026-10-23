@@ -2,12 +2,28 @@
 __pycache__/
 *.pyc
 
+# Experiment outputs; logs/ also contains temporary audit/render/launch scripts.
 artifacts/
 data/
 logs/
 outputs/
 wandb/
+checkpoints/
+replays/
 
+# Scratch scripts belong in these directories, not beside maintained source.
+/tmp/
+/scratch/
+
+# Generated experiment data, checkpoints and profiler output.
+*.npy
+*.npz
+*.jsonl
+*.h5
+*.hdf5
+*.log
+*.prof
+*.lprof
 *.pt
 *.pth
 *.ckpt

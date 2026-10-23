@@ -49,8 +49,9 @@ class NominalRAPSRobotFlowBridge:
         if primitive.primitive_type == "move_backward":
             return [zero, np.array([-abs(p["x_dist"]), 0.0, 0.0], dtype=np.float32)]
         if primitive.primitive_type == "top_grasp":
-            target = np.array([0.0, 0.0, -abs(p["z_down"])], dtype=np.float32)
-            return [zero, target]
+            aligned = np.array([0.0, p["y_offset"], p["z_offset"]], dtype=np.float32)
+            target = aligned + np.array([abs(p["x_forward"]), 0.0, 0.0], dtype=np.float32)
+            return [zero, aligned, target]
         return [zero, zero]
 
     def predict(self, observation, actions) -> tuple[torch.Tensor, torch.Tensor]:

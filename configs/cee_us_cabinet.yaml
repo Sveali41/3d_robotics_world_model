@@ -1,0 +1,17 @@
+# State-based CEE-US diagnostic; does not change the existing PPO experiment.
+seed: 0
+device: cuda
+bootstrap_steps: 1000
+rounds: 3
+steps_per_round: 1000
+evaluation_steps: 1000
+epochs: 25
+planner_candidates: 128
+execution: reference
+runtime_optimizations: false
+cpu_threads: 1
+action_mode: ee_delta
+exploration_mode: baseline
+sim_freq: 100
+control_freq: 20
+# Other architecture, optimizer and iCEM defaults remain pinned in cee_us_backend.py.

@@ -1,9 +1,19 @@
 # RAPS contact exploration in WallCabinetTwoItems-v1.
+# primitives: existing 20D RAPS; ee_delta: 4D normalized xyz delta + gripper.
+# ee_delta executes exactly one 20 Hz control step, with fixed wrist orientation.
+# Native Panda translation range is +/-0.1 m per axis; no action repetition.
+action_mode: primitives
+# D: region-constrained targets + interaction reward (also supports ee_delta).
+exploration_mode: baseline
+# Position constraint independent of the selected reward.
+project_goals_to_region: false
 policy: ppo
 seed: 0
 primitives: 100
-max_primitives_per_episode: 40
+max_primitives_per_episode: 60
 max_low_level_steps_per_episode: 1000
+# ee_delta uses its own control-step limit (100 steps = 5 seconds at 20 Hz).
+max_ee_steps_per_episode: 100
 
 # SAPIEN simulation and rendering.
 sim_backend: cpu
@@ -20,21 +30,23 @@ sim:
   control_freq: 20
 
 reward:
-  approach_progress: 0.5
+  approach_progress: 2.0      # stronger shaping to bootstrap cold-start
   contact_started: 2.0
   new_object_contact: 5.0
   meaningful_contact: 0.2
   grasp_alignment: 1.0
   grasped_object: 2.0
+  lifted_object: 3.0          # one-time reward for lifting while stably held
   moved_object: 3.0
-  # Prevent collisions/pushing from earning movement reward before grasping.
   moved_object_requires_grasp: true
   primitive_duration: 0.005
   primitive_timeout: 0.5
   ee_outside: 1.0
   contact_force_threshold: 0.0001
-  terminate_when_all_grasped: true
-  terminate_on_object_failure: true
+  # Keep running after all objects lifted to collect post-grasp dynamics.
+  terminate_when_all_lifted: false
+  # Keep running after object failure to collect fall dynamics for PointWorld.
+  terminate_on_object_failure: false
 
 ppo:
   # PPO needs only one high-level transition and contact labels, not PointWorld frames.
@@ -56,9 +68,8 @@ ppo:
   value_loss_coef: 0.5
   entropy_coef: 0.01
   max_grad_norm: 0.5
-  # Object-relative state expands the policy input from 32 to 38 dimensions,
-  # so keep its checkpoints separate from prior robot-only policies.
-  checkpoint_dir: logs/ppo_cabinet_object_state_hybrid
+  # Keep policies for the resized bowl separate from earlier scene variants.
+  checkpoint_dir: logs/ppo_cabinet_object_state_hybrid_lift_bowl72mm
   checkpoint_name: policy.pt
   # One row per PPO update. contact_rate is the share of high-level
   # primitives with at least one observed fingertip/object contact.

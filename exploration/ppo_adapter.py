@@ -1,4 +1,4 @@
-"""PPO training adaptor for the current 20D RAPS cabinet action space.
+"""PPO training adaptor for 20D RAPS or 4D Cartesian cabinet actions.
 
 The rollout and clipped PPO update follow the official RAPS PPO setup, while
 the environment side uses the current Gymnasium/ManiSkill wrappers directly.
@@ -36,6 +36,9 @@ TRAINING_METRIC_FIELDS = (
     "policy_loss",
     "value_loss",
     "entropy",
+    "approx_kl",
+    "clip_fraction",
+    "explained_variance",
 )
 
 
@@ -256,7 +259,8 @@ class ParallelCabinetEnvs:
 class RAPSActorCritic(nn.Module):
     """PPO actor with a categorical primitive and bounded parameters.
 
-    The public action remains the official 20D RAPS layout. The first ten
+    With action_dim=4, all entries are continuous Cartesian/gripper commands.
+    Otherwise the action follows the official 20D RAPS layout. The first ten
     entries are emitted as a one-hot categorical sample; the final ten entries
     are tanh-normal parameters. Only the parameter slots used by the sampled
     primitive contribute to the continuous log probability.
@@ -265,7 +269,7 @@ class RAPSActorCritic(nn.Module):
     PARAMETER_MASK = torch.tensor(
         [
             [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
@@ -288,10 +292,10 @@ class RAPSActorCritic(nn.Module):
         super().__init__()
         if action_std <= 0:
             raise ValueError("ppo.action_std must be positive")
-        if action_dim != 20:
-            raise ValueError("The RAPS hybrid policy requires a 20D action")
-        self.num_primitives = 10
-        self.num_parameters = 10
+        if action_dim not in (4, 20):
+            raise ValueError("PPO requires a 20D primitive or 4D ee_delta action")
+        self.num_primitives = 10 if action_dim == 20 else 0
+        self.num_parameters = 10 if action_dim == 20 else 4
         self.actor = nn.Sequential(
             nn.Linear(observation_dim, hidden_size),
             nn.Tanh(),
@@ -309,7 +313,8 @@ class RAPSActorCritic(nn.Module):
         self.log_std = nn.Parameter(
             torch.full((self.num_parameters,), float(np.log(action_std)), dtype=torch.float32)
         )
-        self.register_buffer("parameter_mask", self.PARAMETER_MASK)
+        if self.num_primitives:
+            self.register_buffer("parameter_mask", self.PARAMETER_MASK)
         self._initialize()
 
     def _initialize(self) -> None:
@@ -324,7 +329,7 @@ class RAPSActorCritic(nn.Module):
         output = self.actor(observation)
         logits = output[..., : self.num_primitives]
         mean = output[..., self.num_primitives :]
-        categorical = Categorical(logits=logits)
+        categorical = Categorical(logits=logits) if self.num_primitives else None
         continuous = TransformedDistribution(
             Normal(mean, self.log_std.exp().expand_as(mean)),
             TanhTransform(cache_size=1),
@@ -335,6 +340,9 @@ class RAPSActorCritic(nn.Module):
         self, observation: torch.Tensor, action: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         categorical, continuous = self.distribution(observation)
+        if categorical is None:
+            return (continuous.log_prob(action).sum(dim=-1),
+                    continuous.base_dist.entropy().sum(dim=-1))
         primitive_indices = action[..., : self.num_primitives].argmax(dim=-1)
         parameter_mask = self.parameter_mask[primitive_indices].to(action.device)
         selector_log_prob = categorical.log_prob(primitive_indices)
@@ -350,6 +358,10 @@ class RAPSActorCritic(nn.Module):
 
     def act(self, observation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         categorical, continuous = self.distribution(observation)
+        if categorical is None:
+            action = continuous.sample()
+            log_prob, _ = self._log_prob_entropy(observation, action)
+            return action, log_prob, self.value(observation)
         primitive_indices = categorical.sample()
         primitive_one_hot = torch.nn.functional.one_hot(
             primitive_indices, self.num_primitives
@@ -364,6 +376,8 @@ class RAPSActorCritic(nn.Module):
     def deterministic_action(self, observation: torch.Tensor) -> torch.Tensor:
         """Return the modal primitive and tanh-normal mean parameters."""
         categorical, continuous = self.distribution(observation)
+        if categorical is None:
+            return torch.tanh(continuous.base_dist.loc)
         primitive_indices = categorical.probs.argmax(dim=-1)
         primitive_one_hot = torch.nn.functional.one_hot(
             primitive_indices, self.num_primitives
@@ -462,12 +476,18 @@ def _ppo_update(
     device: torch.device,
 ) -> dict[str, float]:
     tensors = rollout.tensors(device, float(cfg.gamma), float(cfg.gae_lambda))
+    for name, tensor in tensors.items():
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"PPO rollout {name} contains NaN or infinity; inspect the collected transition")
     advantages = tensors["advantages"]
     advantages = (advantages - advantages.mean()) / advantages.std().clamp_min(1e-6)
+    if not torch.isfinite(advantages).all():
+        raise ValueError("PPO normalized advantages are non-finite; collect at least two finite transitions")
     batch_size = len(rollout)
     num_mini_batch = min(int(cfg.num_mini_batch), batch_size)
     mini_batch_size = max(1, batch_size // num_mini_batch)
-    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+    metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
+               "entropy": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0}
     update_count = 0
 
     for _ in range(int(cfg.ppo_epochs)):
@@ -478,7 +498,12 @@ def _ppo_update(
                 tensors["observations"][batch_indices],
                 tensors["actions"][batch_indices],
             )
-            ratio = (new_log_probs - tensors["old_log_probs"][batch_indices]).exp()
+            for name, tensor in (("log probabilities", new_log_probs),
+                                 ("entropy", entropy), ("values", values)):
+                if not torch.isfinite(tensor).all():
+                    raise ValueError(f"PPO policy {name} contains NaN or infinity; inspect policy parameters and observations")
+            log_ratio = new_log_probs - tensors["old_log_probs"][batch_indices]
+            ratio = log_ratio.exp()
             surrogate_1 = ratio * advantages[batch_indices]
             surrogate_2 = ratio.clamp(
                 1.0 - float(cfg.clip_param), 1.0 + float(cfg.clip_param)
@@ -499,19 +524,50 @@ def _ppo_update(
                 + float(cfg.value_loss_coef) * value_loss
                 - float(cfg.entropy_coef) * entropy_mean
             )
+            if not torch.isfinite(loss):
+                raise ValueError("PPO loss is non-finite; inspect log-probability ratios, returns, and learning rate")
+            with torch.no_grad():
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                clip_fraction = ((ratio - 1.0).abs() > float(cfg.clip_param)).float().mean()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(actor_critic.parameters(), float(cfg.max_grad_norm))
+            nn.utils.clip_grad_norm_(
+                actor_critic.parameters(), float(cfg.max_grad_norm), error_if_nonfinite=True
+            )
             optimizer.step()
+            if any(not torch.isfinite(parameter).all() for parameter in actor_critic.parameters()):
+                raise ValueError("PPO optimizer produced non-finite parameters; inspect optimizer state and learning rate")
 
             metrics["loss"] += float(loss.detach().item())
             metrics["policy_loss"] += float(policy_loss.detach().item())
             metrics["value_loss"] += float(value_loss.detach().item())
             metrics["entropy"] += float(entropy_mean.detach().item())
+            metrics["approx_kl"] += float(approx_kl.item())
+            metrics["clip_fraction"] += float(clip_fraction.item())
             update_count += 1
 
-    return {key: value / update_count for key, value in metrics.items()}
+    if update_count == 0:
+        raise ValueError("PPO update requires at least one epoch and a nonempty rollout")
+    metrics = {key: value / update_count for key, value in metrics.items()}
+    return_variance = tensors["returns"].var(unbiased=False)
+    metrics["explained_variance"] = (
+        float((1.0 - (tensors["returns"] - tensors["old_values"]).var(unbiased=False)
+               / return_variance).item())
+        if return_variance > 0 else 0.0
+    )
+    if not all(np.isfinite(value) for value in metrics.values()):
+        raise ValueError("PPO diagnostics are non-finite; inspect return and value magnitudes")
+    return metrics
+
+
+def policy_checkpoint_path(cfg: DictConfig) -> Path:
+    directory = Path(str(cfg.ppo.checkpoint_dir))
+    if str(getattr(cfg, "action_mode", "primitives")) == "ee_delta":
+        directory = directory / "ee_delta"
+    if str(getattr(cfg, "exploration_mode", "baseline")) == "D":
+        directory = directory / "D"
+    return directory / str(cfg.ppo.checkpoint_name)
 
 
 def _save_checkpoint(
@@ -526,6 +582,7 @@ def _save_checkpoint(
             "model": actor_critic.state_dict(),
             "optimizer": optimizer.state_dict(),
             "update": update_index,
+            "action_mode": "primitives" if actor_critic.num_primitives else "ee_delta",
         },
         path,
     )
@@ -554,7 +611,7 @@ def run_ppo(cfg: DictConfig, env_factory: Callable[[DictConfig], object]) -> int
     torch.manual_seed(int(cfg.seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     workers = ParallelCabinetEnvs(env_factory, cfg, num_envs)
-    checkpoint_path = Path(str(ppo_cfg.checkpoint_dir)) / str(ppo_cfg.checkpoint_name)
+    checkpoint_path = policy_checkpoint_path(cfg)
     metrics_path = checkpoint_path.parent / str(ppo_cfg.metrics_filename)
     total_primitives = 0
     episode_index = 0
@@ -735,7 +792,7 @@ def run_evaluation(cfg: DictConfig, env_factory: Callable[[DictConfig], object])
     """Evaluate a saved hybrid policy with deterministic primitive selection."""
     ppo_cfg = cfg.ppo
     env = env_factory(cfg)
-    checkpoint_path = Path(str(ppo_cfg.checkpoint_dir)) / str(ppo_cfg.checkpoint_name)
+    checkpoint_path = policy_checkpoint_path(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor_critic = None
     episode_reports = []
@@ -749,6 +806,9 @@ def run_evaluation(cfg: DictConfig, env_factory: Callable[[DictConfig], object])
             float(ppo_cfg.action_std),
         ).to(device)
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        expected_parameters = actor_critic.num_parameters
+        if tuple(checkpoint["model"]["log_std"].shape) != (expected_parameters,):
+            raise ValueError(f"{checkpoint_path} is incompatible with action_mode={cfg.action_mode}")
         actor_critic.load_state_dict(checkpoint["model"])
         actor_critic.eval()
 

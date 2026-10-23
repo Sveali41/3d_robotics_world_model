@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from .ppo_adapter import RAPSActorCritic, _observation_tensor
+from .ppo_adapter import RAPSActorCritic, _observation_tensor, policy_checkpoint_path
 
 
 def _rgb_frame(frame) -> np.ndarray:
@@ -36,7 +36,7 @@ def run_policy_gif(cfg: DictConfig, env_factory: Callable[[DictConfig], object])
     env = env_factory(cfg)
     ppo_cfg = cfg.ppo
     output_path = Path(str(cfg.visualize.gif_path))
-    checkpoint_path = Path(str(ppo_cfg.checkpoint_dir)) / str(ppo_cfg.checkpoint_name)
+    checkpoint_path = policy_checkpoint_path(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     frames: list[np.ndarray] = []
     try:
@@ -52,9 +52,9 @@ def run_policy_gif(cfg: DictConfig, env_factory: Callable[[DictConfig], object])
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model_state = checkpoint["model"]
         log_std = model_state.get("log_std")
-        if log_std is None or tuple(log_std.shape) != (10,):
+        if log_std is None or tuple(log_std.shape) != (actor_critic.num_parameters,):
             raise ValueError(
-                f"{checkpoint_path} uses the legacy Gaussian policy and cannot "
+                f"{checkpoint_path} has an incompatible action interface and cannot "
                 "be rendered by the hybrid RAPS policy"
             )
         actor_critic.load_state_dict(model_state)

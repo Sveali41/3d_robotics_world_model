@@ -4,7 +4,8 @@ Why this wrapper exists
 -----------------------
 RAPS does not expose the simulator's low-level controller to the policy.  The
 policy emits one hybrid high-level action, for example
-``top_grasp(z_down=0.20)``.  RoboCasa, however, must receive many low-level
+``top_grasp(x_forward=0.10, y_offset=0.0, z_offset=0.0)``.
+RoboCasa, however, must receive many low-level
 robot-independent ``[dx, dy, dz, gripper]`` actions to execute that behavior.
 ``RAPSEnvWrapper`` bridges those interfaces and adapts the command to either
 the fixed-base Fetch controller or Panda's EE-delta-pose controller:
@@ -22,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 try:
     import gymnasium as gym
@@ -32,11 +34,37 @@ except ImportError:  # pragma: no cover - compatibility for older RAPS setups
 
 from .primitives import (
     PRIMITIVE_CLASSES,
+    Primitive,
+    PrimitiveAction,
     PrimitiveContext,
     RAPS_ACTION_SCHEMA,
     normalize_primitive_robot,
+    update_cumulative_lifts,
 )
 from exploration.trajectory_recorder import PrimitiveRecord
+
+
+class _EEDeltaAction(PrimitiveAction):
+    def to_vector(self):
+        return np.array([self.parameters[key] for key in ("dx", "dy", "dz", "gripper")],
+                        dtype=np.float32)
+
+
+class _EEDeltaStep(Primitive):
+    """One controller tick; reuse outcome observation without a motion state machine."""
+    name = "ee_delta"
+
+    def __init__(self, action):
+        super().__init__(action)
+        self.max_steps = 1
+        self.stage = "control"
+
+    def next_action(self, context):
+        if self.done:
+            return None
+        self.steps = 1
+        self.status = "success"
+        return self.action.to_vector()
 
 
 class RAPSEnvWrapper(gym.Wrapper):
@@ -61,33 +89,48 @@ class RAPSEnvWrapper(gym.Wrapper):
         *,
         max_primitives_per_episode: int = 40,
         max_low_level_steps_per_episode: int = 1000,
+        max_ee_steps_per_episode: int = 100,
         debug_base_reward: bool = False,
         observation_transform=None,
         robot: str = "fetch",
         render_during_primitive: bool = False,
         record_dense_trajectory: bool = True,
         contact_check_interval: int = 1,
+        project_goals_to_region: bool = False,
+        action_mode: str = "primitives",
     ):
         if int(max_primitives_per_episode) < 1:
             raise ValueError("max_primitives_per_episode must be positive")
         if int(max_low_level_steps_per_episode) < 1:
             raise ValueError("max_low_level_steps_per_episode must be positive")
+        if int(max_ee_steps_per_episode) < 1:
+            raise ValueError("max_ee_steps_per_episode must be positive")
         if int(contact_check_interval) < 1:
             raise ValueError("contact_check_interval must be positive")
+        if action_mode not in {"primitives", "ee_delta"}:
+            raise ValueError("action_mode must be primitives or ee_delta")
         super().__init__(env)
+        self.action_mode = action_mode
+        self._direct_grasp_frames = {}
+        self._direct_lift_reference_heights = {}
         self.action_space = spaces.Box(
             low=RAPS_ACTION_SCHEMA.low,
             high=RAPS_ACTION_SCHEMA.high,
             dtype=np.float32,
         )
+        if self.action_mode == "ee_delta":
+            self.action_space = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
         self.max_primitives_per_episode = int(max_primitives_per_episode)
         self.max_low_level_steps_per_episode = int(max_low_level_steps_per_episode)
+        self.max_ee_steps_per_episode = int(max_ee_steps_per_episode)
+        self._ee_orientation_target = None
         self.debug_base_reward = bool(debug_base_reward)
         self.observation_transform = observation_transform
         self.robot = normalize_primitive_robot(robot)
         self.render_during_primitive = bool(render_during_primitive)
         self.record_dense_trajectory = bool(record_dense_trajectory)
         self.contact_check_interval = int(contact_check_interval)
+        self.project_goals_to_region = bool(project_goals_to_region)
         self.episode_id = 0
         self.primitive_id = 0
         self.low_level_steps = 0
@@ -126,10 +169,20 @@ class RAPSEnvWrapper(gym.Wrapper):
             raise ValueError(f"primitive emitted invalid low-level action: {action}")
         if self.robot == "fetch":
             return action.copy()
-        # Panda pd_ee_delta_pose: [dxyz, rotation-vector, gripper]. Keeping the
-        # rotation delta at zero preserves the wrist pose during a primitive.
+        rotation = np.zeros(3, dtype=np.float32)
+        if self.action_mode == "ee_delta":
+            if self._ee_orientation_target is None:
+                raise RuntimeError("ee_delta orientation target requires reset()")
+            arm = self.env.unwrapped.agent.controller.controllers["arm"]
+            current = arm.ee_pose_at_base.q.detach().cpu().numpy().reshape(4)
+            current = Rotation.from_quat(np.roll(current, -1))
+            # ManiSkill composes intrinsic XYZ Euler deltas on the left in
+            # root coordinates, and scales normalized rotation by rot_lower.
+            correction = (self._ee_orientation_target * current.inv()).as_euler("XYZ")
+            rotation = correction / float(arm.config.rot_lower)
+            rotation /= max(1.0, float(np.linalg.norm(rotation)))
         return np.array(
-            [action[0], action[1], action[2], 0.0, 0.0, 0.0, action[3]],
+            [*action[:3], *rotation, action[3]],
             dtype=np.float32,
         )
 
@@ -138,6 +191,7 @@ class RAPSEnvWrapper(gym.Wrapper):
             self.env,
             robot=self.robot,
             record_state=self.record_dense_trajectory,
+            project_goals_to_region=self.project_goals_to_region,
         )
 
     def _configure_low_level_time_limit(self) -> None:
@@ -185,12 +239,25 @@ class RAPSEnvWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
+        if self.action_mode == "ee_delta" and self.robot == "panda":
+            arm = self.env.unwrapped.agent.controller.controllers["arm"]
+            cfg = arm.config
+            if (not cfg.normalize_action or not cfg.use_delta or cfg.use_target
+                    or cfg.frame != "root_translation:root_aligned_body_rotation"
+                    or not np.isscalar(cfg.rot_lower) or not np.isscalar(cfg.rot_upper)
+                    or not np.isfinite(cfg.rot_lower) or cfg.rot_lower >= 0
+                    or cfg.rot_upper != -cfg.rot_lower):
+                raise ValueError("ee_delta wrist hold requires normalized current-pose root delta control with symmetric scalar rotation bounds")
+            quaternion = arm.ee_pose_at_base.q.detach().cpu().numpy().reshape(4)
+            self._ee_orientation_target = Rotation.from_quat(np.roll(quaternion, -1))
         if isinstance(result, tuple):
             result = (self._transform_observation(result[0]), *result[1:])
             self._last_observation = result[0]
         else:
             result = self._transform_observation(result)
             self._last_observation = result
+        self._direct_grasp_frames = {}
+        self._direct_lift_reference_heights = {}
         self.episode_id += 1
         self.primitive_id = 0
         self.low_level_steps = 0
@@ -217,22 +284,50 @@ class RAPSEnvWrapper(gym.Wrapper):
             raise RuntimeError("RAPSEnvWrapper.step() called before reset or after episode end")
 
         action = np.asarray(raps_action, dtype=np.float32)
-        if action.shape != (RAPS_ACTION_SCHEMA.action_dim,):
+        if action.shape != self.action_space.shape:
             raise ValueError(
-                f"RAPS action must have shape {(RAPS_ACTION_SCHEMA.action_dim,)}, got {action.shape}"
+                f"{self.action_mode} action must have shape {self.action_space.shape}, got {action.shape}"
             )
         if not np.isfinite(action).all():
             raise ValueError("RAPS action contains NaN or infinity")
-        action = np.clip(action, RAPS_ACTION_SCHEMA.low, RAPS_ACTION_SCHEMA.high)
-        primitive_action = RAPS_ACTION_SCHEMA.decode(action)
-        primitive_cls = PRIMITIVE_CLASSES[primitive_action.primitive_type]
-        primitive = primitive_cls(primitive_action)
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        if self.action_mode == "ee_delta":
+            primitive_action = _EEDeltaAction("ee_delta", dict(zip(
+                ("dx", "dy", "dz", "gripper"), map(float, action))))
+            primitive = _EEDeltaStep(primitive_action)
+        else:
+            primitive_action = RAPS_ACTION_SCHEMA.decode(action)
+            primitive_cls = PRIMITIVE_CLASSES[primitive_action.primitive_type]
+            primitive = primitive_cls(primitive_action)
 
         observation = getattr(self, "_last_observation", None)
         if observation is None:
             observation = self.env.get_observation() if hasattr(self.env, "get_observation") else None
         context = self._context()
         primitive.reset(context)
+        if self.action_mode == "ee_delta":
+            primitive.stable_grasp_frames.update(self._direct_grasp_frames)
+            if self.project_goals_to_region:
+                controller_config = context.arm_controller.config
+                if (not controller_config.normalize_action or not controller_config.use_delta
+                        or controller_config.use_target
+                        or not controller_config.frame.startswith("root_translation")):
+                    raise ValueError("ee_delta projection requires normalized, current-pose root delta control")
+                lower = np.broadcast_to(controller_config.pos_lower, (3,)).astype(np.float32)
+                upper = np.broadcast_to(controller_config.pos_upper, (3,)).astype(np.float32)
+                if np.any(upper <= lower):
+                    raise ValueError("controller translation bounds must have positive width")
+                delta = lower + (action[:3] + 1.0) * 0.5 * (upper - lower)
+                requested = context.ee_position + delta
+                projected = context.project_goal(requested)
+                normalized = 2.0 * (projected - context.ee_position - lower) / (upper - lower) - 1.0
+                executed = np.clip(normalized, -1.0, 1.0)
+                primitive.parameters.update(zip(("dx", "dy", "dz"), map(float, executed)))
+                primitive.action.parameters.update(primitive.parameters)
+                primitive.requested_goals["target"] = requested.tolist()
+                primitive.executed_goals["target"] = projected.tolist()
+                primitive.controller_target = (context.ee_position + lower
+                    + (executed + 1.0) * 0.5 * (upper - lower)).tolist()
         record = PrimitiveRecord(
             episode_id=self.episode_id,
             primitive_id=self.primitive_id,
@@ -246,6 +341,13 @@ class RAPSEnvWrapper(gym.Wrapper):
             ),
             dense_trajectory=self.record_dense_trajectory,
         )
+        if self.action_mode == "ee_delta":
+            record.schema_version = "cabinet-ee-delta-v1"
+            record.metadata.update(action_mode="ee_delta", action_units="normalized_controller",
+                                   project_goals_to_region=self.project_goals_to_region,
+                                   wrist_orientation_hold="episode_reset" if self.robot == "panda" else "native_controller")
+            if self.project_goals_to_region:
+                record.metadata["controller_target"] = primitive.controller_target
         if self.record_dense_trajectory:
             record.append_observation(observation, context)
 
@@ -278,6 +380,7 @@ class RAPSEnvWrapper(gym.Wrapper):
                 or terminated
                 or truncated
                 or primitive.steps >= primitive.max_steps
+                or self.low_level_steps + 1 >= self.max_low_level_steps_per_episode
             )
             contact_event = (
                 primitive.observe(post_context)
@@ -295,7 +398,8 @@ class RAPSEnvWrapper(gym.Wrapper):
                 record.append_observation(observation, post_context)
             else:
                 record.append_compact_transition(
-                    low_action, contact_event=contact_event
+                    low_action, full_controller_action=controller_action,
+                    contact_event=contact_event
                 )
             self.low_level_steps += 1
             self._last_observation = observation
@@ -315,7 +419,9 @@ class RAPSEnvWrapper(gym.Wrapper):
                 primitive.status = "timeout"
 
         self.primitive_id += 1
-        episode_limit = self.primitive_id >= self.max_primitives_per_episode
+        episode_limit = (self.low_level_steps >= self.max_ee_steps_per_episode
+                         if self.action_mode == "ee_delta"
+                         else self.primitive_id >= self.max_primitives_per_episode)
         if not terminated and (episode_limit or budget_limit):
             truncated = True
 
@@ -325,6 +431,18 @@ class RAPSEnvWrapper(gym.Wrapper):
         record.terminated = bool(terminated)
         record.truncated = bool(truncated)
         record.outcome_metrics = primitive.result(context)
+        if self.action_mode == "ee_delta":
+            self._direct_grasp_frames = dict(primitive.stable_grasp_frames)
+            lifted, displacements = update_cumulative_lifts(
+                self._direct_lift_reference_heights,
+                record.outcome_metrics["initial_object_positions_root"],
+                record.outcome_metrics["final_object_positions_root"],
+                self._direct_grasp_frames, record.outcome_metrics["held_object_ids"],
+            )
+            record.outcome_metrics["lifted_object_ids"] = lifted
+            record.outcome_metrics["lift_reference_heights_root"] = dict(self._direct_lift_reference_heights)
+            record.outcome_metrics["object_lift_displacements"] = displacements
+            record.metadata["lift_metric"] = "continuous_grasp_height_v2"
         record.validate()
         self.records.append(record)
         self.last_primitive_record = record

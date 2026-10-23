@@ -1,0 +1,872 @@
+--- upstream/mbrl/base_types.py
++++ vendored/mbrl/base_types.py
+@@ -3,10 +3,10 @@
+ from abc import ABC, abstractmethod
+ from typing import Sequence, Tuple
+ 
+-import gym
++import gymnasium as gym
+ import numpy as np
+ 
+-from mbrl.rolloutbuffer import RolloutBuffer
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer
+ 
+ 
+ class Env(gym.Env, ABC):
+--- upstream/mbrl/controllers/__init__.py
++++ vendored/mbrl/controllers/__init__.py
+@@ -1,29 +0,0 @@
+-from importlib import import_module
+-
+-
+-def controller_from_string(controller_str):
+-    return ControllerFactory(controller_str=controller_str)
+-
+-
+-class ControllerFactory:
+-    # noinspection SpellCheckingInspection
+-    valid_base_controllers = {
+-        "mpc-icem-torch": (".mpc_torch", "TorchMpcICem"),
+-        "mpc-curiosity-icem-torch": (".mpc_torch_curiosity", "TorchCuriosityMpcICem"),
+-        "mpc-rnd-icem-torch": (".mpc_torch_rnd", "TorchRNDMpcICem"),
+-    }
+-
+-    controller = None
+-
+-    def __new__(cls, *, controller_str):
+-
+-        if controller_str in cls.valid_base_controllers:
+-            ctrl_package, ctrl_class = cls.valid_base_controllers[controller_str]
+-            module = import_module(ctrl_package, "mbrl.controllers")
+-            cls.controller = getattr(module, ctrl_class)
+-        else:
+-            raise ImportError(
+-                f"cannot find '{controller_str}' in known controller: " f"{cls.valid_base_controllers.keys()}"
+-            )
+-
+-        return cls.controller
+--- upstream/mbrl/controllers/abstract_controller.py
++++ vendored/mbrl/controllers/abstract_controller.py
+@@ -4,15 +4,15 @@
+ import numpy as np
+ import torch
+ 
+-from mbrl.base_types import Controller, Env, ForwardModel
+-from mbrl.controllers.utils import ArrayIteratorParallelRowwise
+-from mbrl.environments import env_from_string
+-from mbrl.environments.abstract_environments import (
++from third_party.cee_us.mbrl.base_types import Controller, Env, ForwardModel
++from third_party.cee_us.mbrl.controllers.utils import ArrayIteratorParallelRowwise
++
++from third_party.cee_us.mbrl.environments.abstract_environments import (
+     GroundTruthSupportEnv,
+     RealRobotEnvInterface,
+ )
+-from mbrl.models.abstract_models import EnsembleModel
+-from mbrl.rolloutbuffer import RolloutBuffer
++from third_party.cee_us.mbrl.models.abstract_models import EnsembleModel
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer
+ 
+ 
+ class TrainableController(Controller, ABC):
+@@ -111,7 +111,7 @@
+ 
+         if isinstance(self.env, GroundTruthSupportEnv) and self.env.supports_live_rendering:  # can't do it for dm suite
+             if self.visualize_env is None:
+-                self.visualize_env = env_from_string(self.env.name, **self.env.init_kwargs)
++                raise NotImplementedError("Environment visualization excluded from vendored subset")
+                 self.visualize_env.reset()
+ 
+             if self.do_visualize_plan == "last":
+--- upstream/mbrl/controllers/colored_noise.py
++++ vendored/mbrl/controllers/colored_noise.py
+@@ -4,7 +4,7 @@
+ from numpy.fft import irfft, rfftfreq
+ from numpy.random import normal
+ 
+-from mbrl import torch_helpers
++from third_party.cee_us.mbrl import torch_helpers
+ 
+ 
+ def powerlaw_psd_gaussian(exponent, size, fmin=0):
+--- upstream/mbrl/controllers/mpc.py
++++ vendored/mbrl/controllers/mpc.py
+@@ -5,15 +5,15 @@
+ 
+ import numpy as np
+ 
+-from mbrl import allogger
+-from mbrl.controllers.abstract_controller import (
++from third_party.cee_us.mbrl import allogger
++from third_party.cee_us.mbrl.controllers.abstract_controller import (
+     ModelBasedController,
+     OpenLoopPolicy,
+     StatefulController,
+ )
+-from mbrl.environments.abstract_environments import GroundTruthSupportEnv
+-from mbrl.models.gt_model import AbstractGroundTruthModel, GroundTruthModel
+-from mbrl.rolloutbuffer import RolloutBuffer
++from third_party.cee_us.mbrl.environments.abstract_environments import GroundTruthSupportEnv
++
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer
+ 
+ 
+ # abstract MPC controller
+@@ -47,19 +47,18 @@
+ 
+     @staticmethod
+     def hook_from_string(name, hook_params):
+-        from mbrl.controllers.cem_memory import CemMemoryStorage
+ 
+         if not name:
+             return None
+         if name == "CemMemoryStorage":
+-            return CemMemoryStorage(**hook_params)
++            raise NotImplementedError("CEM storage hooks excluded from vendored subset")
+         else:
+             raise AttributeError(f"unknown hook name {name}")
+ 
+     # checks if the model (in case of a ground truth model is consistent with
+     # the actual environment
+     def check_model_consistency(self):
+-        if isinstance(self.forward_model, AbstractGroundTruthModel) and isinstance(self.env, GroundTruthSupportEnv):
++        if False:  # Ground-truth simulator support excluded from vendored subset.
+             model_state = self.forward_model_state
+             env_state = self.env.get_GT_state()
+             diff = self.env.compute_state_difference(model_state, env_state)
+@@ -93,7 +92,7 @@
+         )[0]
+ 
+     def beginning_of_rollout(self, *, observation, state=None, mode):
+-        if state is not None and isinstance(self.forward_model, GroundTruthModel):
++        if state is not None:
+             self.forward_model_state = state
+         else:
+             self.forward_model_state = self.forward_model.reset(observation)
+--- upstream/mbrl/controllers/mpc_torch.py
++++ vendored/mbrl/controllers/mpc_torch.py
+@@ -3,17 +3,15 @@
+ 
+ import numpy as np
+ import torch
+-from gym import spaces
+-
+-from mbrl import allogger, torch_helpers
+-from mbrl.controllers import colored_noise
+-from mbrl.controllers.abstract_controller import OpenLoopPolicy
+-from mbrl.controllers.mpc import MpcController
+-from mbrl.models.abstract_models import TorchModel
+-from mbrl.models.gt_model import GroundTruthModel, Torch2NumpyGroundTruthModelWrapper
+-from mbrl.models.gt_par_model import ParallelGroundTruthModel
+-from mbrl.rolloutbuffer import RolloutBuffer, SimpleRolloutBuffer
+-from mbrl.torch_helpers import to_tensor
++from gymnasium import spaces
++
++from third_party.cee_us.mbrl import allogger, torch_helpers
++from third_party.cee_us.mbrl.controllers import colored_noise
++from third_party.cee_us.mbrl.controllers.abstract_controller import OpenLoopPolicy
++from third_party.cee_us.mbrl.controllers.mpc import MpcController
++from third_party.cee_us.mbrl.models.abstract_models import TorchModel
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer, SimpleRolloutBuffer
++from third_party.cee_us.mbrl.torch_helpers import to_tensor
+ 
+ 
+ # our improved CEM
+@@ -35,14 +33,7 @@
+         self._ensemble_size = getattr(self.forward_model, "ensemble_size", None)
+ 
+         if not isinstance(self.forward_model, TorchModel):
+-            warnings.warn(
+-                "Forward model is not TorchModel, wrapping for compatibility, this might cause things to become slow!"
+-            )
+-            if isinstance(self.forward_model, (GroundTruthModel, ParallelGroundTruthModel)):
+-                self.forward_model = Torch2NumpyGroundTruthModelWrapper(self.forward_model)
+-                self.forward_model.ensemble_size = getattr(self.forward_model, "ensemble_size", None)
+-            else:
+-                raise Exception(f"Model {self.forward_model} not supported!")
++            raise TypeError("Vendored CEE-US supports TorchModel only")
+ 
+         if self._ensemble_size:
+             self.forward_model.num_simulated_trajectories = self.num_sim_traj
+@@ -209,6 +200,12 @@
+         :type time_slice: slice
+         """
+ 
++        # MKL FFT rejects empty batches; zero reused elites have no samples.
++        if num_traj == 0:
++            samples = self.mean_.new_empty((0, *self.mean_.shape))
++            if time_slice is not None:
++                samples = samples[:, time_slice[0]:time_slice[1]]
++            return samples
+         # colored noise
+         if self.colored_noise:
+             assert self.mean_.ndim == 2
+--- upstream/mbrl/controllers/mpc_torch_curiosity.py
++++ vendored/mbrl/controllers/mpc_torch_curiosity.py
+@@ -1,8 +1,8 @@
+ import torch
+ 
+-from mbrl import torch_helpers
+-from mbrl.controllers.mpc_torch import TorchMpcICem
+-from mbrl.rolloutbuffer import RolloutBuffer
++from third_party.cee_us.mbrl import torch_helpers
++from third_party.cee_us.mbrl.controllers.mpc_torch import TorchMpcICem
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer
+ 
+ 
+ # our improved CEM
+--- upstream/mbrl/environments/__init__.py
++++ vendored/mbrl/environments/__init__.py
+@@ -1,64 +0,0 @@
+-from importlib import import_module
+-
+-from .wrappers import env_wrapper_from_string
+-
+-
+-def _check_for_mujoco_lock(env_package):
+-    if env_package == ".mujoco":
+-        import os
+-        import time
+-
+-        import cloudpickle
+-
+-        path = os.path.dirname(cloudpickle.__file__)
+-        site_packages_path = path.split("cloudpickle")[0]
+-        lock_file = os.path.join(site_packages_path, "mujoco_py", "generated", "mujocopy-buildlock.lock")
+-        try:
+-            while os.path.exists(lock_file):
+-                age_of_lock = time.time() - os.path.getmtime(lock_file)
+-                # the lock is already 300 seconds old (120 is less for cluster
+-                # jobs)
+-                if age_of_lock > 300:
+-                    print(f"Deleting stale mujoco lock in {lock_file}")
+-                    os.remove(lock_file)
+-                else:
+-                    print(
+-                        f"waiting for mujoco lock to be released (I kill it in {round(300-age_of_lock)}s) {lock_file}"
+-                    )
+-                    time.sleep(5)
+-        except BaseException:
+-            pass
+-
+-
+-def env_from_string(env_string, wrappers=[], **env_params):
+-    env_dict = {
+-        # - PLAYGROUND - #
+-        "PlaygroundwGoals": (".playground_env_wgoals", "PlaygroundwGoals"),
+-        # - CONSTRUCTION - #
+-        "FetchPickAndPlace": (".robotics", "FetchPickAndPlace"),
+-        "FetchReach": (".robotics", "FetchReach"),
+-        "FetchPickAndPlaceConstruction": (".fpp_construction_env", "FetchPickAndPlaceConstruction"),
+-        # - ROBODESK - #
+-        "Robodesk": (".robodesk_env", "Robodesk"),
+-        "RobodeskFlat": (".robodesk_env", "RobodeskFlat"),
+-        # - GYM ROBOTICS CLASSICS - #
+-        "FetchPickAndPlace": (".robotics", "FetchPickAndPlace"),
+-        "FetchReach": (".robotics", "FetchReach"),
+-    }
+-    if env_string in env_dict:
+-        env_package, env_class = env_dict[env_string]
+-        _check_for_mujoco_lock(env_package)
+-        module = import_module(env_package, "mbrl.environments")
+-        cls = getattr(module, env_class)
+-        env = cls(**env_params, name=env_string)
+-    else:
+-        raise ImportError(f"add '{env_string}' entry to dictionary")
+-
+-    for env_wrapper in wrappers:
+-        env = env_wrapper_from_string(
+-            wrapper_string=env_wrapper["env_wrapper"],
+-            env=env,
+-            **env_wrapper["env_wrapper_params"],
+-        )
+-    env.init_kwargs["wrappers"] = wrappers
+-    return env
+--- upstream/mbrl/environments/abstract_environments.py
++++ vendored/mbrl/environments/abstract_environments.py
+@@ -1,9 +1,9 @@
+ from abc import ABC, abstractmethod
+ 
+-import gym.spaces as spaces
++import gymnasium.spaces as spaces
+ import numpy as np
+ 
+-from mbrl.base_types import Env
++from third_party.cee_us.mbrl.base_types import Env
+ 
+ 
+ class EnvWithDefaults(Env, ABC):
+--- upstream/mbrl/helpers.py
++++ vendored/mbrl/helpers.py
+@@ -1,55 +1,5 @@
+-import contextlib
+-import functools
+-import inspect
+-import json
+-import os
+-import types
+-import uuid
+ from abc import ABC, abstractmethod
+-from contextlib import contextmanager
+ from functools import partial, update_wrapper
+-from importlib import import_module
+-
+-import numpy as np
+-import torch
+-import tqdm
+-
+-from mbrl import allogger
+-from mbrl.controllers.abstract_controller import TeacherController
+-from mbrl.models.abstract_models import TrainableModel
+-from mbrl.rolloutbuffer import RolloutBuffer
+-
+-idx_mapping_type = "none"
+-
+-
+-def copy_func(f):
+-    """Based on http://stackoverflow.com/a/6528148/190597 (Glenn Maynard)"""
+-    g = types.FunctionType(
+-        f.__code__,
+-        f.__globals__,
+-        name=f.__name__,
+-        argdefs=f.__defaults__,
+-        closure=f.__closure__,
+-    )
+-    g = functools.update_wrapper(g, f)
+-    g.__kwdefaults__ = f.__kwdefaults__
+-    return g
+-
+-
+-obs_transforms = {
+-    "none": lambda obs: obs,
+-}
+-
+-batch_transforms = {}
+-for k, obs_transform in obs_transforms.items():
+-
+-    def bt(batch, obs_transform=copy_func(obs_transform)):
+-        batch["observations"] = obs_transform(batch["observations"])
+-        batch["next_observations"] = obs_transform(batch["next_observations"])
+-        return batch
+-
+-    batch_transforms[k] = copy_func(bt)
+-
+ 
+ class Decorator(ABC):
+     def __init__(self, f):
+@@ -65,274 +15,3 @@
+         new_f = partial(self.__call__, instance)
+         update_wrapper(new_f, self.func)
+         return new_f
+-
+-
+-def sin_and_cos_to_radians(sin_of_angle, cos_of_angle):
+-    theta = np.arccos(cos_of_angle)
+-    theta *= np.sign(sin_of_angle)
+-    return theta
+-
+-
+-@contextmanager
+-def redirect_stdout__to_tqdm():
+-    # Store builtin print
+-    old_print = print
+-
+-    def new_print(*args, **kwargs):
+-        to_print = "".join(map(repr, args))
+-        tqdm.tqdm.write(to_print, **kwargs)
+-
+-    try:
+-        # Globally replace print with new_print
+-        inspect.builtins.print = new_print
+-        yield
+-    finally:
+-        inspect.builtins.print = old_print
+-
+-
+-def flatten_list_one_level(list_of_lists):
+-    return [x for lst in list_of_lists for x in lst]
+-
+-
+-def tqdm_context(*args, **kwargs):
+-    with redirect_stdout__to_tqdm():
+-        postfix_dict = kwargs.pop("postfix_dict", {})
+-        additional_info_flag = kwargs.pop("additional_info_flag", False)
+-
+-        t_main = tqdm.tqdm(*args, **kwargs)
+-        t_main.postfix_dict = postfix_dict
+-        if additional_info_flag:
+-            yield t_main
+-        for x in t_main:
+-            t_main.set_postfix(**t_main.postfix_dict)
+-            t_main.refresh()
+-            yield x
+-
+-
+-def delegates(to=None, keep=False):
+-    """Decorator: replace `**kwargs` in signature with params from `to`"""
+-
+-    def _f(f):
+-        if to is None:
+-            to_f, from_f = f.__base__.__init__, f.__init__
+-        else:
+-            to_f, from_f = to, f
+-        sig = inspect.signature(from_f)
+-        sigd = dict(sig.parameters)
+-        kwargs = sigd["kwargs"]
+-        del sigd["kwargs"]
+-        s2 = {
+-            k: v
+-            for k, v in inspect.signature(to_f).parameters.items()
+-            if v.default != inspect.Parameter.empty and k not in sigd
+-        }
+-        sigd.update(s2)
+-        if keep:
+-            sigd["kwargs"] = kwargs
+-        from_f.__signature__ = sig.replace(parameters=sigd.values())
+-        return f
+-
+-    return _f
+-
+-
+-def compute_and_log_reward_info(rollouts, logger, prefix="", exec_time=None):
+-    reward_info = {
+-        prefix + "mean_avg_reward": rollouts.mean_avg_reward,
+-        prefix + "mean_max_reward": rollouts.mean_max_reward,
+-        prefix + "mean_return": rollouts.mean_return,
+-        prefix + "std_return": rollouts.std_return,
+-    }
+-    if exec_time is not None:
+-        reward_info.update({prefix + "exec_time": exec_time})
+-    try:
+-        reward_info[prefix + "mean_success"] = np.mean(rollouts.as_array("successes")[:, -1])
+-        reward_info[prefix + "std_success"] = np.std(rollouts.as_array("successes")[:, -1])
+-    except TypeError:
+-        pass
+-    for k, v in reward_info.items():
+-        logger.log(v, key=k, to_tensorboard=True)
+-        logger.info(f"{k}: {v}")
+-
+-    return reward_info
+-
+-
+-def update_reward_dict(iteration, reward_info: dict, reward_dict: dict):
+-    if "step" in reward_dict:
+-        reward_dict["step"].append(iteration)
+-    else:
+-        reward_dict.update({"step": [iteration]})
+-    for item in reward_info:
+-        if item in reward_dict:
+-            reward_dict[item].append(reward_info[item])
+-        else:
+-            reward_dict.update({item: [reward_info[item]]})
+-    return reward_dict
+-
+-
+-class RunningMeanCalc:
+-    def __init__(self):
+-        self._c = 0.0
+-        self._mu = 0.0
+-
+-    def add(self, x):
+-        self._mu = self._c / (self._c + 1) * self._mu + x / (self._c + 1)
+-        self._c += 1
+-
+-    @property
+-    def mu(self):
+-        return self._mu
+-
+-
+-class RunningExpMean:
+-    def __init__(self, alpha=0.99):
+-        self._mu = 0.0
+-        self.alpha = alpha
+-
+-        self._is_initialized = False
+-
+-    def add(self, value):
+-        if not self._is_initialized:
+-            self._mu = value
+-            self._is_initialized = True
+-        else:
+-            self._mu = self.alpha * self._mu + (1.0 - self.alpha) * value
+-
+-    @property
+-    def mu(self):
+-        if isinstance(self._mu, torch.Tensor):
+-            return self._mu.item()
+-        else:
+-            return self._mu
+-
+-
+-def train_controller(
+-    params,
+-    is_init_iteration,
+-    controller,
+-    expert_controller,
+-    rollout_buffer,
+-    rollout_buffer_expert,
+-):
+-    if controller is None:
+-        return
+-
+-    if controller.needs_training and not is_init_iteration:
+-        if controller.needs_data:
+-            if "policy" in params.controller_data_sources or "env" in params.controller_data_sources:
+-                controller.train(rollout_buffer)
+-            if "expert" in params.controller_data_sources:
+-                if rollout_buffer_expert is not None and not rollout_buffer_expert.is_empty:
+-                    data = rollout_buffer_expert
+-                    if expert_controller is not None and isinstance(expert_controller, TeacherController):
+-                        data = expert_controller.select_teacher_rollouts_for_training(data)
+-                    controller.train(data)
+-                else:
+-                    print("Expert rollout buffer is empty, skipping policy training")
+-        else:
+-            controller.train()
+-
+-
+-def train_dynamics_model(
+-    forward_model,
+-    rollout_man,
+-    controller,
+-    buffer,
+-):
+-
+-    if forward_model is not None and isinstance(forward_model, TrainableModel):
+-        rollouts = buffer["rollouts"]
+-        eval_rollouts = buffer.get("rollouts_eval_model", None)
+-        forward_model.train(rollouts, eval_rollouts)
+-
+-
+-def gen_rollouts(
+-    params,
+-    rollout_man,
+-    main_controller,
+-    initial_controller,
+-    rollout_buffer,
+-    forward_model,
+-    iteration,
+-    do_initial_rollouts,
+-):
+-
+-    if iteration == 0 and do_initial_rollouts:
+-        controller = initial_controller or main_controller
+-        number_of_rollouts = params.initial_number_of_rollouts
+-        render = params.rollout_params.render_initial
+-    else:
+-        controller = main_controller
+-        number_of_rollouts = params.number_of_rollouts
+-        render = params.rollout_params.render
+-
+-    if controller is None:
+-        return rollout_buffer
+-
+-    with forward_model.eval() if forward_model is not None and hasattr(
+-        forward_model, "eval"
+-    ) else contextlib.nullcontext():
+-        new_rollouts = RolloutBuffer(
+-            rollouts=rollout_man.sample(
+-                controller,
+-                render=render,
+-                mode="train",
+-                name="train",
+-                no_rollouts=number_of_rollouts,
+-            )
+-        )
+-
+-    if params.append_data:
+-        rollout_buffer.extend(new_rollouts)
+-    else:
+-        rollout_buffer = new_rollouts
+-
+-    return rollout_buffer
+-
+-
+-class MainState:
+-    def __init__(self, iteration, successful_rollouts):
+-        self.iteration = iteration
+-        self.successful_rollouts = successful_rollouts
+-
+-    def save(self, file):
+-        np.save(
+-            file,
+-            (
+-                self.iteration,
+-                self.successful_rollouts,
+-                dict(allogger.get_logger("root").step_per_key),
+-            ),
+-        )
+-        print(f"checkpointing at iteration {self.iteration}")
+-
+-    def load(self, file):
+-        dat = np.load(file, allow_pickle=True)
+-        if len(dat) == 1:
+-            (self.iteration,) = dat
+-        elif len(dat) == 2:
+-            (self.iteration, self.successful_rollouts) = dat
+-        elif len(dat) == 3:
+-            (self.iteration, self.successful_rollouts, step_per_key) = dat
+-            allogger.get_logger("root").step_per_key = allogger.get_logger("root").manager.dict(step_per_key)
+-        else:
+-            raise AttributeError(
+-                f"loading if main_state failed from {file} got collection of len {len(dat)} expect 1 or 2 or 3!"
+-            )
+-        self.iteration += 1  # we want to start with the next iteration
+-        print(f"loaded checkpoint and starting at iteration {self.iteration}")
+-
+-
+-def hook_executer(
+-    hooks,
+-    _locals,
+-    _globals,
+-):
+-
+-    for hook in hooks:
+-        (module_str, fn_str), kwargs = (
+-            hook[0].split(":"),
+-            hook[1] if len(hook) == 2 else {},
+-        )
+-        module = import_module(module_str)
+-        fn = getattr(module, fn_str)
+-        fn(_locals, _globals, **kwargs)
+--- upstream/mbrl/models/__init__.py
++++ vendored/mbrl/models/__init__.py
+@@ -1,40 +0,0 @@
+-from importlib import import_module
+-
+-models_dict = {
+-    "MLPForwardModel": (".mlp_model", "MLPForwardModel"),
+-    "MLP": (".torch_models", "MLP"),
+-    "GaussianNN": (".torch_models", "GaussianNN"),
+-    "GroundTruthModel": (".gt_model", "GroundTruthModel"),
+-    "GroundTruthEnsembleModel": (".gt_model", "GroundTruthEnsembleModel"),
+-    "ParallelGroundTruthModel": (".gt_par_model", "ParallelGroundTruthModel"),
+-    "GNNForwardModel": (".gnn_model", "GNNForwardModel"),
+-    "ParallelNNDeterministicEnsemble": (
+-        ".mlp_ensemble",
+-        "ParallelNNDeterministicEnsemble",
+-    ),
+-    "ParallelGNNDeterministicEnsemble": (
+-        ".gnn_ensemble",
+-        "GNNForwardEnsembleModel",
+-    ),
+-}
+-
+-
+-# Return a class not an instance
+-def forward_model_from_string(mod_str: str) -> type:
+-    """
+-    Returns a model class equivalent to the supplied string.
+-    :param mod_str: Name of model class
+-    :return: The model class
+-    """
+-    if mod_str == "none":
+-        return None
+-    elif mod_str in models_dict:
+-        if isinstance(models_dict[mod_str], tuple):
+-            mod_package, mod_class = models_dict[mod_str]
+-            module = import_module(mod_package, "mbrl.models")
+-            cls = getattr(module, mod_class)
+-            return cls
+-        else:
+-            return models_dict[mod_str]
+-    else:
+-        raise NotImplementedError("Implement model class {} and add it to dictionary".format(mod_str))
+--- upstream/mbrl/models/abstract_models.py
++++ vendored/mbrl/models/abstract_models.py
+@@ -3,8 +3,8 @@
+ 
+ import numpy as np
+ 
+-from mbrl.base_types import Controller, ForwardModel
+-from mbrl.rolloutbuffer import Rollout, RolloutBuffer
++from third_party.cee_us.mbrl.base_types import Controller, ForwardModel
++from third_party.cee_us.mbrl.rolloutbuffer import Rollout, RolloutBuffer
+ 
+ 
+ class ForwardModelWithDefaults(ForwardModel, ABC):
+--- upstream/mbrl/models/gnn_ensemble.py
++++ vendored/mbrl/models/gnn_ensemble.py
+@@ -5,16 +5,16 @@
+ import torch
+ import torch.nn.functional as F
+ 
+-from mbrl import allogger, torch_helpers
+-from mbrl.controllers.abstract_controller import Controller
+-from mbrl.models.abstract_models import (
++from third_party.cee_us.mbrl import allogger, torch_helpers
++from third_party.cee_us.mbrl.controllers.abstract_controller import Controller
++from third_party.cee_us.mbrl.models.abstract_models import (
+     EnsembleModel,
+     ForwardModelWithDefaults,
+     TorchModel,
+     TrainableModel,
+ )
+-from mbrl.rolloutbuffer import RolloutBuffer, SimpleRolloutBuffer
+-from mbrl.torch_helpers import (
++from third_party.cee_us.mbrl.rolloutbuffer import RolloutBuffer, SimpleRolloutBuffer
++from third_party.cee_us.mbrl.torch_helpers import (
+     TorchTrainingIterator,
+     TrainingIterator,
+     optimizer_from_string,
+@@ -79,9 +79,9 @@
+         self._parse_train_params(**train_params)
+ 
+         if normalize_w_running_stats:
+-            from mbrl.torch_helpers import Normalizer as normalizer_cl
+-        else:
+-            from mbrl.torch_helpers import Normalizer_v2 as normalizer_cl
++            from third_party.cee_us.mbrl.torch_helpers import Normalizer as normalizer_cl
++        else:
++            from third_party.cee_us.mbrl.torch_helpers import Normalizer_v2 as normalizer_cl
+ 
+         if use_input_normalization:
+             self.input_normalizer_obj_dyn = normalizer_cl(shape=self.object_dyn_dim, eps=self.epsilon)
+@@ -938,6 +938,10 @@
+                     next_observation[..., : self.agent_dim + dyn_ind] + obs_tensor[..., : self.agent_dim + dyn_ind]
+                 )
+ 
++            # Static properties are carried through exactly (avoid normalization roundoff).
++            next_observation[..., self.agent_dim + obj_dyn_model_in.shape[2] * self.object_dyn_dim:] = (
++                obs_tensor[..., self.agent_dim + obj_dyn_model_in.shape[2] * self.object_dyn_dim:]
++            )
+             next_observation = self.env.obs_postproc(next_observation)
+ 
+             reward = None
+--- upstream/mbrl/models/torch_parallel_ensembles/gnn_modules.py
++++ vendored/mbrl/models/torch_parallel_ensembles/gnn_modules.py
+@@ -4,7 +4,7 @@
+ import torch
+ import torch.nn as nn
+ 
+-from mbrl.models.utils import (
++from third_party.cee_us.mbrl.models.utils import (
+     unsorted_segment_mean_ensemble,
+     unsorted_segment_sum_ensemble,
+ )
+@@ -116,6 +116,8 @@
+ 
+         self.edge_list = None
+         self.batch_size = 0
++        self.cache_batch_indices = False
++        self._batch_indices = {}
+ 
+         self.to(self.device)
+ 
+@@ -170,6 +172,16 @@
+         return self.edge_list
+ 
+     # Forwards the prior and posterior transition models
++    def _get_batch_indices(self, batch_size, num_nodes, edge_index):
++        key = (batch_size, num_nodes, torch.device(self.device))
++        if key not in self._batch_indices:
++            # Training may reuse these indices after inference-mode prediction.
++            with torch.inference_mode(False), torch.no_grad():
++                node_indices = torch.repeat_interleave(torch.arange(0, batch_size, 1), num_nodes).to(self.device)
++                edge_indices = torch.div(edge_index[0], num_nodes, rounding_mode="trunc") if edge_index is not None else None
++            self._batch_indices[key] = (node_indices, edge_indices)
++        return self._batch_indices[key]
++
+     def _forward_transition_gnn(
+         self,
+         node_attributes: torch.Tensor,
+@@ -196,7 +208,10 @@
+ 
+             # Find the index of the batch sample for each edge in row:
+             # edge_batch_ind = torch.floor_divide(row, num_nodes)
+-            edge_batch_ind = torch.div(row, num_nodes, rounding_mode="trunc")
++            if self.cache_batch_indices:
++                _, edge_batch_ind = self._get_batch_indices(batch_size, num_nodes, edge_index)
++            else:
++                edge_batch_ind = torch.div(row, num_nodes, rounding_mode="trunc")
+ 
+             # global_context: [ensemble_size, batch_size, global_dim]
+             # action: [ensemble_size, batch_size, action_dim]
+@@ -215,7 +230,10 @@
+         flat_shared = torch.cat([global_context, action], dim=-1)
+ 
+         # Node_batch_ind: (N*nObj) x 1
+-        node_batch_ind = torch.repeat_interleave(torch.arange(0, batch_size, 1), self.num_nodes).to(self.device)
++        if self.cache_batch_indices:
++            node_batch_ind, _ = self._get_batch_indices(batch_size, num_nodes, edge_index)
++        else:
++            node_batch_ind = torch.repeat_interleave(torch.arange(0, batch_size, 1), self.num_nodes).to(self.device)
+ 
+         # batch_shared: (N*nObj) x shared_dim
+         batch_shared = torch.index_select(flat_shared, 1, node_batch_ind)
+--- upstream/mbrl/models/torch_parallel_ensembles/simple.py
++++ vendored/mbrl/models/torch_parallel_ensembles/simple.py
+@@ -2,15 +2,15 @@
+ import torch
+ from torch import nn
+ 
+-from mbrl import torch_helpers
+-from mbrl.models.abstract_models import (
++from third_party.cee_us.mbrl import torch_helpers
++from third_party.cee_us.mbrl.models.abstract_models import (
+     EnsembleModel,
+     StochasticModel,
+     TorchModel,
+     TrainableModel,
+ )
+-from mbrl.models.spectral_normalization import ensemble_spectral_norm
+-from mbrl.models.utils import LayerNormEnsemble
++from third_party.cee_us.mbrl.models.spectral_normalization import ensemble_spectral_norm
++from third_party.cee_us.mbrl.models.utils import LayerNormEnsemble
+ 
+ from .utils import MLPParallelEnsembleLayer
+ 
+--- upstream/mbrl/models/torch_parallel_ensembles/utils.py
++++ vendored/mbrl/models/torch_parallel_ensembles/utils.py
+@@ -1,6 +1,6 @@
+ import torch
+ 
+-from mbrl import torch_helpers
++from third_party.cee_us.mbrl import torch_helpers
+ 
+ 
+ class MLPParallelEnsembleLayer(torch.nn.Module):
+--- upstream/mbrl/models/utils.py
++++ vendored/mbrl/models/utils.py
+@@ -4,7 +4,7 @@
+ import torch
+ from torch import nn
+ 
+-from mbrl import torch_helpers
++from third_party.cee_us.mbrl import torch_helpers
+ 
+ 
+ def unsorted_segment_sum(tensor, segment_ids, num_segments):
+--- upstream/mbrl/rolloutbuffer.py
++++ vendored/mbrl/rolloutbuffer.py
+@@ -4,7 +4,7 @@
+ import numpy as np
+ import torch
+ from forwardable import def_delegators, forwardable
+-from sklearn.model_selection import train_test_split
++
+ 
+ 
+ @forwardable()
+@@ -200,6 +200,8 @@
+         if train_size is None and test_size is None:
+             raise ValueError("At least one of train_size, test_size must be specified")
+ 
++        from sklearn.model_selection import train_test_split
++
+         train_rollouts, test_rollouts = train_test_split(
+             self.rollouts, train_size=train_size, test_size=test_size, shuffle=shuffle
+         )
+--- upstream/mbrl/torch_helpers.py
++++ vendored/mbrl/torch_helpers.py
+@@ -10,8 +10,8 @@
+ from torch.optim import RMSprop
+ from torch.optim.optimizer import Optimizer
+ 
+-from mbrl.helpers import Decorator
+-from mbrl.models import torch_parallel_ensembles, utils
++from third_party.cee_us.mbrl.helpers import Decorator
++from third_party.cee_us.mbrl.models import torch_parallel_ensembles, utils
+ 
+ TensorType = Union[torch.Tensor, np.ndarray]
+ 

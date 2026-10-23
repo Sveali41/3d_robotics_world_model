@@ -1,0 +1,16 @@
+# 128-candidate CUDA Graph planner; exploration region constraint disabled.
+seed: 0
+device: cuda
+bootstrap_steps: 1000
+rounds: 3
+steps_per_round: 1000
+evaluation_steps: 1000
+epochs: 25
+planner_candidates: 128
+execution: cuda_graph
+cpu_threads: 1
+action_mode: ee_delta
+exploration_mode: baseline
+project_goals_to_region: false
+sim_freq: 100
+control_freq: 20

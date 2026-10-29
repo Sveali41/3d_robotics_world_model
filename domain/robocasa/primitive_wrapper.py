@@ -124,6 +124,7 @@ class RAPSEnvWrapper(gym.Wrapper):
         self.max_low_level_steps_per_episode = int(max_low_level_steps_per_episode)
         self.max_ee_steps_per_episode = int(max_ee_steps_per_episode)
         self._ee_orientation_target = None
+        self._ee_orientation_override = None
         self.debug_base_reward = bool(debug_base_reward)
         self.observation_transform = observation_transform
         self.robot = normalize_primitive_robot(robot)
@@ -178,13 +179,28 @@ class RAPSEnvWrapper(gym.Wrapper):
             current = Rotation.from_quat(np.roll(current, -1))
             # ManiSkill composes intrinsic XYZ Euler deltas on the left in
             # root coordinates, and scales normalized rotation by rot_lower.
-            correction = (self._ee_orientation_target * current.inv()).as_euler("XYZ")
+            target = self._ee_orientation_override
+            if target is None:
+                target = self._ee_orientation_target
+            correction = (target * current.inv()).as_euler("XYZ")
             rotation = correction / float(arm.config.rot_lower)
             rotation /= max(1.0, float(np.linalg.norm(rotation)))
         return np.array(
             [*action[:3], *rotation, action[3]],
             dtype=np.float32,
         )
+
+    def set_ee_orientation_override(self, quaternion_wxyz):
+        """A skill may hold its observed reachable wrist pose; None restores reset."""
+        if self.robot != "panda" or self.action_mode != "ee_delta":
+            raise ValueError("Skill orientation hold requires Panda ee_delta control")
+        if quaternion_wxyz is None:
+            self._ee_orientation_override = None
+            return
+        quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
+        if quaternion.shape != (4,) or not np.isfinite(quaternion).all() or np.linalg.norm(quaternion) <= 1e-12:
+            raise ValueError("Orientation override requires a finite nonzero wxyz quaternion")
+        self._ee_orientation_override = Rotation.from_quat(np.roll(quaternion / np.linalg.norm(quaternion), -1))
 
     def _context(self):
         return PrimitiveContext(
@@ -239,6 +255,7 @@ class RAPSEnvWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
+        self._ee_orientation_override = None
         if self.action_mode == "ee_delta" and self.robot == "panda":
             arm = self.env.unwrapped.agent.controller.controllers["arm"]
             cfg = arm.config
@@ -345,7 +362,8 @@ class RAPSEnvWrapper(gym.Wrapper):
             record.schema_version = "cabinet-ee-delta-v1"
             record.metadata.update(action_mode="ee_delta", action_units="normalized_controller",
                                    project_goals_to_region=self.project_goals_to_region,
-                                   wrist_orientation_hold="episode_reset" if self.robot == "panda" else "native_controller")
+                                   wrist_orientation_hold=("skill_actual_pose" if self._ee_orientation_override is not None
+                                                           else "episode_reset") if self.robot == "panda" else "native_controller")
             if self.project_goals_to_region:
                 record.metadata["controller_target"] = primitive.controller_target
         if self.record_dense_trajectory:

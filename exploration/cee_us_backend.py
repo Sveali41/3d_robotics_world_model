@@ -50,17 +50,30 @@ class CEEUSBackend:
                  num_objects=2, device='cpu', seed=0, *, ensemble_size=5,
                  hidden_dim=128, horizon=30, candidates=128, iterations=3,
                  elites=10, batch_size=125, execution='reference', action_projection=None,
-                 object_heuristic=None, runtime_optimizations=False):
+                 object_heuristic=None, runtime_optimizations=False, action_dim=4,
+                 object_names=None):
+        if isinstance(action_dim, bool) or not isinstance(action_dim, (int, np.integer)) or action_dim < 1:
+            raise ValueError('action_dim must be a positive integer')
+        if action_projection is not None and action_dim != 4:
+            raise ValueError('action_projection requires action_dim=4')
         if execution not in {'reference', 'cuda_graph'}:
             raise ValueError('execution must be reference or cuda_graph')
         if execution == 'cuda_graph' and torch.device(device).type != 'cuda':
             raise ValueError('cuda_graph execution requires a CUDA device')
-        self.object_heuristic = self._validate_object_heuristic(object_heuristic)
-        if self.object_heuristic is not None and (agent_dim, object_dyn_dim, num_objects) != (32, 12, 2):
-            raise ValueError('object_heuristic requires agent_dim=32, object_dyn_dim=12, num_objects=2')
+        if object_names is None:
+            object_names = ('cabinet_item_16', 'cabinet_item_17') if num_objects == 2 else ()
+        if object_names and (len(object_names) != num_objects or
+                             len(set(object_names)) != num_objects or
+                             not all(isinstance(name, str) and name for name in object_names)):
+            raise ValueError('object_names must contain one unique nonempty name per object')
+        self.object_names = tuple(object_names)
+        self.object_heuristic = self._validate_object_heuristic(object_heuristic, self.object_names)
+        if self.object_heuristic is not None and (agent_dim not in (32, 33) or object_dyn_dim != 12 or len(self.object_names) != num_objects):
+            raise ValueError('object_heuristic requires agent_dim=32 or 33, object_dyn_dim=12, and object_names for all objects')
         torch_helpers.device = torch.device(device)
         torch.manual_seed(seed)
         self.device = torch.device(device)
+        self.action_dim = int(action_dim)
         self.runtime_optimizations = bool(runtime_optimizations)
         self.profile_timings = None
         self.action_projection = deepcopy(action_projection)
@@ -84,7 +97,7 @@ class CEEUSBackend:
         self.env = SimpleNamespace(
             agent_dim=agent_dim, object_dyn_dim=object_dyn_dim,
             object_stat_dim=object_stat_dim, nObj=num_objects,
-            action_space=spaces.Box(-1., 1., (4,), dtype=np.float32),
+            action_space=spaces.Box(-1., 1., (self.action_dim,), dtype=np.float32),
             observation_space=spaces.Box(-np.inf, np.inf, (self.state_dim,), dtype=np.float32),
             obs_preproc=lambda x: x, obs_postproc=lambda x: x,
             cost_fn=lambda obs, actions, next_obs: torch.zeros_like(next_obs[..., 0]),
@@ -125,7 +138,7 @@ class CEEUSBackend:
             self.model.predict = self.prediction_accelerator.predict
 
     @staticmethod
-    def _validate_object_heuristic(setting):
+    def _validate_object_heuristic(setting, object_names=('cabinet_item_16', 'cabinet_item_17')):
         if setting is None:
             return None
         if not isinstance(setting, dict) or set(setting) - {'approach_weight', 'distance_scale_m', 'object_weights'}:
@@ -142,8 +155,8 @@ class CEEUSBackend:
                 raise ValueError(f'object_heuristic {name} must be finite and ' +
                                  ('positive' if name == 'distance_scale_m' else 'nonnegative'))
         weights = result['object_weights']
-        if not isinstance(weights, dict) or not weights or set(weights) - {'cabinet_item_16', 'cabinet_item_17'}:
-            raise ValueError('object_heuristic object_weights must target cabinet_item_16 or cabinet_item_17')
+        if not isinstance(weights, dict) or not weights or set(weights) - set(object_names):
+            raise ValueError('object_heuristic object_weights must target configured object_names')
         try:
             weights = {name: float(value) for name, value in weights.items()}
         except (TypeError, ValueError):
@@ -156,7 +169,8 @@ class CEEUSBackend:
     def _object_heuristic_scores(self, observations, next_observations):
         setting = self.object_heuristic
         progress = {}
-        for name, start in (('cabinet_item_16', 32), ('cabinet_item_17', 44)):
+        for index, name in enumerate(self.object_names):
+            start = self.env.agent_dim + index * self.env.object_dyn_dim
             if name in setting['object_weights']:
                 before = observations[..., 18:21] - observations[..., start:start + 3]
                 after = next_observations[..., 18:21] - next_observations[..., start:start + 3]
@@ -214,7 +228,7 @@ class CEEUSBackend:
     def predict(self, states, actions):
         states = np.asarray(states, dtype=np.float32)
         states = self._array(states, (len(states), self.state_dim), 'states')
-        actions = self._array(actions, (len(states), 4), 'actions')
+        actions = self._array(actions, (len(states), self.action_dim), 'actions')
         obs = torch.as_tensor(states, device=self.device)[None].expand(self.ensemble_size, -1, -1)
         act = torch.as_tensor(actions, device=self.device)[None].expand(self.ensemble_size, -1, -1)
         result = self.model.predict(observations=obs, states=None, actions=act)[0].cpu().numpy()
@@ -226,7 +240,7 @@ class CEEUSBackend:
         states = np.asarray(states, dtype=np.float32)
         states = self._array(states, (len(states), self.state_dim), 'states')
         actions = np.asarray(actions, dtype=np.float32)
-        actions = self._array(actions, (len(states), actions.shape[1], 4), 'actions')
+        actions = self._array(actions, (len(states), actions.shape[1], self.action_dim), 'actions')
         old_count, old_horizon = self.model.num_simulated_trajectories, self.model.horizon
         old_predict = self.model.predict
         try:
@@ -258,7 +272,7 @@ class CEEUSBackend:
         if len(states) < 2 or epochs < 1:
             raise ValueError('CEE-US fitting requires at least two transitions and epochs >= 1')
         batch = dict(observations=states,
-                     actions=self._array(replay['actions'], (len(states), 4), 'actions'),
+                     actions=self._array(replay['actions'], (len(states), self.action_dim), 'actions'),
                      next_observations=self._array(replay['next_states'], states.shape, 'next_states'),
                      rewards=np.zeros(len(states), dtype=np.float32))
         if not np.array_equal(states[:, self.dynamic_dim:], batch['next_observations'][:, self.dynamic_dim:]):
@@ -308,7 +322,7 @@ class CEEUSBackend:
         started = perf_counter()
         self.planner.rollout_seconds = 0.
         action = self.planner.get_action(state, state=None)
-        action = self._array(action, (4,), 'action').copy()
+        action = self._array(action, (self.action_dim,), 'action').copy()
         self.planner.last_action = torch.as_tensor(action, device=self.device).clone()
         std = self.planner.selected_std
         components = dict(joint=float(std[:, :18].sum()), tcp=float(std[:, 18:30].sum()),
@@ -334,7 +348,7 @@ class CEEUSBackend:
             action = self.random_sequence[0].clone()
             tail = self.planner.sample_action_sequences(state, 1, time_slice=(-1, None))[0]
             self.random_sequence = torch.cat((self.random_sequence[1:], tail), dim=0)
-            return self._array(action.cpu().numpy(), (4,), 'random action').copy()
+            return self._array(action.cpu().numpy(), (self.action_dim,), 'random action').copy()
         finally:
             self.planner.mean_.copy_(saved_mean)
             self.planner.std_.copy_(saved_std)
@@ -352,6 +366,7 @@ class CEEUSBackend:
     def state_dict(self):
         payload = dict(
             model=self.model.model.state_dict(), optimizer=self.model.optimizer.state_dict(),
+            action_dim=self.action_dim,
             normalizers={n: getattr(self.model, n).state_dict() for n in self.normalizer_names},
             planner={n: getattr(self.planner, n, None) for n in
                      ('mean_', 'std_', 'last_action', 'was_reset', 'forward_model_state')},
@@ -362,6 +377,8 @@ class CEEUSBackend:
         return self._move_tensors(payload, 'cpu')
 
     def load_state_dict(self, payload, *, restore_planner=True):
+        if payload.get('action_dim', 4) != self.action_dim:
+            raise ValueError('Checkpoint action_dim does not match backend action_dim')
         if payload.get('object_heuristic') != self.object_heuristic:
             raise ValueError('Checkpoint object_heuristic does not match backend object_heuristic')
         if payload.get('action_projection') != self.action_projection:

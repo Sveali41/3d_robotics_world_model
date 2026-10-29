@@ -1,3 +1,6 @@
 [submodule "PointWorld"]
 	path = PointWorld
 	url = https://github.com/Sveali41/PointWorld.git
+[submodule "raps_official"]
+	path = raps_official
+	url = https://github.com/mihdalal/raps.git

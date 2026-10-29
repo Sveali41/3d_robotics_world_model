@@ -141,7 +141,8 @@ class GraphNeuralNetworkEnsemble(nn.Module):
                 agg = unsorted_segment_sum_ensemble(edge_attr, edge_index_for_segment, num_segments=node_attr.size(1))
             out = torch.cat([node_attr, agg], dim=-1)
         else:
-            out = node_attr
+            agg = node_attr.new_zeros((*node_attr.shape[:-1], self.hidden_dim))
+            out = torch.cat([node_attr, agg], dim=-1)
         if mode == "local":
             return self.node_mlp(out)
         elif mode == "global":
@@ -198,6 +199,8 @@ class GraphNeuralNetworkEnsemble(nn.Module):
         node_attr = node_attributes.reshape(self.ensemble_size, -1, self.node_dyn_dim + self.node_stat_dim)
         edge_attr = None
         edge_index = None
+        row = None
+        edge_batch_ind = None
 
         if num_nodes > 1:
             # edge_index: [B * (num_nodes*[num_nodes-1]), 2] edge list
@@ -233,7 +236,7 @@ class GraphNeuralNetworkEnsemble(nn.Module):
         if self.cache_batch_indices:
             node_batch_ind, _ = self._get_batch_indices(batch_size, num_nodes, edge_index)
         else:
-            node_batch_ind = torch.repeat_interleave(torch.arange(0, batch_size, 1), self.num_nodes).to(self.device)
+            node_batch_ind = torch.repeat_interleave(torch.arange(0, batch_size, 1), num_nodes).to(self.device)
 
         # batch_shared: (N*nObj) x shared_dim
         batch_shared = torch.index_select(flat_shared, 1, node_batch_ind)

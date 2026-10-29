@@ -49,10 +49,10 @@ def screen(random_summary, curiosity_summary):
             "limitation": "Single seed, fixed layout, privileged state; no grasp or visual-generalization claim"}
 
 
-def _errors(prediction, target):
+def _errors(prediction, target, agent_dim=32):
     """Physical errors; velocity channels are intentionally not mixed into pose errors."""
-    positions = [slice(32, 35), slice(44, 47)]
-    rotations = [slice(35, 38), slice(47, 50)]
+    positions = [slice(agent_dim, agent_dim + 3), slice(agent_dim + 12, agent_dim + 15)]
+    rotations = [slice(agent_dim + 3, agent_dim + 6), slice(agent_dim + 15, agent_dim + 18)]
     position = np.stack([np.linalg.norm(prediction[..., s] - target[..., s], axis=-1)
                          for s in positions], axis=-1)
     angular = []
@@ -67,6 +67,8 @@ def prediction_metrics(backend, replay, horizons=(1, 10, 30), batch_size=16):
     """Evaluate on supplied held-out transitions, never across episode/reset boundaries."""
     states, next_states = replay["states"], replay["next_states"]
     actions, episodes = replay["actions"], replay["episode_ids"]
+    agent_dim = getattr(getattr(backend, "env", None), "agent_dim", 32)
+    physical_indices = np.r_[np.arange(32), np.arange(agent_dim, agent_dim + 24)]
     result = {}
     for horizon in horizons:
         starts = [i for i in range(len(states) - horizon + 1)
@@ -87,15 +89,15 @@ def prediction_metrics(backend, replay, horizons=(1, 10, 30), batch_size=16):
             target = np.stack([next_states[i:i + horizon] for i in indices])
             mean = predictions.mean(axis=0)
             baseline = np.broadcast_to(initial[:, None], target.shape)
-            ep, ea = _errors(mean[:, -1], target[:, -1])
-            bp, ba = _errors(baseline[:, -1], target[:, -1])
+            ep, ea = _errors(mean[:, -1], target[:, -1], agent_dim)
+            bp, ba = _errors(baseline[:, -1], target[:, -1], agent_dim)
             errors.extend(ep); angles.extend(ea)
             baseline_errors.extend(bp); baseline_angles.extend(ba)
             # Same 1.5 cm threshold as the interaction metrics, over this window.
             moved.extend(bp >= 0.015)
             if horizon == 1:
-                disagreements.extend(predictions.std(axis=0, ddof=1)[..., :56].sum(axis=(-1, -2)))
-                actual_errors.extend(np.sqrt(np.mean((mean[..., :56] - target[..., :56]) ** 2,
+                disagreements.extend(predictions.std(axis=0, ddof=1)[..., physical_indices].sum(axis=(-1, -2)))
+                actual_errors.extend(np.sqrt(np.mean((mean[..., physical_indices] - target[..., physical_indices]) ** 2,
                                                      axis=(-1, -2))))
         errors, baseline_errors = np.asarray(errors), np.asarray(baseline_errors)
         angles, baseline_angles, moved = np.asarray(angles), np.asarray(baseline_angles), np.asarray(moved)

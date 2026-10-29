@@ -212,12 +212,12 @@ def test_collector_logs_heuristic_from_executed_transition(monkeypatch, tmp_path
     assert all(r['reward'] == {'total': 0} for r in rows)
 
 
-def test_heuristic_configuration_matches_completed_baseline():
+def test_ee_baseline_preserves_recorded_protocol():
     from omegaconf import OmegaConf
     import exploration.cee_us_cabinet as runner
-    baseline = OmegaConf.to_container(OmegaConf.load(runner.ROOT/'configs/cee_us_cabinet_60k.yaml'))
-    guided = OmegaConf.to_container(OmegaConf.load(runner.ROOT/'configs/cee_us_cabinet_60k_heuristic.yaml'))
-    heuristic = guided.pop('object_heuristic')
-    assert guided == baseline
-    assert heuristic['approach_weight'] == 50.
-    assert heuristic['object_weights'] == {'cabinet_item_16': 1., 'cabinet_item_17': 1.}
+    config = OmegaConf.load(runner.ROOT/'configs/cee_us_cabinet_120k_total_heuristic.yaml')
+    assert config.agent == 'icem'
+    assert config.execution == 'cuda_graph' and config.planner_candidates == 128
+    assert config.bootstrap_steps + config.rounds * config.steps_per_round + config.evaluation_steps == 120000
+    assert config.object_heuristic.approach_weight == 50.
+    assert dict(config.object_heuristic.object_weights) == {'cabinet_item_16': 1., 'cabinet_item_17': 1.}

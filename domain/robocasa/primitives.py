@@ -147,11 +147,12 @@ class RAPSActionSchema:
             "move_forward": [8], "move_backward": [9],
             "open_gripper": [], "close_gripper": [],
         }
-        self.primitive_name_to_action_idx = official_indices
-        self.max_arg_len = 10
+        self.primitive_name_to_action_idx = {name: official_indices[name] for name in self.primitive_names}
+        self.max_arg_len = max((index for indices in self.primitive_name_to_action_idx.values()
+                                for index in indices), default=-1) + 1
         self.parameter_slices = {
             name: (indices[0], indices[-1] + 1) if indices else (0, 0)
-            for name, indices in official_indices.items()
+            for name, indices in self.primitive_name_to_action_idx.items()
         }
         self.num_parameters = self.max_arg_len
         self.action_dim = self.num_primitives + self.num_parameters
@@ -213,6 +214,11 @@ class RAPSActionSchema:
 
 
 RAPS_ACTION_SCHEMA = RAPSActionSchema()
+RAPS_COMPACT_ACTION_SCHEMA = RAPSActionSchema(tuple(
+    spec for spec in RAPS_PRIMITIVE_SPECS
+    if spec.name in {"move_delta_ee_pose", "top_grasp", "lift", "drop",
+                     "open_gripper", "close_gripper"}
+))
 
 
 @dataclass(frozen=True)
@@ -500,6 +506,8 @@ class Primitive:
 
     @staticmethod
     def _hold_gripper(context: PrimitiveContext) -> float:
+        if hasattr(context, "gripper_command"):
+            return float(context.gripper_command)
         return float(np.clip(2.0 * context.gripper_open - 1.0, -1.0, 1.0))
 
     def next_action(self, context: PrimitiveContext) -> np.ndarray | None:
@@ -641,9 +649,17 @@ class DropPrimitive(Primitive):
     def next_action(self, context):
         if not self._tick():
             return None
-        action, reached = self._move_to(
-            context, self.goal, self._hold_gripper(context)
-        )
+        if getattr(self, "controlled_placement", False):
+            remaining = max(0.0, float(context.ee_position[2] - self.goal[2]))
+            speed = min(.25, max(.025, .25 * remaining / .08))
+            action, reached = self._move_to(
+                context, self.goal, self._hold_gripper(context),
+                tolerance=.002, speed=speed,
+            )
+        else:
+            action, reached = self._move_to(
+                context, self.goal, self._hold_gripper(context)
+            )
         if reached:
             self.status = "success"
             return None
@@ -713,7 +729,7 @@ class TopGraspPrimitive(Primitive):
 
     def observe(self, context):
         snapshot = super().observe(context)
-        if self.stage == "approach":
+        if self.stage == "approach" and getattr(self, "stop_on_contact", True):
             # Stop as soon as both fingertips have a light contact. Waiting
             # for both sides avoids closing on a one-sided collision while
             # preventing the high-force push seen with the old threshold.

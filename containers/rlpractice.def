@@ -1,0 +1,91 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Maintainer sensible_robots_lab
+    Version 1.0
+    Description "ManiSkill cabinet exploration with the vendored CEE-US backend"
+    PythonVersion 3.10.13
+
+%files
+    /home/siyao/Containers_file/Containers/create_container/Create-A-Container/requirements.txt /opt/rlpractice/requirements.txt
+    /home/siyao/phd_file/Research/rlPractice/3d_world_model/domain/ManiSkill /opt/rlpractice/domain/ManiSkill
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        wget \
+        curl \
+        git \
+        tzdata \
+        libssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        llvm \
+        libncurses5-dev \
+        libncursesw5-dev \
+        xz-utils \
+        tk-dev \
+        libffi-dev \
+        liblzma-dev \
+        libvulkan1 \
+        vulkan-tools \
+        libgl1 \
+        libegl1 \
+        libglib2.0-0 \
+        libx11-6 \
+        libxcb1 \
+        libxext6 \
+        libxrender1 \
+        fonts-dejavu-core
+
+    ln -fs /usr/share/zoneinfo/UTC /etc/localtime
+    dpkg-reconfigure --frontend noninteractive tzdata
+
+    cd /opt
+    wget -O Python-3.10.13.tgz https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz
+    tar xzf Python-3.10.13.tgz
+    cd Python-3.10.13
+    ./configure --enable-optimizations --with-ensurepip=install
+    make -j2 altinstall
+    ln -sf /usr/local/bin/python3.10 /usr/local/bin/python
+
+    python3.10 -m ensurepip
+    cd /opt/rlpractice
+    test -f domain/ManiSkill/setup.py
+    python3.10 -m pip install --no-cache-dir -r requirements.txt
+
+    # Build sources are not needed at runtime; keep the editable ManiSkill tree.
+    rm -rf /opt/Python-3.10.13 /opt/Python-3.10.13.tgz
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export PATH="/usr/local/bin:$PATH"
+    export PYTHON_VERSION=3.10.13
+    export PYTHONUNBUFFERED=1
+    export MPLCONFIGDIR=/tmp/matplotlib
+
+%test
+    python3.10 -c "import torch, sapien, mani_skill, numpy, scipy, gymnasium, hydra, omegaconf, forwardable; print('Container imports OK; torch:', torch.__version__)"
+
+%runscript
+    exec /bin/bash "$@"
+
+%help
+    Build:
+        sudo apptainer build rlpractice.sif containers/rlpractice.def
+
+    Run from the project root with a GPU:
+        apptainer exec --nv --bind "$PWD":/workspace --pwd /workspace rlpractice.sif python3.10 -m exploration.cee_us_cabinet --help
+
+    Project code, configs and experiment outputs are supplied by the bind mount.
+    The image contains the requirements and the local editable ManiSkill source.
+    NVIDIA drivers and Vulkan device access must be provided by the host.

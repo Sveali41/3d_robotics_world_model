@@ -10,6 +10,7 @@ from exploration.cee_us_state import (
     OBJECT_NAMES,
     OBJECT_STAT_DIM,
     CabinetStateEncoder,
+    CabinetSkillStateEncoder,
 )
 
 
@@ -87,6 +88,24 @@ def test_state_layout_root_transform_and_dt_scaling():
     np.testing.assert_allclose(state[44:47], [-1, 0, 1], atol=1e-6)
     np.testing.assert_allclose(state[56:66], [1, 0, 0.1, 0.2, 0.3, 0, 1, 0.4, 0.5, 0.6])
     assert mug.name == OBJECT_NAMES[0] and bowl.name == OBJECT_NAMES[1]
+
+
+def test_skill_command_is_explicit_agent_state_and_legacy_layout_is_unchanged():
+    env, *_ = _env()
+    original = CabinetStateEncoder(env).encode()
+    legacy = CabinetSkillStateEncoder(env)
+    np.testing.assert_array_equal(original, legacy.encode())
+    encoder = CabinetSkillStateEncoder(env, latched_gripper=True)
+    encoder.gripper_command = -1.0
+    state = encoder.encode()
+    assert state.shape == (67,) and state[32] == -1
+    np.testing.assert_array_equal(np.delete(state, 32), original)
+    contract = encoder.contract()
+    assert contract["agent_dim"] == 33 and contract["dimension"] == 67
+    assert contract["fields"][8]["name"] == "last_gripper_command"
+    encoder.gripper_command = float("nan")
+    with pytest.raises(ValueError, match="gripper command"):
+        encoder.encode()
 
 
 def test_projection_contract_transforms_root_to_cabinet():

@@ -1,0 +1,49 @@
+# Heuristic-only: 399k training + 1k frozen evaluation.
+# Resume the 89k round checkpoint with --checkpoint; all other settings unchanged.
+agent: raps_gnn_actor
+seed: 0
+device: cuda
+bootstrap_steps: 1000
+rounds: 398
+steps_per_round: 1000
+evaluation_steps: 1000
+epochs: 25
+execution: reference
+runtime_optimizations: false
+cpu_threads: 1
+action_mode: ee_delta
+exploration_mode: baseline
+sim_freq: 100
+control_freq: 20
+episode_steps: 800
+project_goals_to_region: false
+centered_initial_tcp: true
+object_heuristic:
+  approach_weight: 50.0
+  distance_scale_m: 0.1
+  object_weights:
+    cabinet_item_16: 1.0
+    cabinet_item_17: 1.0
+raps_actor:
+  skill_set: compact6
+  hidden_size: 128
+  actor_layers: 2
+  critic_layers: 3
+  init_std: 1.0
+  imagination_horizon: 5
+  imagination_batch_size: 64
+  updates_per_round: 100
+  discount: 0.8
+  lambda_return: 0.95
+  actor_lr: 8.0e-05
+  critic_lr: 8.0e-05
+  adam_eps: 1.0e-05
+  entropy_scale: 0.0001
+  gradient_clip: 100.0
+  target_update_period: 100
+  hold_closed_during_motion: false
+  latched_gripper: true
+  stop_drop_on_support: true
+  grasp_stop_on_contact: false
+  controlled_placement: true
+  disagreement_weight: 0.0

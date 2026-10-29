@@ -75,17 +75,22 @@ def replay_view(storage, count):
     return {key: value[:count] for key, value in storage.items()}
 
 
-def make_env(*, project_goals_to_region=False):
+def make_env(*, project_goals_to_region=False, episode_steps=None, centered_initial_tcp=False):
     from main import build_env
     cfg = OmegaConf.load(ROOT / "configs/exploration.yaml")
     cfg.action_mode = "ee_delta"
     cfg.exploration_mode = "baseline"
     cfg.project_goals_to_region = bool(project_goals_to_region)
+    cfg.centered_initial_tcp = centered_initial_tcp
     cfg.headless = True
     cfg.render_mode = None
     cfg.sim_backend = "cpu"
     cfg.sim.sim_freq, cfg.sim.control_freq = 100, 20
     cfg.ppo.record_dense_trajectory = False
+    if episode_steps is not None:
+        if isinstance(episode_steps, bool) or int(episode_steps) != episode_steps or episode_steps < 1:
+            raise ValueError("episode_steps must be a positive integer")
+        cfg.max_ee_steps_per_episode = int(episode_steps)
     return build_env(cfg), cfg
 
 
@@ -472,11 +477,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("smoke", "compare", "train", "evaluate", "report"))
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/cee_us_cabinet.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/cee_us_cabinet_120k_total_heuristic.yaml")
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--policy", choices=("random", "curiosity"), default="curiosity")
+    parser.add_argument("--agent", choices=("icem", "raps_gnn_actor"),
+                        help="Exploration implementation; omitted keeps the configured agent, default iCEM")
     args = parser.parse_args(argv)
+    selected_agent = args.agent or OmegaConf.load(args.config).get("agent", "icem")
+    if selected_agent == "raps_gnn_actor":
+        from exploration.raps_gnn_actor import run
+        return run(args, OmegaConf.load(args.config))
+    if selected_agent != "icem":
+        parser.error(f"Unknown exploration agent: {selected_agent}")
     if args.stage == "report":
         if args.output is None or not args.output.is_dir():
             parser.error("report requires an existing --output directory")
@@ -485,6 +498,8 @@ def main(argv=None):
     if args.stage == "evaluate" and args.checkpoint is None:
         parser.error("evaluate requires --checkpoint")
     config = OmegaConf.load(args.config)
+    if args.agent is not None:
+        config.agent = args.agent
     if args.device:
         config.device = args.device
     for key in ("bootstrap_steps", "rounds", "steps_per_round", "evaluation_steps", "epochs"):

@@ -1,8 +1,9 @@
-# Fresh 120k run matched to the existing 60k curiosity + approach experiment.
+# Direct EE + GNN + iCEM, fresh run; 119000 training ticks + 1000 frozen evaluation ticks.
+# Preserves existing EE protocol, including environment episode length.
 seed: 0
 device: cuda
 bootstrap_steps: 1000
-rounds: 119
+rounds: 118
 steps_per_round: 1000
 evaluation_steps: 1000
 epochs: 25
@@ -21,3 +22,4 @@ object_heuristic:
   object_weights:
     cabinet_item_16: 1.0
     cabinet_item_17: 1.0
+agent: icem

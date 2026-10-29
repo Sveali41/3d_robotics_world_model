@@ -467,7 +467,7 @@ def main(argv=None):
         parser.error("compare requires CUDA cuda_graph execution")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; benchmark can use --device cpu explicitly")
-    config = OmegaConf.load(ROOT / "configs/cee_us_cabinet.yaml")
+    config = OmegaConf.load(ROOT / "configs/cee_us_cabinet_120k_total_heuristic.yaml")
     config = OmegaConf.merge(config, payload.get("config", {}), {"stage": args.stage, "seed": 0, "device": args.device,
                             "checkpoint": str(args.checkpoint.resolve()),
                             "training_updates": "measured_isolated_updates" if args.stage == "profile" else 0,

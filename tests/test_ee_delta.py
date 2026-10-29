@@ -94,6 +94,22 @@ def test_grasp_persistence_validation_and_episode_reset(monkeypatch):
             wrapper.step(action)
 
 
+def test_skill_orientation_hold_and_restoring_reset_target(monkeypatch):
+    base, wrapper = make_wrapper(monkeypatch)
+    set_arm_rotation(base.arm, [.1, 0, 0])
+    quaternion = base.arm.ee_pose_at_base.q.numpy().copy()
+    wrapper.set_ee_orientation_override(quaternion)
+    np.testing.assert_allclose(wrapper._controller_action(np.zeros(4))[3:6], 0, atol=1e-6)
+    wrapper.set_ee_orientation_override(None)
+    assert np.linalg.norm(wrapper._controller_action(np.zeros(4))[3:6]) > .9
+    wrapper.set_ee_orientation_override(quaternion)
+    wrapper.reset()
+    assert wrapper._ee_orientation_override is None
+    for invalid in ([0, 0, 0, 0], [1, 0, float("nan"), 0], [1, 0, 0]):
+        with pytest.raises(ValueError, match="quaternion"):
+            wrapper.set_ee_orientation_override(invalid)
+
+
 def test_cumulative_lift_detects_small_steps_over_continuous_grasp():
     references = {}
     lifted = []

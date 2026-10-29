@@ -49,6 +49,7 @@ def build_env(cfg: DictConfig):
         },
         visualize_exploration_region=not cfg.headless,
         viewer_camera_configs={"shader_pack": cfg.shader},
+        centered_initial_tcp=getattr(cfg, "centered_initial_tcp", False),
     )
     raps_env = RAPSEnvWrapper(
         base_env,

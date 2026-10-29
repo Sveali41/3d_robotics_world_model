@@ -1,4 +1,4 @@
-"""Fixed-layout state encoder for the two-object CEE-US cabinet task."""
+"""State encoder for the CEE-US cabinet task."""
 
 from __future__ import annotations
 
@@ -64,7 +64,9 @@ class CabinetStateEncoder:
 
         actors = {getattr(actor, "name", None): actor
                   for actor in getattr(self.env, "cabinet_items", [])}
-        missing = [name for name in OBJECT_NAMES if name not in actors]
+        object_names = OBJECT_NAMES
+        object_types = OBJECT_TYPES
+        missing = [name for name in object_names if name not in actors]
         if missing:
             raise ValueError(f"Missing required cabinet actors: {missing}")
         item_types = getattr(self.env, "cabinet_item_types", [])
@@ -72,13 +74,15 @@ class CabinetStateEncoder:
             getattr(actor, "name", None): item_type
             for actor, item_type in zip(self.env.cabinet_items, item_types)
         }
-        if tuple(type_by_name.get(name) for name in OBJECT_NAMES) != OBJECT_TYPES:
+        if tuple(type_by_name.get(name) for name in object_names) != object_types:
             raise ValueError(
-                "Expected cabinet_item_16=mug and cabinet_item_17=bowl; "
-                f"got {tuple(type_by_name.get(name) for name in OBJECT_NAMES)!r}"
+                f"Expected cabinet object types {object_types!r}; "
+                f"got {tuple(type_by_name.get(name) for name in object_names)!r}"
             )
 
-        self.objects = tuple((name, actors[name]) for name in OBJECT_NAMES)
+        self.object_names = object_names
+        self.object_types = object_types
+        self.objects = tuple((name, actors[name]) for name in object_names)
         self.collision_extents = {}
         self.collision_metadata = {}
         for name, actor in self.objects:
@@ -153,13 +157,14 @@ class CabinetStateEncoder:
                 *(angular_velocity * self.dt),
             ))
 
-        for index, (name, _) in enumerate(self.objects):
+        for object_type, (name, _) in zip(self.object_types, self.objects):
             one_hot = np.zeros(2, dtype=np.float32)
-            one_hot[index] = 1.0
+            if object_type in OBJECT_TYPES:
+                one_hot[OBJECT_TYPES.index(object_type)] = 1.0
             state.extend((*one_hot, *self.collision_extents[name]))
 
         result = np.asarray(state, dtype=np.float32)
-        if result.shape != (AGENT_DIM + 2 * OBJECT_DYN_DIM + 2 * OBJECT_STAT_DIM,):
+        if result.shape != (AGENT_DIM + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),):
             raise ValueError(f"Encoded state has unexpected shape {result.shape}")
         if not np.all(np.isfinite(result)):
             raise ValueError("Encoded state contains non-finite values")
@@ -192,26 +197,26 @@ class CabinetStateEncoder:
             {"name": "door_angle", "shape": [1], "units": "rad"},
             {"name": "door_qvel_dt", "shape": [1], "units": "rad per control step"},
         ]
-        for name in OBJECT_NAMES:
+        for name in self.object_names:
             fields.append({"name": f"{name}.root_position", "shape": [3], "units": "m"})
             fields.append({"name": f"{name}.root_euler_xyz", "shape": [3], "units": "rad"})
             fields.append({"name": f"{name}.root_linear_velocity_dt", "shape": [3], "units": "m per control step"})
             fields.append({"name": f"{name}.root_angular_velocity_dt", "shape": [3], "units": "rad per control step"})
-        for name in OBJECT_NAMES:
+        for name in self.object_names:
             fields.append({"name": f"{name}.type_one_hot_mug_bowl", "shape": [2], "units": "binary"})
             fields.append({"name": f"{name}.collision_mesh_extents", "shape": [3], "units": "m"})
         position, rotation = self._root_position, self._root_rotation
         return {
             "dtype": "float32",
-            "dimension": AGENT_DIM + 2 * OBJECT_DYN_DIM + 2 * OBJECT_STAT_DIM,
+            "dimension": AGENT_DIM + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),
             "dt_seconds": self.dt,
             "control_freq_hz": 20,
             "layout": ["agent", "object_dynamics_sorted_by_name", "object_static_sorted_by_name"],
             "agent_dim": AGENT_DIM,
             "object_dyn_dim": OBJECT_DYN_DIM,
             "object_stat_dim": OBJECT_STAT_DIM,
-            "object_names": list(OBJECT_NAMES),
-            "object_types": list(OBJECT_TYPES),
+            "object_names": list(self.object_names),
+            "object_types": list(self.object_types),
             "fields": fields,
             "root_transform_world": {
                 "position_m": position.tolist(),
@@ -219,3 +224,30 @@ class CabinetStateEncoder:
             },
             "collision_meshes": self.collision_metadata,
         }
+
+
+class CabinetSkillStateEncoder(CabinetStateEncoder):
+    """Expose the persistent skill-controller command as an observed state."""
+
+    def __init__(self, env, *, latched_gripper=False):
+        super().__init__(env)
+        self.latched_gripper = bool(latched_gripper)
+        self.gripper_command = 1.0
+
+    def encode(self):
+        state = super().encode()
+        if not self.latched_gripper:
+            return state
+        if not np.isfinite(self.gripper_command) or not -1 <= self.gripper_command <= 1:
+            raise ValueError("Skill gripper command must be finite and normalized")
+        return np.insert(state, AGENT_DIM, self.gripper_command).astype(np.float32)
+
+    def contract(self):
+        contract = super().contract()
+        if self.latched_gripper:
+            contract["agent_dim"] += 1
+            contract["dimension"] += 1
+            contract["fields"].insert(8, dict(name="last_gripper_command", shape=[1],
+                                              units="normalized controller command"))
+            contract["controller_state"] = "latched_gripper_v1"
+        return contract

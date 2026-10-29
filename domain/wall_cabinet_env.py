@@ -85,8 +85,12 @@ class WallCabinetEnv(BaseEnv):
         populate_cabinet: bool = True,
         cabinet_item_layout: str | None = None,
         visualize_exploration_region: bool = False,
+        centered_initial_tcp: bool = False,
         **kwargs,
     ):
+        if not isinstance(centered_initial_tcp, bool):
+            raise ValueError("centered_initial_tcp must be a boolean")
+        self.centered_initial_tcp = centered_initial_tcp
         self.populate_cabinet = populate_cabinet
         self.visualize_exploration_region = bool(visualize_exploration_region)
         self.exploration_region_bounds_local = (
@@ -847,7 +851,16 @@ class WallCabinetEnv(BaseEnv):
                 item.set_angular_velocity(torch.zeros((batch_size, 3)))
 
             # A collision-free ready configuration facing the cabinet.
-            qpos = self.PREGRASP_QPOS.copy()
+            # Fixed IK solution preserves the baseline TCP x/z and orientation,
+            # while moving its root-frame y from -0.06 m to approximately zero.
+            qpos = (
+                np.array(
+                    [-0.0064634923, -1.0980846882, 0.0128412554,
+                     -2.6732239723, 0.0488997027, 3.1393697262,
+                     0.7438901663, 0.04, 0.04], dtype=np.float32
+                )
+                if self.centered_initial_tcp else self.PREGRASP_QPOS.copy()
+            )
             qpos = np.repeat(qpos[None, :], batch_size, axis=0)
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(self.ROBOT_POSE)

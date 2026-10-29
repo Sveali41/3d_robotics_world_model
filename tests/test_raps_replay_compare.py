@@ -160,3 +160,39 @@ def test_fixed_wm_test_excludes_either_arms_overlap_and_missing_motion():
     static=dict(states=states,actions=actions,next_states=states.copy())
     result=fixed_wm_test(model,static,[])
     assert result['moving_endpoints']==0 and result['moving_error_cm'] is None
+
+
+def test_shared_bootstrap_checks_source_contract_and_is_independently_loaded(fixture,tmp_path):
+    from exploration.raps_replay_compare import read_bootstrap
+    from exploration.cee_us_cabinet import rng_state
+    config,payload,encoder,replay=fixture
+    _,actor=initialize(config,payload,encoder,False)
+    skills=[dict(state=s.tolist(),next_state=y.tolist(),action=a.tolist(),episode_id=1,
+                 terminated=False,truncated=False,duration_low_steps=1,trainable=True)
+            for s,y,a in zip(replay['states'],replay['next_states'],replay['actions'])]
+    package=dict(schema='cabinet-shared-bootstrap-v1',source_sha256='source',source_replay_sha256='replay',
+                 state_contract=encoder.contract(),action_contract=action_contract(actor.settings),smoke=True,
+                 device='cpu',object_shift_xy_m=[.03,0.],ticks=[{'step':i+1} for i in range(160)],skills=skills,rng=rng_state())
+    path=tmp_path/'bootstrap.pt';torch.save(package,path)
+    a=read_bootstrap(path,'source','replay',encoder,actor,True,'cpu')
+    b=read_bootstrap(path,'source','replay',encoder,actor,True,'cpu')
+    compare_nested(a,b)
+    a[0][0]['step']=999
+    assert b[0][0]['step']==1
+    with pytest.raises(ValueError,match='source_sha256'):
+        read_bootstrap(path,'other','replay',encoder,actor,True,'cpu')
+    with pytest.raises(ValueError,match='smoke'):
+        read_bootstrap(path,'source','replay',encoder,actor,False,'cpu')
+
+
+def test_independent_cli_requires_shared_bootstrap_and_selects_one_arm(monkeypatch,tmp_path):
+    from exploration import raps_replay_compare as module
+    seen=[]
+    monkeypatch.setattr(module,'run',lambda args:seen.append(args) or 0)
+    for arm in ('continue','fresh'):
+        with pytest.raises(SystemExit) as exc:module.main([arm,'--output',str(tmp_path/arm)])
+        assert exc.value.code==2
+        assert module.main([arm,'--output',str(tmp_path/arm),'--bootstrap','shared/bootstrap.pt'])==0
+    assert [a.stage for a in seen]==['continue','fresh']
+    assert seen[0].output!=seen[1].output
+    assert seen[0].bootstrap==seen[1].bootstrap

@@ -189,10 +189,12 @@ def fixed_wm_test(backend, dataset, train):
                 per_object_error_cm=(error.mean(0)*100).tolist())
 
 
-def prediction_report(output):
+def prediction_report(output, arm_roots=None):
     """Compare all checkpoints on the SAME old and new diagnostic trajectories."""
     torch.set_num_threads(1)
-    manifest=json.loads((output/'manifest.json').read_text())
+    arm_roots=arm_roots or {arm:output/arm for arm in ('continue','fresh')}
+    first_root=next(iter(arm_roots.values()))
+    manifest=json.loads((first_root.parent/'manifest.json').read_text())
     old=load_old_replay(Path(manifest['source_checkpoint']).with_suffix('.replay.npz'))
     training=[old];datasets={};result={}
     old_test=ROOT/'logs/ee_primitive_wm_validation_20261028/primitive_88000_predictions.npz'
@@ -200,8 +202,7 @@ def prediction_report(output):
         with np.load(old_test) as z:
             datasets['old_fixed']=dict(states=z['states'].copy(),actions=z['skill_actions'].copy(),next_states=z['targets'].copy())
     heldout=[]
-    for arm in ('continue','fresh'):
-        root=output/arm
+    for arm,root in arm_roots.items():
         initial_eval=root/'evaluation/step_000000/shifted/skills.jsonl'
         if initial_eval.exists():
             heldout.extend(json.loads(line) for line in initial_eval.open() if json.loads(line)['trainable'])
@@ -210,8 +211,7 @@ def prediction_report(output):
             with np.load(paths[-1]) as z:training.append({k:z[k].copy() for k in ('states','actions','next_states')})
     if len(heldout)>=2:datasets['new_shared_initial_frozen']=skill_arrays(heldout)
     # Dataset union is collected before fitting, never from either training buffer.
-    for arm in ('continue','fresh'):
-        root=output/arm
+    for arm,root in arm_roots.items():
         paths=[root/'initial.pt']+[root/'curiosity'/f'round_{step//1000-1:03d}.pt' for step in (10000,30000,60000)]
         for path in paths:
             if not path.exists():continue
@@ -227,14 +227,13 @@ def prediction_report(output):
     return result
 
 
-def report(output):
+def report(output, arm_roots=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     result=dict(arms={},limitation='Single seed; policy learner including optimizers/counters is the ablation; no isolated actor attribution')
     fig,axes=plt.subplots(1,3,figsize=(14,4.5));csvrows=[]
-    for arm in ('continue','fresh'):
-        root=output/arm
+    for arm,root in (arm_roots or {arm:output/arm for arm in ('continue','fresh')}).items():
         if not root.exists():continue
         rows=[json.loads(line) for line in (root/'learning.jsonl').read_text().splitlines()] if (root/'learning.jsonl').exists() else []
         evaluations={p.parent.parent.name+'/'+p.parent.name:json.loads(p.read_text()) for p in (root/'evaluation').glob('*/*/evaluation.json')}
@@ -251,9 +250,33 @@ def report(output):
     return result
 
 
+def read_bootstrap(path, source_hash, replay_hash, encoder, actor, smoke, device):
+    package=torch.load(path,map_location='cpu',weights_only=False)
+    expected=dict(schema='cabinet-shared-bootstrap-v1',source_sha256=source_hash,
+                  source_replay_sha256=replay_hash,state_contract=encoder.contract(),
+                  action_contract=action_contract(actor.settings),smoke=smoke,device=str(device),
+                  object_shift_xy_m=[.03,0.])
+    for key,value in expected.items():
+        if package.get(key)!=value:raise ValueError(f'Shared bootstrap {key} differs from this experiment')
+    ticks,skills=package['ticks'],package['skills']
+    if len(ticks)!=(160 if smoke else 1000):raise ValueError('Shared bootstrap has wrong physical budget')
+    skill_arrays(skills)
+    return ticks,skills,package['rng']
+
+
 def run(args):
     if args.stage=='report':
-        prediction_report(args.output);report(args.output);return 0
+        roots=None
+        if args.runs:
+            roots={arm:root/arm for arm,root in zip(('continue','fresh'),args.runs)}
+            manifests=[json.loads((root/'manifest.json').read_text()) for root in args.runs]
+            for key in ('source_sha256','source_replay_sha256','shared_bootstrap_sha256'):
+                if not manifests[0].get(key) or manifests[0][key]!=manifests[1].get(key):
+                    raise ValueError(f'Cannot combine runs: {key} differs or is missing')
+            if args.output.exists():raise FileExistsError('Use a fresh merged report directory')
+            args.output.mkdir(parents=True)
+            write_json(args.output/'inputs.json',dict(continue_run=str(args.runs[0]),fresh_run=str(args.runs[1])))
+        prediction_report(args.output,roots);report(args.output,roots);return 0
     if args.output.exists():raise FileExistsError(f'Refusing to overwrite {args.output}')
     payload=torch.load(args.source,map_location='cpu',weights_only=False)
     config=OmegaConf.create(payload['config']);config.raps_actor=OmegaConf.merge(DEFAULTS,config.raps_actor)
@@ -268,7 +291,12 @@ def run(args):
     old=load_old_replay(args.source.with_suffix('.replay.npz'))
     if config.device=='cuda' and not torch.cuda.is_available():raise RuntimeError('CUDA unavailable; no silent fallback')
     torch.set_num_threads(1);seed_all(0)
-    env=None;physical=0;smoke=args.stage=='smoke';cap=200 if smoke else 135000
+    smoke=args.stage=='smoke' or args.smoke
+    arms=(args.stage,) if args.stage in ('continue','fresh') else ('continue','fresh')
+    bootstrap_only=args.stage=='bootstrap'
+    bootstrap_steps=160 if smoke else 1000
+    cap=bootstrap_steps if bootstrap_only else (20 if smoke else 67000)*len(arms)+(0 if args.bootstrap else bootstrap_steps)
+    env=None;physical=0
     def count_step(row):
         nonlocal physical
         physical+=1
@@ -287,11 +315,26 @@ def run(args):
             log_flush_interval_steps=32,imagination_horizon_skills=5,prediction_horizon_seconds=None)
         write_json(args.output/'manifest.json',manifest)
         common_backend,common_actor=initialize(config,payload,encoder,False)
-        bootstrap=SkillCollector(env,encoder,common_actor,args.output/'bootstrap')
-        ticks,skills=bootstrap.collect(160 if smoke else 1000,'random',seed=0,stage='bootstrap',on_step=count_step)
-        skill_arrays(skills);common_rng=rng_state()
+        if args.bootstrap:
+            ticks,skills,common_rng=read_bootstrap(args.bootstrap,manifest['source_sha256'],
+                manifest['source_replay_sha256'],encoder,common_actor,smoke,config.device)
+            manifest.update(shared_bootstrap_path=str(args.bootstrap.resolve()),
+                            shared_bootstrap_sha256=hashlib.sha256(args.bootstrap.read_bytes()).hexdigest(),
+                            imported_bootstrap_steps=len(ticks),selected_arms=list(arms))
+            write_json(args.output/'manifest.json',manifest)
+        else:
+            bootstrap=SkillCollector(env,encoder,common_actor,args.output/'bootstrap')
+            ticks,skills=bootstrap.collect(bootstrap_steps,'random',seed=0,stage='bootstrap',on_step=count_step)
+            skill_arrays(skills);common_rng=rng_state()
+            torch.save(dict(schema='cabinet-shared-bootstrap-v1',source_sha256=manifest['source_sha256'],
+                source_replay_sha256=manifest['source_replay_sha256'],state_contract=encoder.contract(),
+                action_contract=action_contract(common_actor.settings),smoke=smoke,device=str(config.device),
+                object_shift_xy_m=[.03,0.],ticks=ticks,skills=skills,rng=common_rng),args.output/'bootstrap.pt')
         del common_backend,common_actor
-        for arm in ('continue','fresh'):
+        if bootstrap_only:
+            write_json(args.output/'result.json',dict(status='completed',new_physical_steps=physical,shared_bootstrap='bootstrap.pt'))
+            return 0
+        for arm in arms:
             backend,actor=initialize(config,payload,encoder,arm=='continue');restore_rng(common_rng)
             sampler=np.random.default_rng(0)
             root=args.output/arm;root.mkdir()
@@ -338,7 +381,7 @@ def run(args):
         write_json(args.output/'result.json',dict(status='completed',smoke=smoke,new_physical_steps=physical,
             interaction_dynamics='not_validated_by_smoke' if smoke else 'inspect_frozen_evaluations'))
         write_json(args.output/'progress.json',dict(stage='completed',new_physical_steps=physical))
-        if not smoke:prediction_report(args.output)
+        if not smoke and len(arms)==2:prediction_report(args.output)
         report(args.output)
     except BaseException as exc:
         if args.output.exists():write_json(args.output/'failure.json',dict(type=type(exc).__name__,message=str(exc),new_physical_steps=physical))
@@ -350,11 +393,21 @@ def run(args):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage',choices=('smoke','compare','report'))
+    parser.add_argument('stage',choices=('smoke','compare','bootstrap','continue','fresh','report'))
     parser.add_argument('--source',type=Path,default=SOURCE)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--device',choices=('cpu','cuda'),default='cuda')
-    return run(parser.parse_args(argv))
+    parser.add_argument('--bootstrap',type=Path,help='Read-only shared bootstrap.pt for independently launched arms')
+    parser.add_argument('--smoke',action='store_true',help='Short acceptance for bootstrap/continue/fresh')
+    parser.add_argument('--runs',type=Path,nargs=2,metavar=('CONTINUE_RUN','FRESH_RUN'),help='Merge independently launched runs (report only)')
+    args=parser.parse_args(argv)
+    if args.stage in ('continue','fresh') and args.bootstrap is None:
+        parser.error('Independent arms require --bootstrap from the bootstrap stage')
+    if args.stage in ('bootstrap','report') and args.bootstrap is not None:
+        parser.error('--bootstrap is only for training arms')
+    if args.runs is not None and args.stage!='report':parser.error('--runs requires report')
+    if args.smoke and args.stage not in ('bootstrap','continue','fresh'):parser.error('--smoke requires bootstrap/continue/fresh')
+    return run(args)
 
 
 if __name__=='__main__':raise SystemExit(main())

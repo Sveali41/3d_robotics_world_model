@@ -197,3 +197,42 @@ not a balanced grasp/lift benchmark; absent moving samples cannot demonstrate
 interaction prediction quality. Evaluation reports new adaptation and old
 retention separately; a single seed does not establish generality, and without a
 no-old-replay arm this experiment cannot isolate the effect of replay itself.
+
+### Independent, parallel policy-learner arms
+
+First create one shared bootstrap, then launch the two arms in separate terminals.
+The bootstrap is read-only in both jobs. It binds source checkpoint/replay hashes,
+state/action contracts, shifted scene, device, data and post-collection RNG.
+Formal and smoke packages cannot be mixed. Each job refuses an existing output
+folder and writes its own manifest, progress, evaluation logs and checkpoints.
+The default baseline configurations and the sequential `compare` entry remain.
+
+```bash
+# Once, before either training job (1,000 physical ticks).
+python -m exploration.raps_replay_compare bootstrap --output logs/replay_shared
+
+# Terminal A: continue the old actor-critic (plus its optimizer/counter state).
+python -m exploration.raps_replay_compare continue \
+  --bootstrap logs/replay_shared/bootstrap.pt --output logs/replay_continue_60k
+
+# Terminal B: random actor-critic, identical old WM and shared bootstrap.
+python -m exploration.raps_replay_compare fresh \
+  --bootstrap logs/replay_shared/bootstrap.pt --output logs/replay_fresh_60k
+
+# After both finish, combine into a fresh report directory. No experiment data are copied.
+python -m exploration.raps_replay_compare report \
+  --runs logs/replay_continue_60k logs/replay_fresh_60k --output logs/replay_combined_report
+```
+
+Each independent job imports 1k bootstrap ticks, adds 59k training ticks and
+runs 8k evaluation ticks: 67k new physical ticks per job. Along with the one
+shared 1k collection the total stays 135k. Parallel launch changes wall time and
+resource contention, not the budgets or algorithms. Same-GPU parallelism has
+been smoke-tested but is not guaranteed to give a 2x speedup.
+
+For short acceptance, pass `--smoke` to all three stages: bootstrap takes 160
+physical ticks; each separate arm takes 20, total 200. The shared-package hash
+must match when combining reports; mismatched source checkpoints or bootstrap
+packages produce a clear error. Independent jobs do not run cross-arm WM tests
+until the explicit combined `report`, so both final models use one common
+held-out cohort rather than evaluating on inconsistent data.

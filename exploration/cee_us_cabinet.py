@@ -75,13 +75,16 @@ def replay_view(storage, count):
     return {key: value[:count] for key, value in storage.items()}
 
 
-def make_env(*, project_goals_to_region=False, episode_steps=None, centered_initial_tcp=False):
+def make_env(*, project_goals_to_region=False, episode_steps=None, centered_initial_tcp=False,
+             object_shift_xy=(0.0, 0.0)):
     from main import build_env
     cfg = OmegaConf.load(ROOT / "configs/exploration.yaml")
     cfg.action_mode = "ee_delta"
     cfg.exploration_mode = "baseline"
     cfg.project_goals_to_region = bool(project_goals_to_region)
     cfg.centered_initial_tcp = centered_initial_tcp
+    if any(object_shift_xy):
+        cfg.object_shift_xy = list(object_shift_xy)
     cfg.headless = True
     cfg.render_mode = None
     cfg.sim_backend = "cpu"
@@ -480,10 +483,19 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=ROOT / "configs/cee_us_cabinet_120k_total_heuristic.yaml")
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--object-shift-xy", type=float, nargs=2, default=(0.0, 0.0), metavar=("DX", "DY"),
+                        help="Frozen evaluation only: move both objects in cabinet XY (meters); +X is deeper")
+    parser.add_argument("--evaluation-steps", type=int, help="Frozen evaluation control-step budget")
     parser.add_argument("--policy", choices=("random", "curiosity"), default="curiosity")
     parser.add_argument("--agent", choices=("icem", "raps_gnn_actor"),
                         help="Exploration implementation; omitted keeps the configured agent, default iCEM")
     args = parser.parse_args(argv)
+    if (any(args.object_shift_xy) or args.evaluation_steps is not None) and args.stage != "evaluate":
+        parser.error("Position shift and evaluation budget overrides require evaluate")
+    if not np.isfinite(args.object_shift_xy).all():
+        parser.error("Position shifts must be finite")
+    if args.evaluation_steps is not None and args.evaluation_steps < 1:
+        parser.error("evaluation-steps must be positive")
     selected_agent = args.agent or OmegaConf.load(args.config).get("agent", "icem")
     if selected_agent == "raps_gnn_actor":
         from exploration.raps_gnn_actor import run
@@ -498,6 +510,8 @@ def main(argv=None):
     if args.stage == "evaluate" and args.checkpoint is None:
         parser.error("evaluate requires --checkpoint")
     config = OmegaConf.load(args.config)
+    if args.evaluation_steps is not None:
+        config.evaluation_steps = args.evaluation_steps
     if args.agent is not None:
         config.agent = args.agent
     if args.device:
@@ -531,7 +545,8 @@ def main(argv=None):
     env = backend = None
     prepared = False
     try:
-        env, env_config = make_env(project_goals_to_region=bool(config.get("project_goals_to_region", False)))
+        env, env_config = make_env(project_goals_to_region=bool(config.get("project_goals_to_region", False)),
+                                   object_shift_xy=args.object_shift_xy)
         env.reset(seed=int(config.seed))
         encoder = CabinetStateEncoder(env)
         prepare_output(output, config, env_config)

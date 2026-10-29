@@ -31,3 +31,23 @@ def test_primitive_baselines_differ_only_in_disagreement_weight():
     assert combined["centered_initial_tcp"] is True
     assert heuristic["raps_actor"].pop("disagreement_weight") == 0.0
     assert combined == heuristic
+
+
+def test_position_shift_is_explicit_and_defaults_preserve_scene(monkeypatch):
+    import exploration.cee_us_cabinet as runner
+    source_cfg = OmegaConf.create({'sim': {}, 'ppo': {}})
+    monkeypatch.setattr(runner.OmegaConf,'load',lambda _:source_cfg.copy())
+    captured=[]
+    monkeypatch.setattr('main.build_env',lambda cfg:captured.append(cfg))
+    runner.make_env()
+    runner.make_env(object_shift_xy=(.03,0.))
+    assert 'object_shift_xy' not in captured[0]
+    assert list(captured[1].object_shift_xy)==[.03,0.]
+
+
+def test_position_shift_cannot_accidentally_start_training():
+    import pytest
+    from exploration.cee_us_cabinet import main
+    with pytest.raises(SystemExit) as exc:
+        main(['train','--object-shift-xy','.03','0'])
+    assert exc.value.code == 2

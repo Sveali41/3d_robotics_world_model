@@ -253,17 +253,31 @@ class RAPSImaginationActor:
         optimizer.step()
         return float(norm)
 
-    def train(self, replay, updates=None):
+    def train(self, replay, updates=None, *, start_groups=None):
         eligible = np.flatnonzero(~np.asarray(replay["terminated"], dtype=bool))
         if not len(eligible):
             raise ValueError("No nonterminal real replay states for imagination")
         source = torch.as_tensor(np.asarray(replay["states"])[eligible], device=self.backend.device)
+        groups = None
+        if start_groups is not None:
+            labels = np.asarray(start_groups)
+            if labels.shape != (len(replay["states"]),) or not np.isin(labels, [0, 1]).all():
+                raise ValueError("start_groups must identify old=0/new=1 for every replay state")
+            groups = [torch.as_tensor(np.flatnonzero(labels[eligible] == group), device=source.device)
+                      for group in (0, 1)]
+            if any(len(group) == 0 for group in groups) or self.settings["imagination_batch_size"] % 2:
+                raise ValueError("Balanced imagination requires both nonterminal groups and an even batch size")
         metrics = []
         count = self.settings["updates_per_round"] if updates is None else int(updates)
         if count < 1:
             raise ValueError("Actor updates must be positive")
         for _ in range(count):
-            indices = torch.randint(len(source), (self.settings["imagination_batch_size"],), device=source.device)
+            if groups is None:
+                indices = torch.randint(len(source), (self.settings["imagination_batch_size"],), device=source.device)
+            else:
+                half = self.settings["imagination_batch_size"] // 2
+                indices = torch.cat([group[torch.randint(len(group), (half,), device=source.device)]
+                                     for group in groups])
             trajectory = self.imagine(source[indices])
             state = trajectory["states"]
             horizon, batch = trajectory["actions"].shape[:2]
@@ -536,6 +550,8 @@ def run(args, config):
     config.raps_actor = OmegaConf.merge(DEFAULTS, config.get("raps_actor", {}))
     if args.device:
         config.device = args.device
+    if getattr(args, "evaluation_steps", None) is not None:
+        config.evaluation_steps = args.evaluation_steps
     output = args.output or ROOT / "logs" / time.strftime("raps_gnn_actor_%Y%m%dT%H%M%S")
     if args.stage == "report":
         if not output.is_dir():
@@ -582,6 +598,7 @@ def run(args, config):
         env, env_config = make_env(
             episode_steps=config.get("episode_steps", 100),
             centered_initial_tcp=config.get("centered_initial_tcp", False),
+            object_shift_xy=getattr(args, "object_shift_xy", (0.0, 0.0)),
         )
         env.reset(seed=int(config.seed))
         encoder = CabinetSkillStateEncoder(env, latched_gripper=actor.settings["latched_gripper"])
@@ -610,7 +627,14 @@ def run(args, config):
             collector = SkillCollector(env, encoder, actor, output / "evaluation")
             ticks, skills = collector.collect(int(config.evaluation_steps), args.policy,
                                               seed=int(config.seed) + 100000, stage="evaluation")
-            write_json(collector.directory / "evaluation.json", summarize(ticks, skills, actor.schema))
+            result = summarize(ticks, skills, actor.schema)
+            valid = [row for row in skills if row["trainable"]]
+            result["prediction"] = (prediction_metrics(backend, skill_arrays(valid), horizons=(1, 3, 5))
+                                    if len(valid) >= 2 else {"status": "insufficient_completed_skills"})
+            result.update(model_updated=False, actor_updated=False, normalizers_updated=False,
+                          source_checkpoint=str(args.checkpoint.resolve()),
+                          object_shift_xy_m=list(getattr(args, "object_shift_xy", (0.0, 0.0))))
+            write_json(collector.directory / "evaluation.json", result)
             return 0
         smoke = args.stage == "smoke"
         resuming = args.stage == "train" and args.checkpoint is not None

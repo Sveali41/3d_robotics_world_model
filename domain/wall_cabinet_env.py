@@ -86,11 +86,16 @@ class WallCabinetEnv(BaseEnv):
         cabinet_item_layout: str | None = None,
         visualize_exploration_region: bool = False,
         centered_initial_tcp: bool = False,
+        object_shift_xy=(0.0, 0.0),
         **kwargs,
     ):
         if not isinstance(centered_initial_tcp, bool):
             raise ValueError("centered_initial_tcp must be a boolean")
         self.centered_initial_tcp = centered_initial_tcp
+        shift = np.asarray(object_shift_xy, dtype=np.float32)
+        if shift.shape != (2,) or not np.isfinite(shift).all():
+            raise ValueError("object_shift_xy must be two finite cabinet-local offsets in meters")
+        self.object_shift_xy = shift
         self.populate_cabinet = populate_cabinet
         self.visualize_exploration_region = bool(visualize_exploration_region)
         self.exploration_region_bounds_local = (
@@ -845,7 +850,9 @@ class WallCabinetEnv(BaseEnv):
             for item, spawn_position in zip(
                 self.cabinet_items, self._item_spawn_positions
             ):
-                positions = torch.as_tensor(spawn_position).repeat(batch_size, 1)
+                position = np.asarray(spawn_position).copy()
+                position[:2] += self.object_shift_xy
+                positions = torch.as_tensor(position).repeat(batch_size, 1)
                 item.set_pose(Pose.create_from_pq(p=positions))
                 item.set_linear_velocity(torch.zeros((batch_size, 3)))
                 item.set_angular_velocity(torch.zeros((batch_size, 3)))

@@ -1,0 +1,86 @@
+Bootstrap: localimage
+From: {{ BASE_SIF }}
+
+%arguments
+    BASE_SIF=/data/data/siyao/3d_world_model.sif
+    ROBOLAB_COMMIT=9cce00cadd5dc575fd2b8ea3836f5bdcde574229
+
+%labels
+    RoboLabDescription "RoboLab with isolated Python 3.12 / Isaac Sim 6.0.1 for the host's 615 driver"
+    RoboLabCommit {{ ROBOLAB_COMMIT }}
+    IsaacSimVersion 6.0.1
+    IsaacLabVersion 3.0.0b2.post1
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    # The host fakeroot uses a newer glibc than this Ubuntu 22.04 image.
+    # Bootstrap the image's own fakeroot for root-mapped Apptainer builds.
+    apt-get -o APT::Sandbox::User=root update
+    mkdir -p /tmp/robolab-fakeroot
+    cd /tmp/robolab-fakeroot
+    apt-get -o APT::Sandbox::User=root download fakeroot libfakeroot
+    for package in ./*.deb; do
+        dpkg-deb --extract "$package" /
+    done
+    FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv /bin/sh <<'ROBOLAB_INSTALL'
+    set -eu
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git git-lfs ffmpeg \
+        libxt6 libglu1-mesa libxrandr2 libxi6 libxinerama1 \
+        libxcursor1 libxkbcommon0 libnss3 libasound2 libsm6
+
+    # Keep the base image's Python 3.10 packages intact.
+    python3.10 -m venv /opt/robolab-tools
+    /opt/robolab-tools/bin/python -m pip install --no-cache-dir uv==0.13.6
+    export UV_PYTHON_INSTALL_DIR=/opt/robolab-python
+    export UV_PROJECT_ENVIRONMENT=/opt/robolab-venv
+    export UV_CACHE_DIR=/tmp/robolab-uv-cache
+
+    GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/NVlabs/RoboLab.git /opt/robolab
+    cd /opt/robolab
+    GIT_LFS_SKIP_SMUDGE=1 git checkout --detach {{ ROBOLAB_COMMIT }}
+    git lfs install --local
+    git lfs pull
+    git lfs fsck
+    /opt/robolab-tools/bin/uv sync --locked --python 3.12 \
+        --extra isaac60 --extra test --link-mode copy
+
+    mkdir -p /opt/robolab/output
+    rm -f /.singularity.d/runscript.help
+    rm -rf /tmp/robolab-uv-cache /opt/robolab/.git
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    rm -rf /tmp/robolab-fakeroot
+ROBOLAB_INSTALL
+
+%environment
+    export PATH="/opt/robolab-venv/bin:/opt/robolab-tools/bin:$PATH"
+    export UV_PYTHON_INSTALL_DIR=/opt/robolab-python
+    export UV_PROJECT_ENVIRONMENT=/opt/robolab-venv
+    export PYTHONUNBUFFERED=1
+    export MPLCONFIGDIR=/tmp/robolab-matplotlib
+
+%test
+    /opt/robolab-venv/bin/python -c "from importlib.metadata import version; from packaging.version import Version; import torch; assert Version(version('isaacsim')) == Version('6.0.1'); assert Version(version('isaaclab')) == Version('3.0.0b2.post1'); print('RoboLab dependencies OK; torch:', torch.__version__)"
+
+%runscript
+    cd /opt/robolab
+    if [ "$#" -eq 0 ]; then
+        set -- python examples/run_empty.py --headless --task BananaInBowlTask --num_envs 1 --num-steps 50
+    fi
+    exec "$@"
+
+%help
+    Build a NEW image; the original SIF remains unchanged:
+        apptainer build --fakeroot --ignore-fakeroot-command --build-arg BASE_SIF=/data/data/siyao/3d_world_model.sif outputs/3d_world_model_robolab_isaac60.sif containers/robolab.def
+
+    Run one small task from the project root with writable caches and output:
+        bash containers/run_robolab.sh
+
+    Start an interactive shell:
+        bash containers/run_robolab.sh bash
+
+    Python 3.12 is the RoboLab interpreter; python3.10 still accesses the base stack.
+    Source and assets are in /opt/robolab. Policy model servers are separate.
+    Isaac Lab 3.0 is beta. Compare experiments only on the same simulator stack.

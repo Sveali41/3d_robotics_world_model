@@ -1,0 +1,15 @@
+{
+  "stage_instance": {"template_name": "demo_bedroom"},
+  "object_instances": [
+    {
+      "template_name": "demo_donut",
+      "translation": [0.65, 1.4, 1.0],
+      "motion_type": "DYNAMIC"
+    },
+    {
+      "template_name": "demo_ball",
+      "translation": [0.95, 1.4, 1.0],
+      "motion_type": "DYNAMIC"
+    }
+  ]
+}

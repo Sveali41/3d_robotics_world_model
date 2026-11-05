@@ -1,0 +1,31 @@
+{
+  "stages": {
+    "configs": [
+      {
+        "template_handle": "demo_bedroom",
+        "attributes": {
+          "render_asset": "../../data/habitat_demo/van-gogh-room.glb",
+          "collision_asset": "../../data/habitat_demo/van-gogh-room.glb",
+          "up": [0, 0, 1],
+          "front": [0, 1, 0]
+        }
+      }
+    ]
+  },
+  "objects": {
+    "paths": {".json": ["../../third_party/habitat-sim/data/test_assets/objects"]},
+    "configs": [
+      {
+        "original_file": "donut.object_config.json",
+        "template_handle": "demo_donut",
+        "attributes": {"scale": [0.12, 0.12, 0.12], "margin": 0.002}
+      },
+      {
+        "original_file": "sphere.object_config.json",
+        "template_handle": "demo_ball",
+        "attributes": {"scale": [0.12, 0.12, 0.12], "mass": 0.1}
+      }
+    ]
+  },
+  "scene_instances": {"paths": {".json": ["scenes"]}}
+}

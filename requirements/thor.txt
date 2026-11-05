@@ -1,0 +1,11 @@
+ai2thor==5.0.0
+numpy==1.26.4
+Pillow==10.4.0
+shapely==1.8.5.post1
+moviepy==1.0.3
+pandas==2.3.3
+trimesh==5.2.0
+attrs==25.4.0
+scipy==1.17.1
+rtree==1.4.1
+networkx==3.6.1

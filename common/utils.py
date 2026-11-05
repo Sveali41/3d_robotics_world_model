@@ -166,6 +166,8 @@ class RoboCasaPointWorldSampleBuilder:
         observations = phase["observations"]
         camera_names = list(observations[0].get("pointcloud_cameras", {}).keys())
         if not camera_names:
+            camera_names = list(observations[0].get("sensor_data", {}).keys())
+        if not camera_names:
             camera_names = ["merged"]
 
         camera_data = {}
@@ -174,13 +176,33 @@ class RoboCasaPointWorldSampleBuilder:
             for observation in observations:
                 camera_observation = dict(observation)
                 if camera_name != "merged":
-                    camera_observation["pointcloud"] = observation["pointcloud_cameras"][camera_name]
+                    if camera_name in observation.get("pointcloud_cameras", {}):
+                        camera_observation["pointcloud"] = observation[
+                            "pointcloud_cameras"
+                        ][camera_name]
+                    elif "sensor_data" in observation:
+                        # The merged cloud cannot be attributed to one camera;
+                        # let PointWorld build the cloud from this sensor only.
+                        camera_observation.pop("pointcloud", None)
+                    if "sensor_data" in observation:
+                        camera_observation["sensor_data"] = {
+                            camera_name: observation["sensor_data"][camera_name]
+                        }
+                    if "sensor_param" in observation:
+                        camera_observation["sensor_param"] = {
+                            camera_name: observation["sensor_param"][camera_name]
+                        }
                 camera_observation.pop("pointcloud_cameras", None)
                 camera_observations.append(camera_observation)
+            camera_sensors = (
+                {camera_name: self.env._sensors[camera_name]}
+                if camera_name != "merged" and camera_name in self.env._sensors
+                else self.env._sensors
+            )
             camera_data[camera_name], _ = self.pointworld_wrapper.process_observations(
                 camera_observations,
                 self.robot_link_ids,
-                self.env._sensors,
+                camera_sensors,
                 base_pose_mat=base_pose,
                 base_pose_inv_mat=base_inv,
                 object_pose_seq=phase.get("object_poses"),
@@ -310,7 +332,10 @@ class RoboCasaPointWorldSampleBuilder:
                     tensor_numpy(camera_result["scene_segmentation"]).astype(np.int32)
                 ),
             })
-        for key, value in data_dict.items():
-            if key.endswith(("_initial_rgb", "_initial_depth", "_intrinsic", "_extrinsic")):
-                payload[f"{key}.npy"] = numpy_bytes(tensor_numpy(value))
+            for key, value in camera_result.items():
+                if key.endswith(("_initial_rgb", "_initial_depth", "_intrinsic", "_extrinsic")):
+                    field_name = key.split("_", 1)[1]
+                    payload[f"{prefix}_{field_name}.npy"] = numpy_bytes(
+                        tensor_numpy(value)
+                    )
         return payload

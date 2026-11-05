@@ -1,0 +1,20 @@
+{
+  "pointworld": {
+    "path": "exploration/pointworld/official",
+    "commit": "d8a46a80b5f4c9f0e0c6ee4e17450039f8e8a6a2",
+    "patch": "patches/pointworld.patch",
+    "sha256": "bac2274a5f6b2f5b2f65c16e0e7cb3391407fcdc6f4dad1835b18dd012d1386c"
+  },
+  "raps": {
+    "path": "exploration/raps/official",
+    "commit": "1c56b0fe367cc32d3ee548f407ac3a9af9e3ce2e",
+    "patch": "patches/raps.patch",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "maniskill": {
+    "path": "domain/ManiSkill",
+    "commit": "e406239d2b1c554e4b99010bc9b40ad2bbd91f05",
+    "patch": "patches/maniskill.patch",
+    "sha256": "bbbf30e719abaf2e67049806ffae1ce3cf2bb4068b2996df2821c8493dfd10b0"
+  }
+}

@@ -1,0 +1,136 @@
+diff --git a/mani_skill/utils/scene_builder/robocasa/fixtures/cabinet.py b/mani_skill/utils/scene_builder/robocasa/fixtures/cabinet.py
+index 1b1da3776dc945c0824c18d0f4590bcfa9bd8a9d..704b564bd4d55fbea60322311872fddfb82db6e3 100644
+--- a/mani_skill/utils/scene_builder/robocasa/fixtures/cabinet.py
++++ b/mani_skill/utils/scene_builder/robocasa/fixtures/cabinet.py
+@@ -1348,6 +1348,14 @@ class HousingCabinet(Cabinet):
+                 material=self.loader._materials["mat"],
+                 pose=sapien.Pose(positions[geom]),
+             )
++            # The housing walls are structural furniture and must participate in
++            # physics.  Previously they were visual-only, which made the robot
++            # arm pass straight through the cabinet frame despite the rendered
++            # wooden panels being visible.
++            self.actor_builder.add_box_collision(
++                half_size=sizes[geom],
++                pose=sapien.Pose(positions[geom]),
++            )
+             # g = new_geom(
+             #     name=geom_name,
+             #     type="box",
+diff --git a/mani_skill/utils/scene_builder/robocasa/fixtures/fixture.py b/mani_skill/utils/scene_builder/robocasa/fixtures/fixture.py
+index 082f16390cc8cce1f37df95946b871a66f44fdfc..47a7d422eee01a38c4f7d6b72e24d061460fc032 100644
+--- a/mani_skill/utils/scene_builder/robocasa/fixtures/fixture.py
++++ b/mani_skill/utils/scene_builder/robocasa/fixtures/fixture.py
+@@ -39,6 +39,8 @@ class FixtureType(IntEnum):
+     STOOL = 20
+     ISLAND = 21
+     COUNTER_NON_CORNER = 22
++    DISHWASHER = 23
++    FRIDGE = 24
+ 
+ 
+ class Fixture(MujocoObject):
+diff --git a/mani_skill/utils/scene_builder/robocasa/fixtures/fixture_utils.py b/mani_skill/utils/scene_builder/robocasa/fixtures/fixture_utils.py
+index 082659c8a9558280ae94b42e02a6e1dd68f49f51..0f93ba374d1d08536b35e5b2edf51685fbdb31b7 100644
+--- a/mani_skill/utils/scene_builder/robocasa/fixtures/fixture_utils.py
++++ b/mani_skill/utils/scene_builder/robocasa/fixtures/fixture_utils.py
+@@ -7,6 +7,8 @@ from mani_skill.utils.scene_builder.robocasa.fixtures.cabinet import (
+     SingleCabinet,
+ )
+ from mani_skill.utils.scene_builder.robocasa.fixtures.counter import Counter
++from mani_skill.utils.scene_builder.robocasa.fixtures.dishwasher import Dishwasher
++from mani_skill.utils.scene_builder.robocasa.fixtures.fridge import Fridge
+ from mani_skill.utils.scene_builder.robocasa.fixtures.fixture import FixtureType
+ from mani_skill.utils.scene_builder.robocasa.fixtures.microwave import Microwave
+ from mani_skill.utils.scene_builder.robocasa.fixtures.sink import Sink
+@@ -112,6 +114,10 @@ def fixture_is_type(fixture, fixture_type):
+         return isinstance(fixture, Stool)
+     elif fixture_type == FixtureType.ISLAND:
+         return isinstance(fixture, Counter) and "island" in fixture.name
++    elif fixture_type == FixtureType.DISHWASHER:
++        return isinstance(fixture, Dishwasher)
++    elif fixture_type == FixtureType.FRIDGE:
++        return isinstance(fixture, Fridge)
+     elif fixture_type == FixtureType.COUNTER_NON_CORNER:
+         return isinstance(fixture, Counter) and "corner" not in fixture.name
+     else:
+diff --git a/mani_skill/utils/scene_builder/robocasa/fixtures/stove.py b/mani_skill/utils/scene_builder/robocasa/fixtures/stove.py
+index a74a3bbb09d63155f65c5b8120fadb806be814c1..5f992a7a20d326c096ac473bc586c132a24a1f05 100644
+--- a/mani_skill/utils/scene_builder/robocasa/fixtures/stove.py
++++ b/mani_skill/utils/scene_builder/robocasa/fixtures/stove.py
+@@ -34,7 +34,7 @@ class Stove(Fixture):
+             xml=xml, name=name, duplicate_collision_geoms=False, *args, **kwargs
+         )
+ 
+-    def get_reset_regions(self, env, locs=None):
++    def get_reset_regions(self, env, locs=None, fixtures=None, **kwargs):
+         """
+         Returns dictionary of reset regions, usually used when initializing a receptacle on the stove.
+         The regions are the sites where the burner flames are located.
+@@ -47,21 +47,35 @@ class Stove(Fixture):
+         Returns:
+             dict: dictionary of reset regions
+         """
++        # SceneBuilder calls all fixture implementations with
++        # ``get_reset_regions(env, fixtures)``.  In the original RoboCasa
++        # API the second argument meant burner locations, so accept the
++        # ManiSkill fixture mapping without treating its keys as locations.
++        if isinstance(locs, dict) or fixtures is not None:
++            locs = None
++
+         regions = dict()
+ 
+         if locs is None:
+             locs = STOVE_LOCATIONS
+         for location in locs:
+-            site = self.worldbody.find(
+-                "./body/body/site[@name='{}burner_{}_place_site']".format(
+-                    self.naming_prefix, location
+-                )
++            # RoboCasa's original implementation queried robosuite's
++            # ``worldbody`` object.  ManiSkill's MJCF port keeps the parsed
++            # XML on ``loader.xml`` instead, so the old lookup raised
++            # AttributeError and silently removed stoves from placement
++            # candidates in the custom kitchen environment.
++            site_name = f"{self.naming_prefix}burner_{location}_place_site"
++            site = next(
++                (elem for elem in self.loader.xml.findall(".//*site")
++                 if elem.get("name") == site_name),
++                None,
+             )
+             if site is None:
+-                site = self.worldbody.find(
+-                    "./body/body/site[@name='{}burner_on_{}']".format(
+-                        self.naming_prefix, location
+-                    )
++                site_name = f"{self.naming_prefix}burner_on_{location}"
++                site = next(
++                    (elem for elem in self.loader.xml.findall(".//*site")
++                     if elem.get("name") == site_name),
++                    None,
+                 )
+             if site is None:
+                 continue
+diff --git a/mani_skill/utils/scene_builder/robocasa/scene_builder.py b/mani_skill/utils/scene_builder/robocasa/scene_builder.py
+index 282e25b87b3ce58fa3d32eebbc4b482d04449754..915dc5cb8bb807c883dcdae6b27e4f870fc2cab9 100644
+--- a/mani_skill/utils/scene_builder/robocasa/scene_builder.py
++++ b/mani_skill/utils/scene_builder/robocasa/scene_builder.py
+@@ -162,8 +162,16 @@ class RoboCasaSceneBuilder(SceneBuilder):
+         if build_config_idxs is None:
+             build_config_idxs = []
+             for i in range(self.env.num_envs):
+-                # Total number of configs is 10 * 12 = 120
+-                config_idx = self.env._batched_episode_rng[i].randint(0, 120)
++                # Sample only from the layout/style pairs selected by the
++                # environment.  The previous implementation sampled from all
++                # 10 * 12 = 120 configurations, which silently ignored
++                # layout_ids and style_ids.
++                allowed_pairs = self.env.layout_and_style_ids
++                pair_idx = self.env._batched_episode_rng[i].choice(
++                    len(allowed_pairs)
++                )
++                layout_idx, style_idx = allowed_pairs[pair_idx]
++                config_idx = int(layout_idx) * 12 + int(style_idx)
+                 build_config_idxs.append(config_idx)
+ 
+         for scene_idx, build_config_idx in enumerate(build_config_idxs):

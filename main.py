@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:2] == ["thor"]:
+        from domain.thor.cli import main as thor_main
+
+        raise SystemExit(thor_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["room"]:
+        from domain.household.room_viewer import main as room_main
+
+        raise SystemExit(room_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["household"]:
+        from domain.household.cli import main as household_main
+
+        raise SystemExit(household_main(sys.argv[2:]))
+
 import hydra
 import numpy as np
 from omegaconf import DictConfig
@@ -38,7 +54,9 @@ def build_env(cfg: DictConfig):
     render_mode = cfg.render_mode or (None if cfg.headless else "human")
     base_env = gym.make(
         "WallCabinetTwoItems-v1",
-        obs_mode="state",
+        obs_mode=str(getattr(cfg, "obs_mode", "state")),
+        sensor_configs=OmegaConf.to_container(cfg.sensor_configs, resolve=True)
+        if cfg.get("sensor_configs") is not None else {},
         reward_mode="dense",
         control_mode="pd_ee_delta_pose",
         render_mode=render_mode,
@@ -97,7 +115,7 @@ def main(cfg: DictConfig) -> int:
         raise ValueError("scripted grasp sequences require action_mode=primitives")
 
     if cfg.policy == "scripted":
-        from exploration.scripted_grasp import run_scripted_grasp
+        from exploration.visualization.scripted_grasp import run_scripted_grasp
 
         status = run_scripted_grasp(cfg, build_env)
         if status:
@@ -105,12 +123,12 @@ def main(cfg: DictConfig) -> int:
         return 0
 
     if cfg.policy == "visualize":
-        from exploration.policy_gif import run_policy_gif
+        from exploration.visualization.policy_gif import run_policy_gif
 
         return run_policy_gif(cfg, build_env)
 
     if cfg.policy == "scripted_gif":
-        from exploration.scripted_gif import run_scripted_gif
+        from exploration.visualization.scripted_gif import run_scripted_gif
 
         return run_scripted_gif(cfg, build_env)
 

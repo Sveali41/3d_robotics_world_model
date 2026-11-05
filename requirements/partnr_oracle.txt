@@ -1,0 +1,10 @@
+# Oracle-skill runtime only; Torch/vision/audio versions are installed separately.
+# Numerical pins match the upstream PARTNR requirements.
+numpy==1.26.4
+numba==0.60.0
+llvmlite==0.43.0
+pillow==10.4.0
+pandas
+scikit-image
+scikit-learn
+huggingface-hub<1.0

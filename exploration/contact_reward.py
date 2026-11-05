@@ -169,12 +169,23 @@ class ContactExplorationRewardWrapper(gym.Wrapper):
                 self.observation_space = spaces.Box(
                     low=low, high=high, dtype=np.float32
                 )
+            elif isinstance(base_obs, spaces.Dict):
+                self.observation_space = spaces.Dict({
+                    **base_obs.spaces,
+                    "ever_lifted": spaces.Box(0.0, 1.0, shape=(n,), dtype=np.float32),
+                })
 
     def _append_lifted_bits(self, observation) -> np.ndarray:
         """Append a binary ever-lifted vector to a flat observation array."""
         n = len(self._tracked_object_ids)
         if n == 0:
             return observation
+        if isinstance(observation, dict):
+            # Visual collection keeps the sensor payload intact; state policies
+            # continue to receive the existing flat observation below.
+            return {**observation, "ever_lifted": np.asarray([
+                float(oid in self.ever_lifted_object_ids)
+                for oid in self._tracked_object_ids], dtype=np.float32)}
         if isinstance(observation, np.ndarray):
             obs_flat = observation.flatten().astype(np.float32)
         else:

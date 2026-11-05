@@ -15,7 +15,10 @@ from .primitives import (
     RAPS_ACTION_SCHEMA,
     RAPS_PRIMITIVE_SPECS,
     SUPPORTED_PRIMITIVE_ROBOTS,
-    TopGraspPrimitive,
+    ApproachPrimitive,
+    AlignYZPrimitive,
+    ApproachXPrimitive,
+    RAPS_SPLIT_ACTION_SCHEMA,
     UniformPrimitiveExplorer,
     normalize_primitive_robot,
 )
@@ -26,7 +29,8 @@ __all__ = [
     "MoveDeltaPrimitive", "MoveBackwardPrimitive", "MoveForwardPrimitive",
     "MoveLeftPrimitive", "MoveRightPrimitive", "OpenGripperPrimitive",
     "PrimitiveAction", "PrimitiveContext", "RAPS_ACTION_SCHEMA",
-    "RAPS_PRIMITIVE_SPECS", "TopGraspPrimitive",
+    "RAPS_PRIMITIVE_SPECS", "ApproachPrimitive",
+    "AlignYZPrimitive", "ApproachXPrimitive", "RAPS_SPLIT_ACTION_SCHEMA",
     "SUPPORTED_PRIMITIVE_ROBOTS", "UniformPrimitiveExplorer", "RAPSEnvWrapper",
     "normalize_primitive_robot",
 ]

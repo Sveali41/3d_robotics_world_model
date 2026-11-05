@@ -4,7 +4,7 @@ Why this wrapper exists
 -----------------------
 RAPS does not expose the simulator's low-level controller to the policy.  The
 policy emits one hybrid high-level action, for example
-``top_grasp(x_forward=0.10, y_offset=0.0, z_offset=0.0)``.
+``approach(x_forward=0.10, y_offset=0.0, z_offset=0.0)``.
 RoboCasa, however, must receive many low-level
 robot-independent ``[dx, dy, dz, gripper]`` actions to execute that behavior.
 ``RAPSEnvWrapper`` bridges those interfaces and adapts the command to either
@@ -67,6 +67,16 @@ class _EEDeltaStep(Primitive):
         return self.action.to_vector()
 
 
+class _JointPositionAction(PrimitiveAction):
+    def to_vector(self):
+        return np.array([self.parameters[f"joint_{i}"] for i in range(7)]
+                        + [self.parameters["gripper"]], dtype=np.float32)
+
+
+class _JointPositionStep(_EEDeltaStep):
+    name = "joint_position"
+
+
 class RAPSEnvWrapper(gym.Wrapper):
     """Expose one parameterized primitive as one reward-free environment step.
 
@@ -107,8 +117,8 @@ class RAPSEnvWrapper(gym.Wrapper):
             raise ValueError("max_ee_steps_per_episode must be positive")
         if int(contact_check_interval) < 1:
             raise ValueError("contact_check_interval must be positive")
-        if action_mode not in {"primitives", "ee_delta"}:
-            raise ValueError("action_mode must be primitives or ee_delta")
+        if action_mode not in {"primitives", "ee_delta", "joint_position"}:
+            raise ValueError("action_mode must be primitives, ee_delta or joint_position")
         super().__init__(env)
         self.action_mode = action_mode
         self._direct_grasp_frames = {}
@@ -138,6 +148,18 @@ class RAPSEnvWrapper(gym.Wrapper):
         self.last_primitive_record: PrimitiveRecord | None = None
         self.records: list[PrimitiveRecord] = []
         self._needs_reset = True
+        self._ee_arm_controller = None
+        self._ee_control_mode = None
+        if self.action_mode == "joint_position":
+            if self.robot != "panda" or self.project_goals_to_region:
+                raise ValueError("joint_position requires Panda with goal projection disabled")
+            raw = self.env.unwrapped
+            self._ee_control_mode = raw.agent.control_mode
+            self._ee_arm_controller = raw.agent.controller.controllers["arm"]
+            limits = raw.agent.robot.get_qlimits().detach().cpu().numpy().reshape(9, 2)
+            self.action_space = spaces.Box(
+                low=np.r_[limits[:7, 0], -1.].astype(np.float32),
+                high=np.r_[limits[:7, 1], 1.].astype(np.float32), dtype=np.float32)
         self._validate_robot_action_space()
         self._configure_low_level_time_limit()
 
@@ -166,6 +188,14 @@ class RAPSEnvWrapper(gym.Wrapper):
     def _controller_action(self, primitive_action: np.ndarray) -> np.ndarray:
         """Map canonical [dxyz, gripper] to the selected robot controller."""
         action = np.asarray(primitive_action, dtype=np.float32)
+        if self.action_mode == "joint_position":
+            if action.shape != (8,) or not np.isfinite(action).all():
+                raise ValueError("joint_position requires seven joint targets and one gripper command")
+            agent = self.env.unwrapped.agent
+            if agent.control_mode != "pd_joint_pos":
+                agent.set_control_mode("pd_joint_pos")
+                agent.controller.reset()
+            return action.copy()
         if action.shape != (4,) or not np.isfinite(action).all():
             raise ValueError(f"primitive emitted invalid low-level action: {action}")
         if self.robot == "fetch":
@@ -192,7 +222,7 @@ class RAPSEnvWrapper(gym.Wrapper):
 
     def set_ee_orientation_override(self, quaternion_wxyz):
         """A skill may hold its observed reachable wrist pose; None restores reset."""
-        if self.robot != "panda" or self.action_mode != "ee_delta":
+        if self.robot != "panda" or self.action_mode not in {"ee_delta", "joint_position"}:
             raise ValueError("Skill orientation hold requires Panda ee_delta control")
         if quaternion_wxyz is None:
             self._ee_orientation_override = None
@@ -208,6 +238,7 @@ class RAPSEnvWrapper(gym.Wrapper):
             robot=self.robot,
             record_state=self.record_dense_trajectory,
             project_goals_to_region=self.project_goals_to_region,
+            arm_controller=self._ee_arm_controller,
         )
 
     def _configure_low_level_time_limit(self) -> None:
@@ -254,9 +285,14 @@ class RAPSEnvWrapper(gym.Wrapper):
         }
 
     def reset(self, **kwargs):
+        if self.action_mode == "joint_position":
+            self.env.unwrapped.agent.set_control_mode(self._ee_control_mode)
         result = self.env.reset(**kwargs)
+        if self.action_mode == "joint_position":
+            self._ee_arm_controller = self.env.unwrapped.agent.controller.controllers["arm"]
+            self.env.unwrapped.motion_planner.reset_grasp()
         self._ee_orientation_override = None
-        if self.action_mode == "ee_delta" and self.robot == "panda":
+        if self.action_mode in {"ee_delta", "joint_position"} and self.robot == "panda":
             arm = self.env.unwrapped.agent.controller.controllers["arm"]
             cfg = arm.config
             if (not cfg.normalize_action or not cfg.use_delta or cfg.use_target
@@ -307,8 +343,16 @@ class RAPSEnvWrapper(gym.Wrapper):
             )
         if not np.isfinite(action).all():
             raise ValueError("RAPS action contains NaN or infinity")
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        if self.action_mode == "ee_delta":
+        if self.action_mode == "joint_position":
+            if np.any(action < self.action_space.low) or np.any(action > self.action_space.high):
+                raise ValueError("Joint target exceeds controller bounds; refusing to clip a checked trajectory")
+        else:
+            action = np.clip(action, self.action_space.low, self.action_space.high)
+        if self.action_mode == "joint_position":
+            primitive_action = _JointPositionAction("joint_position", dict(zip(
+                [f"joint_{i}" for i in range(7)] + ["gripper"], map(float, action))))
+            primitive = _JointPositionStep(primitive_action)
+        elif self.action_mode == "ee_delta":
             primitive_action = _EEDeltaAction("ee_delta", dict(zip(
                 ("dx", "dy", "dz", "gripper"), map(float, action))))
             primitive = _EEDeltaStep(primitive_action)
@@ -322,7 +366,7 @@ class RAPSEnvWrapper(gym.Wrapper):
             observation = self.env.get_observation() if hasattr(self.env, "get_observation") else None
         context = self._context()
         primitive.reset(context)
-        if self.action_mode == "ee_delta":
+        if self.action_mode in {"ee_delta", "joint_position"}:
             primitive.stable_grasp_frames.update(self._direct_grasp_frames)
             if self.project_goals_to_region:
                 controller_config = context.arm_controller.config
@@ -358,6 +402,10 @@ class RAPSEnvWrapper(gym.Wrapper):
             ),
             dense_trajectory=self.record_dense_trajectory,
         )
+        if self.action_mode == "joint_position":
+            record.schema_version = "cabinet-joint-position-v1"
+            record.metadata.update(action_mode="joint_position", control_mode="pd_joint_pos",
+                                   action_units="seven_joint_targets_rad_plus_normalized_gripper")
         if self.action_mode == "ee_delta":
             record.schema_version = "cabinet-ee-delta-v1"
             record.metadata.update(action_mode="ee_delta", action_units="normalized_controller",
@@ -379,7 +427,10 @@ class RAPSEnvWrapper(gym.Wrapper):
                 break
             low_action = np.asarray(low_action, dtype=np.float32)
             controller_action = self._controller_action(low_action)
-            result = self._step_result(self.env.step(controller_action))
+            # The env's original EE action space cannot infer batching after a
+            # native controller switch; joint targets require an explicit env axis.
+            submitted = controller_action[None, :] if self.action_mode == "joint_position" else controller_action
+            result = self._step_result(self.env.step(submitted))
             observation, base_reward, terminated, truncated, info = result
             if self.render_during_primitive:
                 self.env.render()
@@ -438,7 +489,7 @@ class RAPSEnvWrapper(gym.Wrapper):
 
         self.primitive_id += 1
         episode_limit = (self.low_level_steps >= self.max_ee_steps_per_episode
-                         if self.action_mode == "ee_delta"
+                         if self.action_mode in {"ee_delta", "joint_position"}
                          else self.primitive_id >= self.max_primitives_per_episode)
         if not terminated and (episode_limit or budget_limit):
             truncated = True
@@ -449,7 +500,7 @@ class RAPSEnvWrapper(gym.Wrapper):
         record.terminated = bool(terminated)
         record.truncated = bool(truncated)
         record.outcome_metrics = primitive.result(context)
-        if self.action_mode == "ee_delta":
+        if self.action_mode in {"ee_delta", "joint_position"}:
             self._direct_grasp_frames = dict(primitive.stable_grasp_frames)
             lifted, displacements = update_cumulative_lifts(
                 self._direct_lift_reference_heights,

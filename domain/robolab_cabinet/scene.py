@@ -65,7 +65,7 @@ def _box(position, half_size, color, density=None):
     return shape
 
 
-def build_scene_spec(layout="full"):
+def build_scene_spec(layout="full", *, item_names=None):
     """Return all geometry, physics, and reset metadata as JSON-compatible data."""
     if layout not in LAYOUTS:
         raise ValueError(f"Unknown cabinet layout {layout!r}; expected one of {list(LAYOUTS)}")
@@ -75,6 +75,16 @@ def build_scene_spec(layout="full"):
     items = capture.cabinet_items
     for item, kind in zip(items, capture.cabinet_item_types):
         item.update(type=kind, dynamic=True)
+    if item_names is not None:
+        requested_names = list(item_names)
+        if len(requested_names) != len(set(requested_names)):
+            raise ValueError("Duplicate cabinet item names are not allowed")
+        available_names = {item["name"] for item in items}
+        unknown_names = [name for name in requested_names if name not in available_names]
+        if unknown_names:
+            raise ValueError(f"Unknown cabinet item name(s): {unknown_names}")
+        selected_names = set(requested_names)
+        items = [item for item in items if item["name"] in selected_names]
     wood, inside = [0.63, 0.39, 0.20, 1.0], [0.74, 0.55, 0.34, 1.0]
     frame_parts = [
         ([0.238, 0., 0.], [0.012, 0.30, 0.36], inside),
@@ -111,13 +121,13 @@ def build_scene_spec(layout="full"):
                 items=items)
 
 
-def export_scene(output_path, layout="full"):
+def export_scene(output_path, layout="full", *, item_names=None, include_physics_scene=True):
     """Write a standalone USD and sibling JSON manifest, requiring ``usd-core``."""
     try:
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
     except ImportError as exc:
         raise RuntimeError("USD export requires pxr; install the usd-core package in the export environment") from exc
-    spec = build_scene_spec(layout)
+    spec = build_scene_spec(layout, item_names=item_names)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Usd.Stage.CreateNew(str(output))
@@ -125,9 +135,10 @@ def export_scene(output_path, layout="full"):
     stage.SetDefaultPrim(world.GetPrim())
     UsdGeom.SetStageMetersPerUnit(stage, 1.)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-    physics = UsdPhysics.Scene.Define(stage, "/World/physicsScene")
-    physics.CreateGravityDirectionAttr(Gf.Vec3f(0., 0., -1.))
-    physics.CreateGravityMagnitudeAttr(9.81)
+    if include_physics_scene:
+        physics = UsdPhysics.Scene.Define(stage, "/World/physicsScene")
+        physics.CreateGravityDirectionAttr(Gf.Vec3f(0., 0., -1.))
+        physics.CreateGravityMagnitudeAttr(9.81)
     material = UsdShade.Material.Define(stage, "/World/physicsMaterial")
     api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
     api.CreateStaticFrictionAttr(.3)

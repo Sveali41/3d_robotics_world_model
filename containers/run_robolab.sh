@@ -6,6 +6,7 @@ runtime_dir="$project_root/outputs/robolab-isaac60"
 mkdir -p "$runtime_dir"/{home,output,cache,data,logs}
 
 exec apptainer run --nv --cleanenv \
+    --bind "$project_root:/workspace" \
     --home "$runtime_dir/home" \
     --env OMNI_KIT_ACCEPT_EULA=Y \
     --bind "$runtime_dir/output:/opt/robolab/output" \

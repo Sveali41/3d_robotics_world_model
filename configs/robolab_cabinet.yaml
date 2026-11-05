@@ -1,0 +1,19 @@
+# Both variants reuse the original ManiSkill cabinet geometry and item poses.
+variants:
+  target:
+    items: null  # All 24 original objects.
+  mini:
+    items: [cabinet_item_16, cabinet_item_17]  # Original mug and bowl.
+
+seed: 0
+# Stock Panda-hand asset; the corresponding Isaac 6 asset URL currently returns 404.
+robot_usd: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.0/Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd
+sim_freq: 100
+control_freq: 20
+episode_steps: 200
+camera:
+  eye: [-0.82, -0.46, 1.22]
+  lookat: [0.04, -0.08, 0.74]
+  width: 640
+  height: 512
+  fov: 0.82

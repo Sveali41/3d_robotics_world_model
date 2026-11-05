@@ -32,7 +32,7 @@ robocasa_visualization:
   # Agent-centric RAPS actions: no object ID or simulator object pose is used.
   primitive_weights:
     move_delta_ee_pose: 0.15
-    top_grasp: 0.10
+    approach: 0.10
     lift: 0.12
     drop: 0.08
     move_left: 0.10
@@ -72,7 +72,7 @@ raps_collection:
   # Temporary preprocessing smoke-test checkpoint. It is not Fetch-trained;
   # it only supplies PointWorld's model/config contract while the Fetch
   # canonical scene/robot fields are generated.
-  pointworld_checkpoint: "PointWorld/train_logs/pointworld_maniskill_peg_small_balanced/model-last.pt"
+  pointworld_checkpoint: "exploration/pointworld/official/train_logs/pointworld_maniskill_peg_small_balanced/model-last.pt"
   sim_backend: "auto"
   render_backend: "gpu"
 
@@ -80,12 +80,12 @@ raps_collection:
 # ========== Pipeline Settings ==========
 # train / eval / curriculum_preview
 pipeline_mode: "eval"
-collect_data: true # true 时，train 模式先采集当前 curriculum，再开始训练
-# eval 时要加载的 PointWorld 实验目录名；null 时回退到下面的 exp_name。
-# 对应模型路径：PointWorld/<log_dir>/<eval_exp_name>/model-last.pt
+collect_data: true # When true, train mode collects the current curriculum before training
+# PointWorld experiment directory to load for eval; null uses exp_name below.
+# Corresponding model path: exploration/pointworld/official/<log_dir>/<eval_exp_name>/model-last.pt
 eval_exp_name: null
-eval_viz_num: 10 # 跑验证时可视化的样本数量，-1 表示关闭可视化，正数（如 10）表示开启并在浏览器查看
-eval_viz_gif: False # true: 离线生成多帧 GIF；false: 使用网页端 Viser 查看
+eval_viz_num: 10 # Number of evaluation samples to visualize; -1 disables visualization, positive values (e.g. 10) enable browser viewing
+eval_viz_gif: False # true: generate offline multi-frame GIFs; false: view with browser-based Viser
 eval_viz_gif_fps: 5.0
 
 # Curriculum random-policy GIF preview. Used when pipeline_mode is
@@ -149,14 +149,14 @@ curriculum_smoke_train_steps: 20
 curriculum_smoke_require_success: false
 
 # Log all curriculum stages into one continuous W&B run. The generated run ID
-# is persisted under PointWorld/<log_dir>/<run_name>[_smoke]/wandb_run_id.txt,
+# is persisted under exploration/pointworld/official/<log_dir>/<run_name>[_smoke]/wandb_run_id.txt,
 # allowing an interrupted pipeline to resume the same W&B run.
 curriculum_wandb_single_run: true
 curriculum_wandb_run_name: "pointworld_peg_continual"
 curriculum_wandb_run_id: null
 
 # Explicit continual-learning experiment/folder names. These become directories
-# under PointWorld/<log_dir>/ and are chained automatically in env-list mode.
+# under exploration/pointworld/official/<log_dir>/ and are chained automatically in env-list mode.
 curriculum_exp_names:
   grasp_contact: "pointworld_peg_continual_grasp"
   object_transport: "pointworld_peg_continual_transport"

@@ -113,7 +113,7 @@ RAPS_PRIMITIVE_SPECS = (
     # +x. The policy learns y_offset and z_offset to aim at the target object
     # (directly readable from tcp_to_mug / tcp_to_bowl in the observation).
     PrimitiveSpec(
-        "top_grasp",
+        "approach",
         (
             PrimitiveParameter("x_forward", 0.35),  # push depth along +x (covers full drift range)
             PrimitiveParameter("y_offset", 0.20),   # lateral offset to target
@@ -142,7 +142,8 @@ class RAPSActionSchema:
         self.primitive_names = tuple(spec.name for spec in self.specs)
         self.num_primitives = len(self.specs)
         official_indices = {
-            "move_delta_ee_pose": [0, 1, 2], "top_grasp": [3, 4, 5],
+            "move_delta_ee_pose": [0, 1, 2], "approach": [3, 4, 5],
+            "align_yz": [4, 5], "approach_x": [3],
             "lift": [4], "drop": [5], "move_left": [6], "move_right": [7],
             "move_forward": [8], "move_backward": [9],
             "open_gripper": [], "close_gripper": [],
@@ -216,8 +217,17 @@ class RAPSActionSchema:
 RAPS_ACTION_SCHEMA = RAPSActionSchema()
 RAPS_COMPACT_ACTION_SCHEMA = RAPSActionSchema(tuple(
     spec for spec in RAPS_PRIMITIVE_SPECS
-    if spec.name in {"move_delta_ee_pose", "top_grasp", "lift", "drop",
+    if spec.name in {"move_delta_ee_pose", "approach", "lift", "drop",
                      "open_gripper", "close_gripper"}
+))
+
+
+# Preserve the original 10/6-skill action contracts for baseline checkpoints.
+RAPS_SPLIT_ACTION_SCHEMA = RAPSActionSchema((
+    RAPS_PRIMITIVE_SPECS[0],
+    PrimitiveSpec("align_yz", RAPS_PRIMITIVE_SPECS[1].parameters[1:]),
+    PrimitiveSpec("approach_x", RAPS_PRIMITIVE_SPECS[1].parameters[:1]),
+    *RAPS_COMPACT_ACTION_SCHEMA.specs[2:],
 ))
 
 
@@ -226,12 +236,12 @@ class PrimitiveAction:
     primitive_type: str
     parameters: dict[str, float]
 
-    def to_vector(self) -> np.ndarray:
-        return RAPS_ACTION_SCHEMA.encode(self)
+    def to_vector(self, schema=RAPS_ACTION_SCHEMA) -> np.ndarray:
+        return schema.encode(self)
 
     @classmethod
-    def from_vector(cls, vector) -> "PrimitiveAction":
-        return RAPS_ACTION_SCHEMA.decode(vector)
+    def from_vector(cls, vector, schema=RAPS_ACTION_SCHEMA) -> "PrimitiveAction":
+        return schema.decode(vector)
 
 
 @dataclass
@@ -247,12 +257,13 @@ class PrimitiveContext:
     """Robot state for control and optional dense-trajectory recording."""
 
     def __init__(self, env, *, robot: str = "fetch", record_state: bool = True,
-                 project_goals_to_region: bool = False):
+                 project_goals_to_region: bool = False, arm_controller=None):
         self.env = env.unwrapped if hasattr(env, "unwrapped") else env
         self.project_goals_to_region = bool(project_goals_to_region)
         self.robot = normalize_primitive_robot(robot)
         self.agent = self.env.agent
-        self.arm_controller = self.agent.controller.controllers["arm"]
+        self.arm_controller = (self.agent.controller.controllers["arm"]
+                               if arm_controller is None else arm_controller)
         self.ee_position = _numpy(self.arm_controller.ee_pose_at_base.p[0]).astype(
             np.float32
         )
@@ -513,7 +524,7 @@ class Primitive:
     def next_action(self, context: PrimitiveContext) -> np.ndarray | None:
         raise NotImplementedError
 
-    def result(self, context: PrimitiveContext) -> dict[str, Any]:
+    def result(self, context: PrimitiveContext, *, schema=None) -> dict[str, Any]:
         translations = {}
         for object_id, initial in self.initial_object_positions.items():
             if object_id in context.objects:
@@ -560,7 +571,8 @@ class Primitive:
                 key: state.position_world.tolist() for key, state in context.objects.items()
                 if hasattr(state, "position_world")
             },
-            "high_level_action": self.action.to_vector().tolist(),
+            "high_level_action": (self.action.to_vector() if schema is None
+                                  else schema.encode(self.action)).tolist(),
             "final_tcp_position": context.ee_position.tolist(),
             "duration_steps": self.steps,
             "status": self.status,
@@ -696,8 +708,10 @@ class CloseGripperPrimitive(GripperPrimitive):
     command_sign = -1.0
 
 
-class TopGraspPrimitive(Primitive):
-    name = "top_grasp"
+class ApproachPrimitive(Primitive):
+    """Legacy side-grasp behavior: align, approach along +X, then close."""
+
+    name = "approach"
 
     def reset(self, context):
         super().reset(context)
@@ -768,6 +782,68 @@ class TopGraspPrimitive(Primitive):
         return np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 
 
+class AlignYZPrimitive(Primitive):
+    """Translate in root Y/Z, preserving X and the gripper command."""
+
+    name = "align_yz"
+
+    def reset(self, context):
+        super().reset(context)
+        self.goal = context.ee_position + np.array(
+            [0.0, self.parameters["y_offset"], self.parameters["z_offset"]],
+            dtype=np.float32,
+        )
+        self._set_goal(context, "goal")
+        self.max_steps = 100
+        self.stage = "align"
+
+    def next_action(self, context):
+        if self.done or not self._tick():
+            return None
+        action, reached = self._move_to(
+            context, self.goal, self._hold_gripper(context), tolerance=.015, speed=.30
+        )
+        if reached:
+            self.status = "success"
+            return None
+        return action
+
+
+class ApproachXPrimitive(Primitive):
+    """Translate along root +X; optional contact stopping never closes the gripper."""
+
+    name = "approach_x"
+
+    def reset(self, context):
+        super().reset(context)
+        self.goal = context.ee_position + np.array(
+            [abs(self.parameters["x_forward"]), 0.0, 0.0], dtype=np.float32
+        )
+        self._set_goal(context, "goal")
+        self.max_steps = 150
+        self.stage = "approach"
+
+    def observe(self, context):
+        snapshot = super().observe(context)
+        if not self.done and getattr(self, "stop_on_contact", True):
+            for state in snapshot["objects"].values():
+                if state["left_force"] >= .05 and state["right_force"] >= .05:
+                    self.status = "contact_stop"
+                    break
+        return snapshot
+
+    def next_action(self, context):
+        if self.done or not self._tick():
+            return None
+        action, reached = self._move_to(
+            context, self.goal, self._hold_gripper(context), tolerance=.012, speed=.08
+        )
+        if reached:
+            self.status = "success"
+            return None
+        return action
+
+
 class DirectionalMovePrimitive(Primitive):
     direction = np.zeros(3, dtype=np.float32)
     parameter_name = "distance"
@@ -821,7 +897,9 @@ PRIMITIVE_CLASSES = {
     "drop": DropPrimitive,
     "open_gripper": OpenGripperPrimitive,
     "close_gripper": CloseGripperPrimitive,
-    "top_grasp": TopGraspPrimitive,
+    "approach": ApproachPrimitive,
+    "align_yz": AlignYZPrimitive,
+    "approach_x": ApproachXPrimitive,
     "move_left": MoveLeftPrimitive,
     "move_right": MoveRightPrimitive,
     "move_forward": MoveForwardPrimitive,
@@ -837,7 +915,7 @@ class UniformPrimitiveExplorer:
         self.verbose = bool(verbose)
         self.weights = weights or {
             "move_delta_ee_pose": 0.15,
-            "top_grasp": 0.10,
+            "approach": 0.10,
             "lift": 0.12,
             "drop": 0.08,
             "move_left": 0.10,

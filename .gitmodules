@@ -1,6 +1,9 @@
 [submodule "PointWorld"]
-	path = PointWorld
+	path = exploration/pointworld/official
 	url = https://github.com/Sveali41/PointWorld.git
 [submodule "raps_official"]
-	path = raps_official
+	path = exploration/raps/official
 	url = https://github.com/mihdalal/raps.git
+[submodule "ManiSkill"]
+	path = domain/ManiSkill
+	url = https://github.com/haosulab/ManiSkill.git

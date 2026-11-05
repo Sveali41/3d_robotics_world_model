@@ -91,8 +91,9 @@ class PrimitiveRecord:
         contact_event: dict[str, Any] | None = None,
     ) -> None:
         action = np.asarray(low_action, dtype=np.float32)
-        if action.shape != (4,) or not np.isfinite(action).all():
-            raise ValueError(f"low-level RAPS action must be finite shape (4,), got {action.shape}")
+        expected = (8,) if self.schema_version == "cabinet-joint-position-v1" else (4,)
+        if action.shape != expected or not np.isfinite(action).all():
+            raise ValueError(f"low-level action must be finite shape {expected}, got {action.shape}")
         self.low_actions.append(action.copy())
         if full_controller_action is None:
             full_controller_action = action
@@ -117,9 +118,10 @@ class PrimitiveRecord:
         if self.dense_trajectory:
             raise RuntimeError("compact transitions require dense_trajectory=False")
         action = np.asarray(low_action, dtype=np.float32)
-        if action.shape != (4,) or not np.isfinite(action).all():
+        expected = (8,) if self.schema_version == "cabinet-joint-position-v1" else (4,)
+        if action.shape != expected or not np.isfinite(action).all():
             raise ValueError(
-                f"low-level RAPS action must be finite shape (4,), got {action.shape}"
+                f"low-level action must be finite shape {expected}, got {action.shape}"
             )
         full_action = np.asarray(action if full_controller_action is None else full_controller_action,
                                  dtype=np.float32)
@@ -161,7 +163,8 @@ class PrimitiveRecord:
     def validate(self, *, finalized: bool = True) -> None:
         """Raise when a primitive record violates its storage contract."""
         action = np.asarray(self.raps_action_normalized)
-        expected_shape = (4,) if self.schema_version == "cabinet-ee-delta-v1" else (20,)
+        expected_shape = ((8,) if self.schema_version == "cabinet-joint-position-v1" else
+                          (4,) if self.schema_version == "cabinet-ee-delta-v1" else (20,))
         if action.shape != expected_shape or not np.isfinite(action).all():
             raise RuntimeError(
                 f"record action must be finite shape {expected_shape}, "

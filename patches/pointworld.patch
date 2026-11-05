@@ -1,0 +1,279 @@
+diff --git a/integration/pointworld_wrapper.py b/integration/pointworld_wrapper.py
+index d265ef10aec800212e9d9af82480406aecd0e7d5..54baeb7fb9860c45ae1a9d471dad1bb3aaa0fa30 100644
+--- a/integration/pointworld_wrapper.py
++++ b/integration/pointworld_wrapper.py
+@@ -2,6 +2,7 @@ import os
+ import sys
+ import copy
+ from pathlib import Path
++from types import SimpleNamespace
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -363,12 +364,14 @@ class PointWorldWrapper:
+     def __init__(self, model_path, device="cuda", scene_voxel_size=0.008,
+                  max_scene_points=12000, robot_urdf_path=None,
+                  robot_type="droid_panda", robot_joint_names=None,
+-                 camera_names=None):
++                 camera_names=None, data_domain=None,
++                 filter_scene_workspace=True):
+         self.device = torch.device(device)
+-        self.model_path = Path(model_path)
++        self.model_path = Path(model_path) if model_path is not None else None
+         self.max_robot_points = 500
+         self.scene_voxel_size = float(scene_voxel_size)
+         self.max_scene_points = int(max_scene_points)
++        self.filter_scene_workspace = bool(filter_scene_workspace)
+         self.robot_adapter = create_robot_flow_adapter(
+             robot_type=robot_type,
+             device=self.device,
+@@ -382,15 +385,21 @@ class PointWorldWrapper:
+         )
+         self.camera_names = tuple(camera_names or default_cameras)
+         
+-        print(f"[PointWorldWrapper] Loading checkpoint from {model_path}...")
+-        checkpoint = torch.load(self.model_path, map_location="cpu", weights_only=False)
+-        self.args = checkpoint["args"]
+-        
+-        # Override args to match local configuration
+-        self.args.device = device
+-        self.args.distributed = False
+-        self.args.disable_compile = True
+-        self.args.norm_stats_path = str(repo_path / self.args.norm_stats_path)
++        if self.model_path is None:
++            if data_domain is None:
++                raise ValueError("data_domain is required when model_path=None")
++            self.args = SimpleNamespace(domains=[data_domain])
++            self.model = None
++        else:
++            print(f"[PointWorldWrapper] Loading checkpoint from {model_path}...")
++            checkpoint = torch.load(self.model_path, map_location="cpu", weights_only=False)
++            self.args = checkpoint["args"]
++
++            # Override args to match local configuration
++            self.args.device = device
++            self.args.distributed = False
++            self.args.disable_compile = True
++            self.args.norm_stats_path = str(repo_path / self.args.norm_stats_path)
+         
+         # Setup data_info_dict
+         self.data_info_dict = {
+@@ -398,12 +407,14 @@ class PointWorldWrapper:
+             "robot_features_dim": 16,
+         }
+         
+-        # Instantiate BaseModel
+-        from pointworld.base import BaseModel
+-        self.model = BaseModel(self.args, self.data_info_dict)
+-        self.model.load_state_dict(checkpoint["model"])
+-        self.model.to(self.device)
+-        self.model.eval()
++        if self.model_path is not None:
++            # Importing BaseModel also imports the DINO model stack, so keep it
++            # out of offline preprocessing-only runs.
++            from pointworld.base import BaseModel
++            self.model = BaseModel(self.args, self.data_info_dict)
++            self.model.load_state_dict(checkpoint["model"])
++            self.model.to(self.device)
++            self.model.eval()
+ 
+         urdf_path = robot_urdf_path or self.robot_adapter.default_urdf_path()
+         from robot_sampler import RobotSampler
+@@ -414,7 +425,10 @@ class PointWorldWrapper:
+         )
+         self.robot_sampler.presample(self.max_robot_points, seed=0)
+         
+-        print("[PointWorldWrapper] Model successfully initialized and weights loaded.")
++        if self.model is not None:
++            print("[PointWorldWrapper] Model successfully initialized and weights loaded.")
++        else:
++            print("[PointWorldWrapper] Initialized for preprocessing only.")
+         print(
+             f"[PointWorldWrapper] Scene voxel downsample: "
+             f"grid_size={self.scene_voxel_size}, max_points={self.max_scene_points}"
+@@ -477,7 +491,7 @@ class PointWorldWrapper:
+             )
+             coords = (coords_h @ base_inv.T)[:, :3]
+ 
+-        if self.robot_type == "fetch":
++        if self.robot_type == "fetch" or not self.filter_scene_workspace:
+             # RoboCasa is a kitchen-scale world, not the small ManiSkill
+             # tabletop workspace used by the legacy Panda/Peg pipeline.
+             keep = torch.isfinite(coords).all(dim=-1)
+@@ -592,7 +606,7 @@ class PointWorldWrapper:
+                     dim=-1,
+                 )
+                 coords = (coords_h @ base_pose_inv.T)[:, :3]
+-            if self.robot_type == "fetch":
++            if self.robot_type == "fetch" or not self.filter_scene_workspace:
+                 workspace_mask = torch.isfinite(coords).all(dim=-1)
+             else:
+                 workspace_min_t = workspace_min.to(device=coords.device, dtype=coords.dtype)
+@@ -620,9 +634,9 @@ class PointWorldWrapper:
+         is_scene_mask = ~is_robot_mask
+         
+         # Initial scene points
+-        init_scene_coords = init_coords[is_scene_mask]
+-        init_scene_colors = init_colors[is_scene_mask]
+-        init_scene_seg = init_seg[is_scene_mask]
++        init_scene_coords = init_coords[is_scene_mask].to(device)
++        init_scene_colors = init_colors[is_scene_mask].to(device)
++        init_scene_seg = init_seg[is_scene_mask].to(device)
+         if init_scene_coords.shape[0] == 0:
+             raise RuntimeError(
+                 "No scene points remain after ManiSkill tabletop workspace filtering. "
+@@ -813,6 +827,11 @@ class PointWorldWrapper:
+         """
+         Runs a forward pass of PointWorld predictor.
+         """
++        if self.model is None:
++            raise RuntimeError(
++                "PointWorldWrapper was initialized for preprocessing only; "
++                "predict requires a model checkpoint"
++            )
+         with torch.no_grad():
+             data_dict, metadata = self.process_observations(raw_obs_seq, robot_link_ids, env_sensors)
+             outputs = self.model(data_dict, training=False)
+diff --git a/pointworld/base.py b/pointworld/base.py
+index 88f43542f4702b5233c619beeac54dbaae4faf6d..e73f90eb31c67cf3cc7e18bab618fee774ac31b0 100644
+--- a/pointworld/base.py
++++ b/pointworld/base.py
+@@ -363,7 +363,7 @@ class DynamicsPredictor(nn.Module):
+ 
+ 
+ class BaseModel(nn.Module):
+-    def __init__(self, args, data_info_dict, rank: int = 0, cpu_pg=None):
++    def __init__(self, args, data_info_dict, rank: int = 0, cpu_pg=None, scene_backbone=None):
+         super().__init__()
+         self.args = args
+         self.device = args.device
+@@ -380,6 +380,7 @@ class BaseModel(nn.Module):
+             data_info_dict,
+             rank,
+             self.normalize_scene_features,
++            dinov3=scene_backbone,
+         )
+ 
+         self.robot_proj = MLP(data_info_dict['robot_features_dim'], self.channels, self.channels)
+@@ -470,7 +471,7 @@ class BaseModel(nn.Module):
+             self.scene_norm_var,
+         )
+     
+-    def encode_scene_features(self, data_dict):
++    def encode_scene_features(self, data_dict, backbone_features=None):
+         B = data_dict["scene_flows"].shape[0]
+         if not hasattr(self, '_current_domain_indices'):
+             batch_domains = data_dict['__domain__']
+@@ -481,10 +482,10 @@ class BaseModel(nn.Module):
+                 device=self.device, dtype=torch.long
+             )
+ 
+-        return self.scene_feature_encoder(data_dict)
++        return self.scene_feature_encoder(data_dict, backbone_features=backbone_features)
+ 
+     # ------------------------------------------------------------------ #
+-    def forward(self, data_dict, training=True, encoded_scene_feat0=None):
++    def forward(self, data_dict, training=True, encoded_scene_feat0=None, backbone_features=None):
+         for name, tensor in data_dict.items():
+             if isinstance(tensor, torch.Tensor):
+                 assert torch.isfinite(tensor).all(), f"{name} has NaNs"
+@@ -515,7 +516,7 @@ class BaseModel(nn.Module):
+         if encoded_scene_feat0 is not None:
+             scene_feat0 = encoded_scene_feat0
+         else:
+-            scene_feat0 = self.encode_scene_features(data_dict)
++            scene_feat0 = self.encode_scene_features(data_dict, backbone_features=backbone_features)
+         
+         # ---------------------------- robot features ---------------------------- #
+         robot_feat_seq = self.normalize_robot_features(robot_feat_seq)
+diff --git a/scene_featurizer.py b/scene_featurizer.py
+index 7730d0b5f81bcdec19f0df4a65f7e845f4612b99..3f5c5a90f644222ba73b0ca9e6461b5452d5d89b 100644
+--- a/scene_featurizer.py
++++ b/scene_featurizer.py
+@@ -20,7 +20,7 @@ import torch.nn.functional as F
+ 
+ class SceneEncoder2D(nn.Module):
+     """DINOv3-based 2-D scene encoder that projects 3-D points to camera views."""
+-    def __init__(self, args, channels, data_info_dict, rank: int = 0):
++    def __init__(self, args, channels, data_info_dict, rank: int = 0, dinov3=None):
+         super().__init__()
+         self.args = args
+         self.rank = rank
+@@ -43,7 +43,10 @@ class SceneEncoder2D(nn.Module):
+         in_dim = self.feat_dim * len(self.selected_layers)
+         
+         # ---------- backbone ----------
+-        self._load_backbone()
++        if dinov3 is None:
++            self._load_backbone()
++        else:
++            self.dinov3 = dinov3
+         
+         # --- projection head (now uses in_dim) ------------------------
+         self.feat_proj = nn.Linear(in_dim, channels)
+@@ -138,7 +141,8 @@ class SceneEncoder2D(nn.Module):
+     # ------------------------------------------------------------------ forward
+     # Note: AMP context is controlled by callers (e.g., train.py).
+     # Avoid forcing autocast here so we respect the global AMP settings.
+-    def forward(self, scene_coord, scene_exists, camera_data):
++    def forward(self, scene_coord, scene_exists, camera_data, *,
++                backbone_features=None, return_backbone_features=False):
+         """
+         Optimized forward method that directly samples from patch features without interpolation.
+         
+@@ -152,6 +156,10 @@ class SceneEncoder2D(nn.Module):
+         scene_features : (B, Ns, channels) - always returned
+         """
+         B, Ns, _ = scene_coord.shape
++        if backbone_features is not None:
++            if backbone_features.shape != (B, Ns, self.feat_dim * len(self.selected_layers)):
++                raise ValueError("Shared DINO features have incompatible point/feature dimensions")
++            return self._project_features(backbone_features, scene_exists)
+         device = self.device
+         cams = sorted(camera_data.keys())
+         C = len(cams)
+@@ -311,6 +319,12 @@ class SceneEncoder2D(nn.Module):
+         cam_counts = valid_sample.sum(dim=1).clamp(min=1).unsqueeze(-1)     # (B,Ns,1) avoid /0
+         aggregated_features = feat_sum_dino / cam_counts                    # (B,Ns,in_dim)
+ 
++        if return_backbone_features:
++            return aggregated_features
++        return self._project_features(aggregated_features, scene_exists)
++
++    def _project_features(self, aggregated_features, scene_exists):
++
+         # project down to `channels` AFTER aggregation (linear -> identical to avg of per-cam projections)
+         scene_features = self.feat_proj(aggregated_features)                # (B,Ns,channels)
+ 
+@@ -364,17 +378,18 @@ class SceneEncoder2D(nn.Module):
+ 
+ 
+ class SceneFeatureEncoder(nn.Module):
+-    def __init__(self, args, channels, data_info_dict, rank, normalize_scene_features_fn):
++    def __init__(self, args, channels, data_info_dict, rank, normalize_scene_features_fn,
++                 dinov3=None):
+         super().__init__()
+         self.args = args
+         self.normalize_scene_features = normalize_scene_features_fn
+-        self.scene_encoder = SceneEncoder2D(args, channels, data_info_dict, rank)
++        self.scene_encoder = SceneEncoder2D(args, channels, data_info_dict, rank, dinov3=dinov3)
+         self.scene_raw_feat_proj = nn.Linear(data_info_dict["scene_features_dim"], channels)
+         self.scene_encoder_norm = nn.LayerNorm(channels)
+         self.scene_raw_norm = nn.LayerNorm(channels)
+         self.scene_proj = nn.Linear(channels * 2, channels)
+ 
+-    def forward(self, data_dict):
++    def forward(self, data_dict, backbone_features=None):
+         scene_coord0 = data_dict["scene_flows"][:, 0]  # (B, Ns, 3)
+         scene_feat0 = data_dict["scene_features"][:, 0]  # (B, Ns, Ds)
+         scene_exists0 = data_dict["scene_exists"][:, 0]  # (B, Ns)
+@@ -382,7 +397,8 @@ class SceneFeatureEncoder(nn.Module):
+         scene_feat0 = self.normalize_scene_features(scene_feat0)
+ 
+         camera_data = self.scene_encoder._extract_camera_data(data_dict)
+-        backbone_scene_feat0 = self.scene_encoder(scene_coord0, scene_exists0, camera_data)
++        backbone_scene_feat0 = self.scene_encoder(
++            scene_coord0, scene_exists0, camera_data, backbone_features=backbone_features)
+         backbone_scene_feat0 = backbone_scene_feat0.to(scene_feat0.dtype)
+         scene_feat0 = torch.cat(
+             [

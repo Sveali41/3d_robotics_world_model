@@ -1,6 +1,7 @@
 .vscode/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Experiment outputs; logs/ also contains temporary audit/render/launch scripts.
 artifacts/
@@ -27,3 +28,9 @@ replays/
 *.pt
 *.pth
 *.ckpt
+
+# Installed separately; PARTNR revision is pinned in domain/household/partnr.py.
+third_party/partnr-planner/
+third_party/habitat-sim/
+third_party/procthor/
+.runtime/

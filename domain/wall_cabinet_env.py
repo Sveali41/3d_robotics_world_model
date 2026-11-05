@@ -838,6 +838,8 @@ class WallCabinetEnv(BaseEnv):
         return self.door_joint.qpos
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        # Reconfiguration can replace the robot and its FK model.
+        self.__dict__.pop("_cabinet_motion_planner", None)
         with torch.device(self.device):
             batch_size = len(env_idx)
 
@@ -881,6 +883,58 @@ class WallCabinetEnv(BaseEnv):
             "handle_position": self.handle_position,
         }
 
+    @property
+    def motion_planner(self):
+        """Shared opt-in pose planner; existing env.step actions are unchanged."""
+        if not hasattr(self, "_cabinet_motion_planner"):
+            from domain.robocasa.motion_planning import CabinetMotionPlanner
+            self._cabinet_motion_planner = CabinetMotionPlanner(self)
+        return self._cabinet_motion_planner
+
+    def plan_to_pose(self, position_root, quaternion_wxyz, **kwargs):
+        """Plan to an explicit robot-root TCP pose without advancing physics."""
+        return self.motion_planner.plan_to_pose(position_root, quaternion_wxyz, **kwargs)
+
+    def _after_control_step(self):
+        super()._after_control_step()
+        planner = getattr(self, "_cabinet_motion_planner", None)
+        if planner is not None:
+            planner.observe_grasp()
+
+    def execute_motion_plan(self, plan, *, gripper_command=None,
+                            max_steps=400, on_step=None):
+        """Execute a checked plan, recording real joint actions outside EE replay.
+
+        This is an explicit macro API, not a replacement for env.step(). Its
+        caller owns the macro budget and must consume the returned tick records.
+        """
+        from domain.robocasa.motion_planning import MotionPlanExecution
+
+        execution = MotionPlanExecution(self, plan, gripper_command=gripper_command,
+                                        max_steps=max_steps)
+        original_mode = self.agent.control_mode
+        observation = info = None
+        try:
+            self.agent.set_control_mode("pd_joint_pos")
+            self.agent.controller.reset()
+            while (action := execution.next_action()) is not None:
+                observation, reward, terminated_raw, truncated_raw, info = self.step(action[None, :])
+                row = execution.record_step(
+                    terminated=bool(terminated_raw.reshape(-1)[0]),
+                    truncated=bool(truncated_raw.reshape(-1)[0]))
+                if on_step is not None:
+                    on_step(row)
+        finally:
+            self.agent.set_control_mode(original_mode)
+            self.agent.controller.reset()
+            if execution.attachment:
+                # Restoring a controller must retain closing pressure; position
+                # reset alone would replace its gripper target with current q.
+                self.agent.controller.controllers["gripper"].set_action(
+                    torch.tensor([[execution.gripper_command]], device=self.device))
+        return execution.result(observation=observation, info=info,
+                                controller_restored=original_mode)
+
     def _get_obs_extra(self, info: dict):
         obs = {
             "tcp_pose": self.agent.tcp.pose.raw_pose,
@@ -890,9 +944,8 @@ class WallCabinetEnv(BaseEnv):
                 # PrimitiveContext controls in the arm controller's base
                 # frame. Keep object-relative observations in that same frame
                 # so a positive policy delta has a consistent meaning.
-                arm_controller = self.agent.controller.controllers["arm"]
-                tcp_position = arm_controller.ee_pose_at_base.p
-                root_inv = arm_controller.root_link.pose.inv()
+                root_inv = self.agent.robot.pose.inv()
+                tcp_position = (root_inv * self.agent.tcp.pose).p
                 obs.update(
                     tcp_to_mug=(
                         (root_inv

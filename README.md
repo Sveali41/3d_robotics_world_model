@@ -74,7 +74,8 @@ Main exploration configurations:
 | --- | --- |
 | `configs/exploration.yaml` | Base cabinet environment, action mode, rewards, and PPO |
 | `configs/cee_us_cabinet_120k_total_heuristic.yaml` | Direct EE actions with GNN and iCEM |
-| `configs/raps_gnn_actor_cabinet_400k_episode40s_centered.yaml` | Skill-level GNN actor–critic baseline |
+| `configs/raps_gnn_actor_cabinet_split7.yaml` | Split7 skill-level curiosity exploration with direct EE execution |
+| `configs/raps_gnn_actor_cabinet_400k_episode40s_centered.yaml` | Retained compact6 skill-level GNN actor–critic baseline |
 | `configs/raps_gnn_actor_cabinet_400k_heuristic_only.yaml` | Skill-level heuristic-only comparison |
 | `configs/raps_gnn_actor_cabinet_split7_planner.yaml` | Split7 primitives with collision-aware joint-trajectory execution |
 
@@ -90,6 +91,130 @@ python -m exploration.diagnostics.validate_cabinet_planner --help
 
 Existing datasets and checkpoint action contracts remain unchanged. New split7 data has a 13D skill action and cannot directly evaluate an older 12D world model. Diagnostic source fingerprints still require matching code versions.
 
+For new skill-level curiosity runs, use the direct-execution split7 configuration:
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.cee_us.cee_us_cabinet train \
+  --config configs/raps_gnn_actor_cabinet_split7.yaml \
+  --output logs/raps_split7_curiosity
+```
+
+This selects the existing RAPS imagination actor with the CEE-US GNN ensemble, using completed primitive endpoints. It preserves the compact6 baseline's ensemble-disagreement reward, object approach heuristic, training budgets and 100/20 Hz timing. The action is now 7 primitive choices plus 6 shared parameters: `move_delta_ee_pose`, `align_yz`, `approach_x`, `lift`, `drop`, `open_gripper`, `close_gripper`. The actor selects their order; `approach_x` does not automatically close the gripper. Execution uses the existing direct `ee_delta` controller and latched gripper. Start a fresh actor and WM without `--checkpoint`; compact6 checkpoints and the 12D `logs/cabinet_grasp_sequences_972` dataset are incompatible. This configuration does not migrate those artifacts. The split7 planner configuration remains a separate variant, and the 4D iCEM entry retains its existing configuration.
+
+### Automatic multi-point cabinet grasp collection
+
+The selected collection and WM-validation workflow uses the original compact6 primitives with `motion_execution: ee_delta`, without the motion planner. The planner comparison below is retained as a separate diagnostic and is not part of collection or training.
+
+`exploration.diagnostics.collect_cabinet_grasps` collects validation-only compact6 primitive endpoints through the existing physical executor, without training a model. It uses the original 12 cm cup/bowl spacing and fixed wrist orientation. Its 108 cases combine two objects, 27 grasp offsets around the calibrated object-relative targets, and 4/8 cm lift distances. Root-frame offset increments are X = -1/0/+1 cm and Y/Z = -1.5/0/+1.5 cm. This is a local grasp-neighborhood evaluation, not exhaustive environment coverage.
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.collect_cabinet_grasps \
+  --checkpoint logs/raps_compact6_train_400k_episode40s_centered_20261026T173840/curiosity/round_001.pt \
+  --output logs/cabinet_grasps_smoke --stage smoke
+```
+
+Use `--stage plan` with a new output directory to inspect the full sampling plan without simulation. Use `--stage collect` with another new output directory to run all 108 cases headlessly in one process. The default seed is 1000000; each case uses that seed plus its fixed case ID. Each case resets the scene and executes open, approach/close, grasp confirmation, lift, carry, drop, release and retreat; it ends after the sequence or failure cleanup, with at most 800 control ticks at 20 Hz (100 Hz physics). The smoke stage runs only each object's center grasp with an 8 cm lift.
+
+Raw actions, partial trajectories, zero-duration attempts and unsuccessful outcomes remain on disk. `evaluation.npz` includes completed nonzero-duration skill endpoints from successful, failed and interrupted attempts, with 67D states, 12D actions, unique episode IDs and actual durations; incomplete skills are excluded. Reports retain all finished cases in success-rate denominators. `--resume` preserves old attempts, skips finished cases and restarts interrupted cases from reset without joining their trajectories. Resume requires matching execution sources, checkpoint and sampling configuration. No data is automatically added to training replay, and collection does not certify collision-free grasping.
+
+Case success preserves the calibration script's measured grasp/lift/carry/release criteria. It does not require every constituent primitive to report `success`: for example, a drop may time out before the subsequent release completes. Inspect the per-primitive statuses in each case report alongside its aggregate outcome.
+
+`exploration.diagnostics.collect_cabinet_grasp_sequences` provides a separate sequence-variation protocol using compact6 by default and the direct executor:
+
+- Six permutations of X/Y/Z approach waypoints followed by `close_gripper`. The root-frame grasp target is frozen after opening; each waypoint updates target coordinates in the selected order. Actual reachability and arrival errors are recorded rather than assumed.
+- Three templates retain the original `approach` and insert a +Y 3 cm move and a return to the anchored TCP position after grasping, midway through lifting, or before carrying. The midway template uses two equal requested lift halves. Existing motion tolerances remain unchanged, so physical return and final lift positions are approximate. Loss of grasp during inserted motions is retained as a failure.
+
+These are nine templates, not a Cartesian product of every approach order and insertion stage. The full plan has 972 cases (108 base cases times nine templates); each template shares its base case's initial seed. Outputs are separate from the original 108-case dataset. The smoke stage runs eight center cases: two objects times one approach-order template and the three insertion templates. It does not automatically launch full collection or training.
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.collect_cabinet_grasp_sequences \
+  --checkpoint logs/raps_compact6_train_400k_episode40s_centered_20261026T173840/curiosity/round_001.pt \
+  --output logs/cabinet_grasp_sequences_smoke --stage smoke
+```
+
+Use `--stage plan` to inspect the sampling plan, `--stage collect` with a new output directory for all cases, or the matching command plus `--resume` after interruption. Reports include template-specific outcomes and measured adjustments. Data still contains completed physical primitive endpoints; repeated initial conditions and shared sequence prefixes are correlated observations, not independent samples. Keep dataset episode IDs separate when comparing or combining runs.
+
+For the split7 action set, add `--skill-set split7` and use a new output directory, such as `logs/cabinet_grasp_sequences_split7_smoke`. Its seven primitives are `move_delta_ee_pose`, `align_yz`, `approach_x`, `lift`, `drop`, `open_gripper`, and `close_gripper`. The six axis-order templates use `align_yz` for Y/Z and `approach_x` for positive X, followed by explicit closure. The three insertion templates replace composite `approach` with separate YZ alignment, X approach and closure; subsequent carry and insertion motions retain the original movement primitive. This uses direct EE control, without a planner, and preserves each primitive's existing tolerance. Splitting changes physical execution: alignment can stop within its 1.5 cm tolerance, and the subsequent X primitive preserves achieved Y/Z rather than continuing to correct toward the original 3D grasp target. Success parameters from composite approach therefore need not transfer unchanged.
+
+Split7 exports **13D actions** with the same **67D state**. The supplied compact6 checkpoint supplies only state/configuration provenance; its model and policy weights are not used or converted. The manifest records both its source 12D contract and the effective split7 contract. Old datasets remain compact6 and cannot be relabeled or evaluated with an incompatible action contract. Resume requires the same skill set and source snapshot; historical runs retain their saved sources. `--stage plan --skill-set split7` lists all 972 cases without simulation; `--stage collect --skill-set split7` starts a separate full collection only when explicitly requested.
+
+Create an offline interactive 3D snapshot while collection continues:
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.visualize_cabinet_grasp_sequences \
+  --input logs/cabinet_grasp_sequences_972 \
+  --output artifacts/cabinet_grasp_sequences_3d
+```
+
+The viewer uses only closed cases from the captured snapshot. Open its generated HTML in a browser to rotate/zoom, select an object, template, outcome or individual case, and compare actual TCP and target-object paths. Colors distinguish complete pipelines, confirmed grasps followed by pipeline failure, and unconfirmed grasps. The static overview shows labelled representatives; the HTML includes all captured cases. Interactive paths retain every recorded 20 Hz controller step, including reset; path lengths use these full trajectories, in robot-root metres. No trajectories are joined across cases or attempts. This is a snapshot, not a live feed; regenerate into a new output directory to include later cases. The exporter reuses the inline Plotly.js bundle from the existing coverage-network HTML by default (`--plotly-source` selects another HTML with an inline bundle), embedding it for offline use without installing packages or loading a CDN.
+
+New snapshots open on one complete case in **Paths** mode; select **Density** to inspect the aggregate distribution. Density uses a root-frame grid anchored at `(0, 0, 0)`, with `--voxel-size 0.02` metres by default. Each cell counts distinct cases whose recorded TCP or target-object positions entered it, with each case counted at most once per cell. Counts use all recorded positions, including the initial position, before any display downsampling; gaps between samples are not filled. Filters recompute counts for the selected cases. Color uses a labelled logarithmic scale, with raw case counts available on hover; `density.png` shows TCP and target-object distributions side by side. Common initial states can form hotspots. The spatial extent shows where recorded positions occurred, while color shows repetition within that extent; this statistic does not establish whole-environment or dynamics coverage.
+
+Grasp/lift counters use saved calibration feedback rather than movement alone. Select one case to inspect confirmed grasp, held-lift verification, measured rise/carry distance, release, failure reason and actual primitive statuses (including timeouts in otherwise successful pipelines). In **Paths**, a single case shows its complete TCP route colored by recorded action phase, dotted target-object route, direction arrows and start/end labels. A cabinet wireframe and translucent shelf provide fixed spatial context (schematic frame only, without door or robot collision geometry). The step slider and Play/Pause animate current TCP/object markers while leaving the entire route visible. Each video has a **Show complete 3D trajectory** button to select its case directly. The plot retains original 20 Hz step/time labels; these display changes do not change the underlying success criteria, metrics or raw dataset. Initial reset points have no grasp feedback.
+
+For an intuitive view of what happened, render a few representative robot videos, then embed them above the distribution plot:
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.render_cabinet_grasp_replays \
+  --input logs/cabinet_grasp_sequences_972 --output artifacts/cabinet_robot_replays
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.visualize_cabinet_grasp_sequences \
+  --input logs/cabinet_grasp_sequences_972 --output artifacts/cabinet_with_robot_playback \
+  --replays artifacts/cabinet_robot_replays
+```
+
+The default six videos cover both cup and bowl, grouped by object: cup cases 2/0/272 and bowl cases 542/486/630 show a complete pipeline, unconfirmed grasp, and lost grasp during lift respectively. Rendering needs the simulator's GPU/Vulkan runtime. This diagnostic replays recorded full controller actions, checking every 67D state exactly against the original logs; mismatched replays fail instead of publishing a misleading video. Labels show recorded phases, grasp confirmation and target height change. Videos run at the original 20 Hz, with an extra one-second final hold; use native play/seek/fullscreen controls and the playback-speed selector. Only the selected examples are rendered. Their movies are embedded in the HTML for offline viewing; the underlying dataset, primitives and evaluation metrics stay unchanged.
+
+To compare the two center-case trajectories with the existing collision-aware executor, use the separate diagnostic:
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.compare_cabinet_grasp_paths \
+  --baseline artifacts/cabinet_grasps_smoke_20261110 \
+  --output artifacts/cabinet_grasp_path_comparison
+```
+
+It reuses the baseline checkpoint, seeds and grasp offsets, verifies the initial states, and executes the planner variant in a separate headless scene. PNG/SVG plots show actual root-frame TCP and object paths in 3D, top and side views. Rejected targets are labelled separately from executed paths. The diagnostic preserves raw planner results and does not export planner data as an old-WM validation set. A TCP curve does not describe the whole arm's swept volume or certify collision freedom.
+
+### Teleoperation-derived primitive validation
+
+`exploration.diagnostics.teleop_wm_validation` records a mouse-controlled EE demonstration, extracts parameters from human-labelled skill segments, then resets the scene and executes those parameters through the existing skill collector. It supports the compact6, latched-gripper, EE-delta checkpoint contract; it does not train a model or use demonstration endpoints as primitive prediction labels.
+
+Run these commands from an interactive terminal in the `rlPractice` environment:
+
+```bash
+python -m exploration.diagnostics.teleop_wm_validation --stage record \
+  --checkpoint logs/raps_compact6_train_400k_episode40s_centered_20261026T173840/curiosity/round_001.pt \
+  --output logs/teleop_mouse_validation
+python -m exploration.diagnostics.teleop_wm_validation --stage extract \
+  --output logs/teleop_mouse_validation
+python -m exploration.diagnostics.teleop_wm_validation --stage replay \
+  --output logs/teleop_mouse_validation
+```
+
+The record stage opens a scene viewer with a teleoperation panel. Select a skill and click Begin, then drag the target gizmo at the EE using the mouse. The existing EE-delta controller moves the arm toward that target; the robot is never teleported. Run/Pause controls whether an active segment advances physics at 20 Hz. Use Open/Close gripper, End to finish the segment, and Finish/save after closing the last segment. Available labels are `move_delta_ee_pose`, `approach`, `lift`, `drop`, `open_gripper`, and `close_gripper`. The `approach` primitive includes closing the gripper. Only target translation is used; wrist orientation remains fixed. Paused viewing does not advance physics.
+
+New manual recordings place the cup and bowl 1 cm farther apart on each side: their initial lateral center spacing is 14 cm instead of 12 cm. Only this diagnostic's spawn positions change; object geometry, shelf height, robot pose and training scenes remain unchanged. The extra 2 cm is recorded as `object_spacing_increase_m` in the demonstration manifest. Primitive replay uses that recorded layout; older demonstrations without the field retain their original 12 cm layout. Restart the collector to create the new scene; existing recordings are preserved.
+
+Manual recording has no default step cap and ends when you click Finish/save. This diagnostic removes the inherited 800-step EE episode limit and the nested simulator time limits, including during primitive replay; training episode limits remain unchanged. Replay ends after the extracted plan. Supply optional `--max-steps N` to explicitly cap a record/replay run. Actual termination or simulator errors still stop execution. Single-primitive parameter bounds still apply: end movement segments before exceeding X/Y +/-0.15m or Z +/-0.12m, then begin another segment. Longer demonstrations are not a guarantee of broader dynamics coverage.
+
+For scripted headless checks, `--headless` retains terminal commands: `begin NAME`, `w/s` for root-frame +/-X, `a/d` for +/-Y, `r/f` for +/-Z (optional tick count, such as `w 5`), `o/c` for the gripper, `end`, and `quit`. Existing output directories are never overwritten; choose a new directory for each demonstration.
+
+For independent arm-joint adjustment, add `--control-mode joints` to the record command and choose a new output directory. Its mouse panel provides seven named joint-angle sliders in radians, bounded by the robot's physical joint limits, plus gripper and Begin/End/Run/Pause controls. Joint targets execute through the existing joint-position controller and physical simulation; this mode does not hold the wrist orientation or teleport the arm. Physical collisions can prevent reaching a requested angle. This mouse-only diagnostic records a distinct 8D action (seven absolute joint targets plus normalized gripper), alongside its source checkpoint contract. It cannot be passed to compact6 extract/replay; use the default `--control-mode ee` for the existing primitive validation workflow. Direct joint control alone does not establish an obstacle-free path into the cabinet.
+
+For mouse-controlled position and orientation with whole-arm path planning, use the explicit pose mode in the existing NumPy 1.26 runtime (MPLib 0.1.1 cannot run with NumPy 2):
+
+```bash
+.runtime/thor-ceeus/bin/python -m exploration.diagnostics.teleop_wm_validation --stage record \
+  --control-mode pose \
+  --checkpoint logs/raps_compact6_train_400k_episode40s_centered_20261026T173840/curiosity/round_001.pt \
+  --output logs/teleop_pose_validation
+```
+
+In the pose panel, click Begin segment at the top and confirm the visible recording state changes to `pose_control`, drag the gizmo in Translate or Rotate mode, then click Plan & Execute. Target editing does not advance physics. The existing planner checks the complete arm against the live scene and then executes its joint trajectory; it does not teleport the robot or fall back to direct EE motion when planning fails. For intentional grasp contact, explicitly select the target object in the finger-contact selector; this permits only the existing planner's finger/object contact exception, not arm/cabinet contact. Gripper buttons hold the measured arm configuration for 30 control ticks. Pause/resume, cancel, and end controls retain partial executions and their status. A failed planning request is recorded with zero physical transitions, rather than inventing a failed simulator action.
+
+Pose requests, planner outcomes and planned trajectories are saved separately from dense actual 8D joint-control transitions, with target frames, source checkpoint contract and execution feedback. These are a new pose/macro diagnostic action definition and cannot enter old compact6 extract/replay. Finite planner collision checks and execution feedback do not guarantee continuous collision freedom or grasp success; an unreachable or obstructed target is an expected rejection. The per-request planner/execution budgets remain finite even though the manual session has no default total step cap.
+
+Extraction rejects unsupported directions, gripper changes, incomplete segments, and out-of-range parameters instead of clipping them. Replay checks the seeded initial state and contracts before stepping. Actual primitive execution may differ from the demonstration; its completed nonzero-duration endpoints, including failed outcomes, populate `replay/evaluation.npz`. Dense replay logs retain incomplete attempts as well. This is a human-designed diagnostic dataset, not exhaustive dynamics coverage; keep it separate from training replay and split complete episodes if collecting additional data for training.
+
 ### Household environments
 
 ```bash
@@ -104,6 +229,212 @@ python main.py thor --help
 - `thor`: iTHOR / ProcTHOR entry; dependencies are listed in `requirements/thor.txt`.
 
 Help and prerequisite checks do not establish that full simulation works. Setup scripts may download assets and change runtimes; run them as needed.
+
+### FloorPlan1 CEE-US world model
+
+`exploration.cee_us.cee_us_thor` reuses the pinned official state-GNN ensemble, normalizers, delta/MSE training and member-wise rollout. Categorical CEM replaces continuous iCEM. It searches 8 navigation/posture and 6 interaction types; a fixed executor chooses the nearest visible object with the required capability. Put chooses a receptacle excluding the held object and retains `placeStationary=True`. No automatic navigation, forced interaction, task-target preference or object randomization is used.
+
+Prepare the isolated combined runtime without changing the existing THOR or training environments:
+
+```bash
+bash scripts/setup_thor_cee_us.sh
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor --help
+```
+
+The setup reuses PyTorch from `rlPractice`; set `CEEUS_PYTHON` to its Python executable on another machine. It installs only iTHOR runtime dependencies, not ProcTHOR. The existing pinned Unity build must already be available (`scripts/setup_thor.sh unity` downloads it explicitly if needed). The standard smoke/training collector uses local graphics unless `--metadata-only` is passed; the designed validation collector below defaults to metadata-only headless Unity. Offline evaluation does not start Unity. CPU is the default; unavailable CUDA requests fail explicitly.
+
+GPU training, CEM planning and periodic validation use the same FP32 GNN with `--device cuda`. The local RTX 2000 Ada Laptop GPU (8GB) is accessible from the host, but this session's default sandbox hides NVIDIA device nodes. Run GPU commands from a GPU-visible terminal or an explicitly approved host execution context; missing sandbox device access does not imply a broken driver. No driver/package replacement was needed.
+
+For the hidden-dimension-32 FloorPlan1 pilot, measured candidate chunks of 4 were about as fast as chunks of 8/12 and used less memory. Keep the training minibatch at its original 4 and use `--cem-chunk-size 4 --eval-batch-size 4`; larger batches did not improve per-sample prediction throughput in this bounded test. CEM reuses rollout storage while chunk dimensions match. These controls preserve candidate count, iterations, horizon, ensemble size, loss and optimizer; batched/device arithmetic can differ slightly in floating point. Existing CPU defaults remain available. Chunk size is recorded in checkpoint planning settings; exact resume still checks sources and settings and must not be used to silently migrate an older experiment.
+
+Run a new bounded GPU learning-curve pilot:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor train \
+  --device cuda --metadata-only --cem-chunk-size 4 --eval-batch-size 4 \
+  --eval-data outputs/thor_cee_us/learning_curve_subset_20261109/evaluation.npz \
+  --bootstrap-steps 64 --rounds 3 --steps-per-round 32 --epochs 1 \
+  --hidden-dim 32 --horizon 3 --candidates 12 --iterations 2 --elites 4 \
+  --eval-every 1 --output outputs/thor_cee_us/gpu_learning_curve
+```
+
+Reproduce the inference/memory check using an existing checkpoint:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m scripts.benchmark_thor_gpu \
+  --checkpoint outputs/thor_cee_us/learning_curve_subset_pilot_20261109/curiosity.pt \
+  --output outputs/thor_cee_us/gpu_benchmark --fit-smoke
+.runtime/thor-ceeus/bin/python -s -m artifacts.thor_learning_curve.evaluate_full \
+  --checkpoint outputs/thor_cee_us/gpu_learning_curve/curiosity.pt \
+  --eval-data outputs/thor_cee_us/instance_validation_frozen_20261109/evaluation.npz \
+  --device cuda --batch-size 4 \
+  --output outputs/thor_cee_us/gpu_learning_curve/full_evaluation.json
+```
+
+This tests CPU/CUDA predictions, three paired CEM seeds at chunks 1/4/8/12, prediction batches 4/8/16, and an optional discarded eight-training-transition fit. It never starts Unity or trains on frozen validation. The measured chunk-4 planning median was 0.272s with 0.802GiB peak allocated device memory; a separate 24-action CUDA loop averaged 0.353s per CEM decision. Full4979 CUDA validation completed in 28.6s, including overlap with another small GPU check, and its headline metrics agreed with the saved CPU report (rtol 1e-4, atol 1e-6). These are small-model measurements, not guaranteed speedups or memory limits for larger configurations. Reports are in `outputs/thor_cee_us/gpu_benchmark_20261109/` and `gpu_loop_smoke_20261109/`.
+
+The earlier 9.3s subset validation overlapped a separate full GPU evaluation; it is not an isolated-validation baseline. Standalone 512-transition measurements are around 2–3s with this hidden32 model. Example displays reuse the first 16 predictions from the metric pass, avoiding 16 extra forward calls without changing samples, groups or metrics. A 5000-attempt experiment still requires thousands of planning decisions and repeated fitting of cumulative replay; planning-only estimates do not predict total runtime, especially when increasing training epochs.
+
+Run the bounded smoke test (use a new output directory for every command):
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor smoke \
+  --output outputs/thor_cee_us/smoke
+```
+
+This freezes separate validation episodes, collects eight random bootstrap attempts, trains a small 5-member GNN, executes three CEM decisions, checks checkpoint prediction equality and evaluates horizons 1/3/5. Validation includes a fixed default-pose interaction sequence and bounded explicit initial-pose setup to seek missing interaction coverage. Any setup actions are separate from recorded evaluation transitions. Inspect actual coverage; unsupported success cases are never fabricated. The tiny smoke model is a wiring check, not evidence of learned general dynamics.
+
+For a small explicit random/curiosity comparison, first freeze evaluation data, then run both variants under the same attempted-action budget:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor collect-eval \
+  --steps 20 --output outputs/thor_cee_us/eval
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor compare \
+  --eval-data outputs/thor_cee_us/eval/evaluation.npz \
+  --bootstrap-steps 16 --rounds 1 --steps-per-round 10 --epochs 1 \
+  --hidden-dim 16 --horizon 2 --candidates 4 --elites 2 --iterations 1 \
+  --output outputs/thor_cee_us/compare
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor evaluate \
+  --checkpoint outputs/thor_cee_us/compare/curiosity.pt --hidden-dim 16 \
+  --eval-data outputs/thor_cee_us/eval/evaluation.npz \
+  --output outputs/thor_cee_us/evaluation
+```
+
+`train` defaults to curiosity; `train --exploration random` uses the existing random collector without constructing CEM, retaining the same five-member WM and training/evaluation settings. Random action types use the same navigation/interaction50/50 prior as bootstrap, not uniform sampling over14 actions; target selection remains nearest-visible-capable. Checkpoints record the exploration policy and explicit restore mismatches fail. `compare` runs both from the shared random bootstrap. These stages require explicit budgets and a frozen evaluation dataset. `--checkpoint` resumes at collection/episode boundaries; use matching seed, hidden dimension, CEM settings and unchanged source. `--rounds` specifies additional rounds. Mid-episode Unity restoration is not supported. `report` performs the same offline evaluation as `evaluate`.
+
+Outputs include `manifest.json` (versions, source hashes, protocol, evaluation hash), `contract.json`, independent `evaluation.npz`, model/replay/RNG checkpoints, per-round diagnostics, stratified prediction reports, actual validation ego/topdown frames and a PNG table of actual versus predicted state. The GNN does not synthesize predicted RGB. No-target attempts are local failures without a Unity call and still count against the exploration budget; a 50/50 navigation/interaction prior is shared by random exploration and CEM initialization.
+
+The optional `--prediction-mode mixed` is a separate THOR research variant; the default `mse` retains the upstream numeric-delta objective. Mixed mode keeps the five-member GNN, edge messages and mean aggregation. Each object/global readout shares two hidden layers and branches into continuous regression and classification linear heads. Agent position/yaw/horizon (indices 0–6) and object position/rotation/openness use normalized delta MSE. Standing, action outcome, the twelve object flags and multi-hot parent relations use absolute next-state BCE-with-logits. Liquid (four classes) and temperature (three classes) use separate cross-entropies; their fields remain represented even when an action does not change them. Static fields are copied exactly. No labels are inferred from changes or from action types.
+
+Mixed regression is the equal average of the agent and object continuous mean losses. Mixed classification is the equal average of six mean losses: standing, action success, object flags, parent relations, liquid and temperature. The objective is `regression + classification`, summed over the five ensemble members. These are explicit initial research weights, not weights tuned on validation data. The two loss families and per-task averaging intentionally change training relative to the MSE baseline; in particular success no longer receives only one coordinate's weight out of all dynamic outputs.
+
+The separate `--prediction-mode mixed-relations` variant gives each object readout three linear heads after the existing shared trunk: continuous regression, attribute classification (flags/liquid/temperature), and multi-label parent relations. The global agent readout is unchanged. The relation head outputs only actual receptacle instances from the frozen scene capabilities. Its BCE excludes self-parent candidates; decoding writes zero for all invalid parent pairs and preserves the existing full state layout. It retains multiple simultaneous parents, rather than a single-parent softmax. Current FloorPlan1 has43 receptacle candidates and3268 valid directed relation slots, versus5929 unfiltered slots; other scenes use their own contract.
+
+Before each fit, the new variant computes one global relation `pos_weight = N_negative / N_positive` over valid next-state labels in the training buffer. Either class absent gives weight1; an empty valid mask gives zero relation loss. This weight stays fixed during minibatches and evaluation; monitoring data do not update it. Invalid positive labels fail explicitly. Counts and weight are registered model buffers saved in checkpoints. Relation BCE remains one of the original six equally weighted classification terms; other losses, thresholds, normalization and action semantics are unchanged. Weighted sigmoid scores need not be calibrated probabilities, and positive weighting changes their decision tradeoff; evaluate relation F1, not the mostly-negative accuracy alone. The old `mixed` two-head/unweighted baseline and original `mse` remain available. Choose the new mode explicitly for a fresh experiment; old mixed checkpoints do not convert into new-head checkpoints. Both online and offline fitting accept, for example, `--prediction-mode mixed-relations --gns --gns-radius 0.5`.
+
+For an already-running online experiment, `scripts.monitor_thor_online` reads the saved bootstrap/round checkpoints and uses the exact `scripts.fit_thor_offline.assess` diagnostics to supplement the recorded metrics with action-success BCE/Brier/balanced accuracy. It verifies the dataset hash and agreement with existing MAE/accuracy/F1 values, preserves the original history, and writes `standardized_learning_curve.json`. It uses the same four-panel plotter with `--online`: action-success accuracy, action-success BCE, changed-coordinate MAE, and parent-relation F1. Online x values are training attempts; offline x values are epochs. This observer performs no fitting and changes no trainer/source fingerprints. Re-evaluated online reports explicitly describe their evaluation role rather than inheriting the offline in-sample label. The original standalone relation plot is superseded by the relation panel in the unified learning curve.
+
+The online monitor optionally accepts `--reference-history PATH` to pin a completed offline epoch as a horizontal reference in each of the same four panels. Its path, exact history SHA256 and selected epoch are stored in `standardized_evaluation_manifest.json`; the plotter checks the offline monitoring-data hash matches the online evaluation hash and fails if the selected history changes. References are explicitly labeled as in-sample fitting, not a lower bound or a matched training-budget comparison. The current run uses the three-head GNS offline epoch18, its last completed checkpoint. The reference metadata can be added while the observer is running; subsequent plot renders read it without restarting training.
+
+The offline fitting plotter also accepts repeated `--compare-history PATH` arguments to overlay previous runs, with labels read from their manifests. It requires identical training and monitoring dataset hashes and plots action-success accuracy/BCE, changed-coordinate MAE and parent-relation F1. Each line ends at its actual last recorded epoch; stopped baseline runs are not extrapolated. These remain in-sample comparisons. The mixed-relations experiment changes head layout, legal candidates and relation loss together, so a difference cannot isolate which component caused it.
+
+The optional `--gns` enables a GNS-inspired dynamic sparse graph for either `mse` or `mixed`; omitting it retains the full graph. `--gns-radius 0.5` sets the estimated box-gap threshold in metres (default 0.5 for new GNS runs). At every forward call, including each member-wise imagined rollout step, edges are rebuilt from the current input: spatial neighbors, bidirectional parent relations, and bidirectional held-object/Put-target relations. No future labels enter construction. Geometry uses object positions and canonical initial AABB sizes, so it approximates proximity rather than THOR collision detection; it does not model swept volumes, opening geometry or guarantee all possible contacts. Binary relations use the existing 0.5 threshold on raw states or predicted probabilities. All nodes and global agent/action context remain. Local and global means divide by retained-edge counts, with zero aggregation for isolated nodes. This changes the graph and thus the prediction function; accuracy must be compared experimentally.
+
+The implementation in `exploration/cee_us/thor_gns.py` reuses the existing MLP parameters and optimizer without modifying upstream sources. Selected edges are packed per ensemble member and padded to the largest member edge count; only that packed list passes through the edge MLP. Adjacency search still uses quadratic pairwise geometry, but discarded pairs do not run the message MLP. Sparse graph construction and packing introduce overhead, so speedups are not guaranteed. Online and offline entry points accept the same flags. Manifests/checkpoints record graph mode/radius; online restore infers saved settings and rejects explicit mismatches. Legacy checkpoints without graph metadata remain full graph. Switching graphs is a new experiment, not exact resume of a baseline. The method borrows radius-based rebuilding from [GNS (ICML 2020)](https://proceedings.mlr.press/v119/sanchez-gonzalez20a/sanchez-gonzalez20a.pdf), with THOR-specific relation additions; it is not a reproduction of the particle simulator.
+
+For an explicitly in-sample fitting diagnostic, `scripts/fit_thor_offline.py` can train a fresh mixed model directly on the recorded evaluation dataset. This is intentional training on validation data, not held-out evaluation or evidence of exploration performance. It starts no Unity instance, preserves source data, fits normalizers on the training file only, records every epoch, and saves a distinct `thor-offline-fit-v1` checkpoint that the online resume command rejects. This diagnostic does not train on online curiosity replay. The fixed512 monitor is a subset of the full4979 training records, so its curve measures fit, not generalization. Five epochs are an early checkpoint, not a convergence criterion.
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m scripts.fit_thor_offline \
+  --data outputs/thor_cee_us/instance_validation_frozen_20261109/evaluation.npz \
+  --monitor-data outputs/thor_cee_us/learning_curve_subset_20261109/evaluation.npz \
+  --epochs 20 --hidden-dim 128 --device cuda --seed 0 \
+  --output outputs/thor_cee_us/gpu_offline_validation_fit_20261109
+MPLCONFIGDIR=/tmp/mpl-thor-offline python3 scripts/plot_thor_offline_fit.py \
+  --history outputs/thor_cee_us/gpu_offline_validation_fit_20261109/history.json \
+  --output outputs/thor_cee_us/gpu_offline_validation_fit_20261109/fitting_curve.png
+```
+
+Plotting uses the existing system matplotlib environment; the training runtime lacks its `cycler` dependency. The trainer writes `history.json`, latest model/optimizer checkpoint, provenance/source snapshots and, on completion, a full training-data fitting report. Success probability BCE/Brier, balanced accuracy and confusion counts complement threshold accuracy. No claim that exploration is the only bottleneck follows from a single converged fit; failure to fit within a finite budget also does not prove the architecture cannot represent the transitions.
+
+Inference adds continuous deltas to the current state and decodes classification logits with sigmoid/softmax directly into next-state probabilities, without adding old binary values. The existing target resolver thresholds probabilities at 0.5 during imagined rollouts. CEM still sums ensemble standard deviations of decoded states over the planning horizon; it now includes probability disagreement, so curiosity scores and numerical training losses are not directly comparable between prediction modes. No new entropy bonus, task mask, hard category projection, learning rate or automatic loss balancing is introduced. Checkpoints record the prediction mode; restoration infers it when omitted and rejects an explicitly different mode. Old checkpoints without this field are MSE. Switching modes requires fresh training, and exact resume still requires the checkpoint's original source version.
+
+A bounded mixed-mode GPU integration check (20 online attempts, not a learning-quality experiment):
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor train \
+  --prediction-mode mixed --device cuda --metadata-only --hidden-dim 128 \
+  --eval-data outputs/thor_cee_us/learning_curve_subset_20261109/evaluation.npz \
+  --bootstrap-steps 16 --rounds 1 --steps-per-round 4 --epochs 1 \
+  --horizon 2 --candidates 4 --iterations 1 --elites 2 --cem-chunk-size 2 \
+  --eval-every 1 --eval-batch-size 4 --seed 0 \
+  --output outputs/thor_cee_us/gpu_mixed_smoke_20261109
+```
+
+State features use all default FloorPlan1 metadata objects, fixed instance identities and parent-receptacle multi-hot relations. Training runs adopt the frozen dataset's initial scene schema, including canonical AABB sizes, because initial physics can change observed AABB sizes across Unity launches. Object IDs, types, capabilities and mass must still match; evaluation transition targets are never used to fit normalizers. Boolean states are regressed with the original MSE, not calibrated probabilities; a 0.5 threshold is used for evaluation and future target resolution without clipping rollout states. This first version does not establish cross-scene generalization. The all-object fully connected graph costs substantially more than the two-object cabinet; normal model defaults are wider than smoke settings and should be budgeted explicitly.
+
+### Designed FloorPlan1 validation collection
+
+Collect independent scripted trajectories using the frozen scene contract:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.thor_designed_validation \
+  --reference-data outputs/thor_cee_us/smoke_2/evaluation.npz \
+  --max-attempts 600 --max-poses 6 \
+  --output outputs/thor_cee_us/designed_validation
+```
+
+The reference supplies canonical object identities/static metadata only. Evaluation transitions are not used for training or normalization. Cases enumerate openable, toggleable, pickupable and receptacle instances, plus navigation, no-target and default-pose controls. Initial placement and held-object preparation are logged separately in `setup.jsonl`; retained episodes contain no setup actions. Each episode ends after its fixed sequence (6 interaction/control steps, 8 navigation steps or 9 default mixed steps), including failed attempts. Cases that cannot be prepared within the pose budget are skipped explicitly. The total attempt cap never truncates an episode.
+
+This collector defaults to headless metadata-only Unity, without RGB, segmentation, map cameras or saved images. Use `--save-frames` to enable rendering and initial episode frames for debugging. The state/action representation and nearest-target executor are unchanged. `rows.jsonl`, `coverage.json` and `manifest.json` record actual targets, failures, skipped cases and provenance; `evaluation.npz` can be passed directly to `compare` or `evaluate` via `--eval-data`. A generic `state_changed` flag includes visibility changes and floating-point physics motion; it is not proof of the intended interaction effect.
+
+The first frozen collection is `outputs/thor_cee_us/designed_validation_20261109/evaluation.npz`: 355 attempts across 56 episodes, 203 successes and 152 failures. All 114 planned cases were considered; 58 were skipped during setup. It includes rendered debug frames because it completed before metadata-only collection was enabled. This is a bounded coverage baseline, not uniform coverage of all dynamics, object placements or source/receptacle combinations. No model training was performed for collection.
+
+### Instance-level dynamics validation
+
+The earlier 114-case collector is retained as a bounded scripted baseline. For instance-level completion accounting, use:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.thor_instance_validation \
+  --reference-data outputs/thor_cee_us/smoke_2/evaluation.npz \
+  --min-count 10 --max-attempts 5000 --max-poses 1024 \
+  --output outputs/thor_cee_us/instance_validation
+```
+
+`thor_coverage.InstanceCoverage` defines 175 explicit FloorPlan1 requirements: both open/close directions for 22 instances, both toggle directions for 9, Pickup and Release via Put for 30, an observed new parent relationship from a successful Put into each of 43 receptacles, and 10 navigation/posture effects (including failed, stationary MoveAhead and MoveBack). Coverage requires actual before/after fields and actual resolved targets; repeated idempotent actions do not count. Setup does not contribute to coverage. `--min-count` specifies the required effect count per item, not the number of attempted actions. The global attempt cap is a safety bound and cannot guarantee completion.
+
+The metadata-only collector searches standing/crouched poses and horizons -30/0/30/60, opens necessary parent/target containers using native actions, checks inverse-action target changes, and tries distinct source objects for receptacles. Successful source choices are reused, with different starting locations tried before repeated camera variants. Initial agent placement and all preparation are logged separately. Consecutive retained actions share an episode only when no setup intervenes. Objects are not teleported, forceAction remains false, and the nearest-target execution rule is unchanged.
+
+Inspect the running `coverage.json`: `complete` is true only when every fixed requirement reaches its count; `missing` is never removed merely because a case fails. All attempts are retained in `evaluation.npz`, with labels in `rows.jsonl` and setup diagnostics separately. Source/version/reference/dataset hashes appear in `manifest.json`. Each output requires a new directory; prior data are preserved. This finite checklist measures instance-level effects, not all possible room layouts or source/receptacle combinations. The first expanded one-observation audit (`instance_audit_20261109`) observed 144/175 requirements using 293 attempts; it remains incomplete.
+
+Failure-control collection uses the same native executor and separately labels deliberate invalid-precondition attempts:
+
+```bash
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.thor_instance_validation \
+  --reference-data outputs/thor_cee_us/smoke_2/evaluation.npz \
+  --min-count 1 --max-attempts 1200 --failure-controls \
+  --output outputs/thor_cee_us/instance_failure_controls
+```
+
+Controls include already-open/closed, already-on/off, occupied-hand Pickup and empty-hand Put. Labels describe the intended test condition; actual returned success/failure and errors remain authoritative. These control attempts are retained even when the positive effect has already been observed elsewhere. Failure observations contribute to outcome coverage and world-model validation; they do not satisfy a different successful-effect requirement. A claim of exhaustive failure coverage needs an explicit feasible precondition checklist, not an assumed success/failure pair for every possible action.
+
+An offline interactive example is `artifacts/thor_dynamic_coverage_graph/coverage_graph.html`, with auditable `graph_data.json` and artifact-local `render_graph.py`. The graph includes all metadata instances and current actions, separates unattempted/success-only/failure-only/both outcomes and local no-target failures, and supports object filtering and detailed error counts. It is an object-action outcome graph, not the complete continuous state-transition graph. Snapshots of running JSONL inputs include only complete records and record the exact bytes read; regenerate after collection to update it. Preparation failures are not world-model transitions and are excluded.
+
+The pooled frozen benchmark is `outputs/thor_cee_us/instance_validation_frozen_20261109/evaluation.npz` (4979 attempts: 2146 successes and 2833 failures). It combines the original independent 355-transition baseline, 3281-transition main collection, 1200 deliberate-control transitions and 143 placement-supplement transitions. Episode IDs are shifted to keep sources separate; setup and diagnostic pilots/audits are excluded. Pass this NPZ directly as `--eval-data` for evaluation. All four source datasets remain intact, with hashes in the pooled manifest.
+
+For a bounded learning-curve pilot, freeze a 512-transition proportional action/outcome-stratified subset, use the same subset after bootstrap and each online round, then evaluate all 4979 transitions once at the end:
+
+```bash
+python3 artifacts/thor_learning_curve/prepare_subset.py \
+  --source outputs/thor_cee_us/instance_validation_frozen_20261109/evaluation.npz \
+  --output outputs/thor_cee_us/learning_curve_subset --size 512 --seed 10001
+.runtime/thor-ceeus/bin/python -s -m exploration.cee_us.cee_us_thor train \
+  --eval-data outputs/thor_cee_us/learning_curve_subset/evaluation.npz \
+  --bootstrap-steps 64 --rounds 3 --steps-per-round 32 --epochs 1 \
+  --hidden-dim 32 --horizon 3 --candidates 12 --iterations 2 --elites 4 \
+  --metadata-only --eval-every 1 --output outputs/thor_cee_us/learning_curve_pilot
+MPLCONFIGDIR=/tmp/mpl-thor-learning python3 -m exploration.cee_us.thor_learning_curve \
+  --history outputs/thor_cee_us/learning_curve_pilot/curiosity_learning_curve.json \
+  --output outputs/thor_cee_us/learning_curve_pilot/learning_curve.png
+.runtime/thor-ceeus/bin/python -s -m artifacts.thor_learning_curve.evaluate_full \
+  --checkpoint outputs/thor_cee_us/learning_curve_pilot/curiosity.pt \
+  --eval-data outputs/thor_cee_us/instance_validation_frozen_20261109/evaluation.npz \
+  --output outputs/thor_cee_us/learning_curve_pilot/full_evaluation.json
+```
+
+The subset manifest preserves exact source indices, random seed, source/subset hashes and stratum counts. Every nonempty action/outcome stratum receives at least one sample; other allocations approximate source proportions. Gaps in sampled episodes create new episode boundaries. Periodic reports stream conditional one-step predictions in small batches and retain action/outcome strata, a zero-change baseline and changed-coordinate errors. Changed-coordinate MAE mixes the original feature units and is a diagnostic, not a physical-unit accuracy score. This mode omits the more expensive free-running rollout evaluation; the existing `evaluate` command still reports horizons 1/3/5. Evaluation transitions never enter the training replay or normalizer fitting. Each evaluated round saves a checkpoint and the JSON curve is refreshed after every assessment. The x-axis counts online training attempts, including failures; it is not the size of the validation set. Keep the final full-data report separate from the subset curve because their distributions differ slightly. This small single-seed model/planner budget checks the loop and does not establish a curiosity advantage over random exploration.
+
+The final positive-effect/navigation checklist reaches 161/175 items at least ten times (163 observed at least once); it is explicitly incomplete. The object-action graph has 134/135 applicable object-action relations attempted, with SaltShaker Pickup unobserved. These are different denominators: failed actions cover observed outcomes but do not count as successful state transitions. The paired-state graph classifies 2061 successful attempts with relevant effects and 85 successes with no relevant effect; all 2833 failures are preserved. Observed repeated Open/Close controls return success without changing the target flag in this pinned runtime, whereas repeated toggles, occupied-hand Pickup and empty-hand Put yield failures. Do not assume an idempotent native action must fail.
+
+Use `--reuse-placements-from previous/rows.jsonl --targets EXACT_OBJECT_ID ...` to supplement selected instances with native revalidation of previously successful source/pose combinations. It first tries a varied pose and, if Put fails while the same source is still held, can retry the known pose in a separately logged setup/new episode. Selection never removes missing items from the ledger. Initial-placement changes for inaccessible/colliding targets remain a separate experimental decision; no such object rearrangement was performed here.
+
+Refresh the graph from the matching frozen rows and report:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl-thor-coverage-graph python3 artifacts/thor_dynamic_coverage_graph/render_graph.py \
+  --rows outputs/thor_cee_us/instance_validation_frozen_20261109/rows.jsonl \
+  --coverage-report outputs/thor_cee_us/instance_validation_frozen_20261109/coverage.json --png
+```
 
 ## Using the reorganized directories
 

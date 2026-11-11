@@ -12,7 +12,7 @@ THOR_COMMIT = "f0825767cd50d69f666c7f282e54abfe58f1e917"
 PROCTHOR_COMMIT = "53d5bd4c8c96a699e6a615dc390abb670cc9d353"
 
 
-def create_controller():
+def create_controller(*, metadata_only=False):
     from ai2thor.controller import Controller
     from ai2thor.platform import Linux64
 
@@ -30,7 +30,8 @@ def create_controller():
         commit_id=THOR_COMMIT, platform=Linux64, scene="Procedural",
         width=640, height=480, quality="Low", gridSize=0.25,
         rotateStepDegrees=90, visibilityDistance=1.5, snapToGrid=True,
-        renderInstanceSegmentation=True, server_start_timeout=120,
+        headless=metadata_only, renderInstanceSegmentation=not metadata_only,
+        server_start_timeout=120,
     )
 
 
@@ -48,7 +49,7 @@ def snapshot(event):
 
 class ThorEnv:
     def __init__(self, *, scene="FloorPlan1", generate=None, house=None, seed=42,
-                 output_dir=None, start_near=None, only_room=None):
+                 output_dir=None, start_near=None, only_room=None, metadata_only=False):
         self.output_dir = Path(output_dir or PROJECT_ROOT / "outputs" / "thor" /
                                datetime.now().strftime("%Y%m%d_%H%M%S_%f")).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,8 +62,9 @@ class ThorEnv:
         self.decision = 0
         self.resets = 0
         self.start_pose = None
+        self.metadata_only = bool(metadata_only)
         try:
-            self.controller = create_controller()
+            self.controller = create_controller(metadata_only=self.metadata_only)
             if generate:
                 from procthor.generation import HouseGenerator
 
@@ -112,6 +114,7 @@ class ThorEnv:
                 "visibility_distance_metres": 1.5, "force_action": False,
                 "pickup": "upstream iTHOR abstract hand; no robot arm controller",
                 "put_place_stationary": True, "privileged_state": True,
+                "metadata_only": self.metadata_only,
             }, indent=2))
         except BaseException:
             self.close()
@@ -128,12 +131,13 @@ class ThorEnv:
             require_success(self.controller.step(action="TeleportFull", **self.house["metadata"]["agent"]),
                             "Initial agent pose")
         require_success(self.controller.step(action="SetRandomSeed", seed=self.seed), "Random seed")
-        camera = require_success(self.controller.step(action="GetMapViewCameraProperties"), "Map camera")
-        camera_parameters = {**camera.metadata["actionReturn"], "skyboxColor": "black"}
-        if camera_parameters.get("orthographic"):
-            camera_parameters["orthographicSize"] *= 1.1
-        require_success(self.controller.step(action="AddThirdPartyCamera", **camera_parameters),
-                        "Add map camera")
+        if not self.metadata_only:
+            camera = require_success(self.controller.step(action="GetMapViewCameraProperties"), "Map camera")
+            camera_parameters = {**camera.metadata["actionReturn"], "skyboxColor": "black"}
+            if camera_parameters.get("orthographic"):
+                camera_parameters["orthographicSize"] *= 1.1
+            require_success(self.controller.step(action="AddThirdPartyCamera", **camera_parameters),
+                            "Add map camera")
         self.resets += 1
         (self.output_dir / f"reset_{self.resets}.json").write_text(
             json.dumps(snapshot(self.controller.last_event), indent=2))

@@ -1,5 +1,5 @@
-# Split YZ alignment / +X approach. Same protocol as the centered compact6 baseline.
-# New 13D action contract; initialize fresh actor and WM checkpoints.
+# Split7 curiosity exploration with direct EE execution; fresh 13D actor and WM.
+# Preserves the compact6 centered 40s baseline training and reward settings.
 agent: raps_gnn_actor
 seed: 0
 device: cuda
@@ -26,6 +26,7 @@ object_heuristic:
     cabinet_item_17: 1.0
 raps_actor:
   skill_set: split7
+  motion_execution: ee_delta
   hidden_size: 128
   actor_layers: 2
   critic_layers: 3

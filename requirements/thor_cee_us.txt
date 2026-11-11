@@ -1,0 +1,12 @@
+# PyTorch, Gymnasium and forwardable come from the existing rlPractice runtime.
+# FloorPlan1 does not require ProcTHOR or its generation dependencies.
+ai2thor==5.0.0
+numpy==1.26.4
+opencv-python==4.11.0.86
+Pillow==10.4.0
+Flask==3.1.3
+Werkzeug==3.1.9
+msgpack==1.2.4
+progressbar2==4.6.0
+aws-requests-auth==0.4.3
+python-xlib==0.33

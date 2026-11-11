@@ -51,7 +51,7 @@ class CEEUSBackend:
                  hidden_dim=128, horizon=30, candidates=128, iterations=3,
                  elites=10, batch_size=125, execution='reference', action_projection=None,
                  object_heuristic=None, runtime_optimizations=False, action_dim=4,
-                 object_names=None):
+                 object_names=None, attach_icem=True, forward_model_class=GNNForwardEnsembleModel):
         if isinstance(action_dim, bool) or not isinstance(action_dim, (int, np.integer)) or action_dim < 1:
             raise ValueError('action_dim must be a positive integer')
         if action_projection is not None and action_dim != 4:
@@ -102,13 +102,33 @@ class CEEUSBackend:
             obs_preproc=lambda x: x, obs_postproc=lambda x: x,
             cost_fn=lambda obs, actions, next_obs: torch.zeros_like(next_obs[..., 0]),
         )
-        self.model = GNNForwardEnsembleModel(
+        self.model = forward_model_class(
             env=self.env, normalize_w_running_stats=False,
             model_params=dict(n=ensemble_size, hidden_dim=hidden_dim, num_layers=2,
                               num_message_passing=1, layer_norm=True),
             train_params=dict(epochs=1, batch_size=batch_size, learning_rate=1e-5,
                               weight_decay=.001, bootstrapped=False),
         )
+        if not attach_icem and (execution != 'reference' or action_projection is not None or object_heuristic is not None):
+            raise ValueError('Model-only backend requires reference execution without cabinet heuristics or projection')
+        self.planner = None
+        if attach_icem:
+            self._attach_icem(horizon, candidates, iterations, elites)
+        self.random_sequence = None
+        self.updates = 0
+        self._fit_updates = 0
+        self.model.optimizer.register_step_pre_hook(self._check_gradients)
+        self.execution = execution
+        self._original_predict = self.model.predict
+        if self.action_projection is not None:
+            self.model.predict = self._predict_with_region
+        self.prediction_accelerator = None
+        if execution == 'cuda_graph':
+            from exploration.cee_us.cee_us_cuda_graph import CudaGraphPrediction
+            self.prediction_accelerator = CudaGraphPrediction(self.model)
+            self.model.predict = self.prediction_accelerator.predict
+
+    def _attach_icem(self, horizon, candidates, iterations, elites):
         self.planner = _MeasuredPlanner(
             env=self.env, forward_model=self.model, horizon=horizon,
             num_simulated_trajectories=candidates, cost_along_trajectory='sum',
@@ -123,19 +143,6 @@ class CEEUSBackend:
         self.planner.object_heuristic_fn = (
             self._object_heuristic_scores if self.object_heuristic is not None else None)
         self.planner.elite_samples = None
-        self.random_sequence = None
-        self.updates = 0
-        self._fit_updates = 0
-        self.model.optimizer.register_step_pre_hook(self._check_gradients)
-        self.execution = execution
-        self._original_predict = self.model.predict
-        if self.action_projection is not None:
-            self.model.predict = self._predict_with_region
-        self.prediction_accelerator = None
-        if execution == 'cuda_graph':
-            from exploration.cee_us.cee_us_cuda_graph import CudaGraphPrediction
-            self.prediction_accelerator = CudaGraphPrediction(self.model)
-            self.model.predict = self.prediction_accelerator.predict
 
     @staticmethod
     def _validate_object_heuristic(setting, object_names=('cabinet_item_16', 'cabinet_item_17')):
@@ -261,7 +268,10 @@ class CEEUSBackend:
         finally:
             self.model.predict = old_predict
             self.model.num_simulated_trajectories, self.model.horizon = old_count, old_horizon
-            self.model.preallocate_memory()
+            if old_count is not None and old_horizon is not None:
+                self.model.preallocate_memory()
+            else:
+                self.model.memory_is_preallocated = False
 
     def train(self, replay, epochs):
         # Captures reference normalizer storage; recomputing statistics replaces it.
@@ -312,12 +322,16 @@ class CEEUSBackend:
         return dict(loss=loss, updates=self._fit_updates, total_updates=self.updates, finitegrad=True)
 
     def reset_planner(self, state):
+        if self.planner is None:
+            raise RuntimeError('This model-only backend has no continuous iCEM planner')
         state = self._array(state, (self.state_dim,), 'state')
         self.planner.beginning_of_rollout(observation=state, mode='train')
         self.planner.last_action = None
         self.random_sequence = None
 
     def action(self, state):
+        if self.planner is None:
+            raise RuntimeError('This model-only backend has no continuous iCEM planner')
         state = self._array(state, (self.state_dim,), 'state')
         started = perf_counter()
         self.planner.rollout_seconds = 0.
@@ -337,6 +351,8 @@ class CEEUSBackend:
         return action, diagnostics
 
     def random_action(self, state):
+        if self.planner is None:
+            raise RuntimeError('This model-only backend has no continuous iCEM planner')
         state = self._array(state, (self.state_dim,), 'state')
         # Sample under the original initial distribution, independent of fitted iCEM means.
         saved_mean, saved_std = self.planner.mean_.clone(), self.planner.std_.clone()
@@ -372,11 +388,15 @@ class CEEUSBackend:
                      ('mean_', 'std_', 'last_action', 'was_reset', 'forward_model_state')},
             random_sequence=self.random_sequence, updates=self.updates,
             action_projection=self.action_projection, object_heuristic=self.object_heuristic,
-            elite_samples=None if self.planner.elite_samples is None else self.planner.elite_samples.buffer,
+            elite_samples=None if self.planner is None or self.planner.elite_samples is None else self.planner.elite_samples.buffer,
         )
         return self._move_tensors(payload, 'cpu')
 
     def load_state_dict(self, payload, *, restore_planner=True):
+        if restore_planner:
+            has_icem_state = any(value is not None for value in payload['planner'].values())
+            if has_icem_state != (self.planner is not None):
+                raise ValueError('Checkpoint planner differs; set restore_planner=False to load only the model')
         if payload.get('action_dim', 4) != self.action_dim:
             raise ValueError('Checkpoint action_dim does not match backend action_dim')
         if payload.get('object_heuristic') != self.object_heuristic:
@@ -390,7 +410,9 @@ class CEEUSBackend:
         self.model.optimizer.load_state_dict(payload['optimizer'])
         for name, state in payload['normalizers'].items():
             getattr(self.model, name).load_state_dict(state)
-        if restore_planner:
+        if self.planner is None:
+            self.random_sequence = None
+        elif restore_planner:
             for name, state in payload['planner'].items():
                 setattr(self.planner, name, state)
             elite = payload['elite_samples']

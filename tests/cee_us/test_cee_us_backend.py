@@ -25,6 +25,30 @@ def replay():
                 next_states=next_states)
 
 
+def test_model_only_backend_matches_icem_backend():
+    options = dict(hidden_dim=8, horizon=3, candidates=8,
+                   iterations=3, elites=4, batch_size=4)
+    reference = CEEUSBackend(**options)
+    model_only = CEEUSBackend(**options, attach_icem=False)
+    assert model_only.planner is None
+    data = replay()
+    reference.train(data, epochs=1)
+    model_only.load_state_dict(reference.state_dict(), restore_planner=False)
+    expected = reference.predict(data['states'], data['actions'])
+    np.testing.assert_array_equal(model_only.predict(data['states'], data['actions']), expected)
+    saved = model_only.state_dict()
+    with pytest.raises(ValueError, match='Checkpoint planner differs'):
+        reference.load_state_dict(saved)
+    np.testing.assert_array_equal(model_only.rollout(data['states'][:1], data['actions'][:1, None]),
+                                  reference.rollout(data['states'][:1], data['actions'][:1, None]))
+    model_only.train(data, epochs=1)
+    model_only.load_state_dict(saved)
+    np.testing.assert_array_equal(model_only.predict(data['states'], data['actions']), expected)
+    for operation in (model_only.action, model_only.random_action, model_only.reset_planner):
+        with pytest.raises(RuntimeError, match='no continuous iCEM'):
+            operation(data['states'][0])
+
+
 def test_forward_loss_training_and_static_fields(backend):
     data = replay()
     metrics = backend.train(data, epochs=1)

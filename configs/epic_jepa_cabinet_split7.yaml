@@ -1,0 +1,48 @@
+# Experimental RGB-only stochastic JEPA, independent of the GNN actor baseline.
+agent: epic_jepa_cem
+world_model: stochastic_jepa
+planner_type: mixed_cem
+objective: predictive_variance
+object_heuristic: null
+seed: 0
+device: cuda
+cpu_threads: 1
+action_mode: ee_delta
+sim_freq: 100
+control_freq: 20
+episode_steps: 800
+bootstrap_steps: 4000
+rounds: 10
+steps_per_round: 1000
+total_controls: 14000
+epochs: 1
+batch_size: 32
+validation_every: 5
+collection_policy: curiosity
+model: {}
+planner: {}
+raps_actor:
+  skill_set: split7
+  motion_execution: ee_delta
+  hold_closed_during_motion: false
+  latched_gripper: true
+  stop_drop_on_support: true
+  grasp_stop_on_contact: false
+  controlled_placement: true
+smoke:
+  bootstrap_steps: 1200
+  rounds: 2
+  steps_per_round: 400
+  total_controls: 2000
+  episode_steps: 200
+  validation_every: 3
+  epochs: 1
+  batch_size: 8
+  model:
+    flow_steps: 2
+  planner:
+    candidates: 8
+    iterations: 1
+    elites: 2
+    num_futures: 2
+    chunk_size: 4

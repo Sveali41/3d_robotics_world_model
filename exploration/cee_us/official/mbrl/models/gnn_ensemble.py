@@ -1,4 +1,5 @@
 import copy
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -633,14 +634,28 @@ class GNNForwardEnsembleModel(ForwardModelWithDefaults, EnsembleModel, Trainable
         mode="epochs",
     ):
 
+        data_dict = dict(observations=observations, actions=actions, next_observations=next_observations)
+        if self.runtime_optimizations:
+            timings = self.profile_timings
+            if timings is not None:
+                if self.device.type == "cuda":
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    torch.cuda.synchronize(self.device)
+                    start.record()
+                began = perf_counter()
+            data_dict = {key: to_tensor(value).to(self.device) for key, value in data_dict.items()}
+            if timings is not None:
+                if self.device.type == "cuda":
+                    end.record()
+                    end.synchronize()
+                    timings["data_upload_gpu_s"] = start.elapsed_time(end) / 1000
+                timings["data_upload_s"] = perf_counter() - began
+
         iterator_train = TorchTrainingIterator(
-            data_dict=dict(
-                observations=observations,
-                actions=actions,
-                next_observations=next_observations,
-            ),
+            data_dict=data_dict,
             ensemble=True,
             ensemble_size=self.ensemble_size,
+            runtime_optimizations=self.runtime_optimizations,
         )
 
         if eval_buffer:
@@ -669,6 +684,7 @@ class GNNForwardEnsembleModel(ForwardModelWithDefaults, EnsembleModel, Trainable
         print("Epoch length: ", epoch_length)
 
         train_loss_accum = 0.0
+        pending_losses = []
         best_weights: Optional[Dict] = None
         epochs_since_update = 0
 
@@ -683,8 +699,15 @@ class GNNForwardEnsembleModel(ForwardModelWithDefaults, EnsembleModel, Trainable
             loss = self.loss(batch_train)
             loss.backward()
             self.optimizer.step()
-            train_loss_accum += loss.item()
+            if self.runtime_optimizations:
+                pending_losses.append(loss.detach())
+            else:
+                train_loss_accum += loss.item()
             if (i + 1) % epoch_length == 0 or i == 0:
+                if self.runtime_optimizations:
+                    for value in torch.stack(pending_losses).cpu().tolist():
+                        train_loss_accum += value
+                    pending_losses.clear()
                 with torch.no_grad():
                     self.model.eval()
                     if eval_buffer:
@@ -733,7 +756,10 @@ class GNNForwardEnsembleModel(ForwardModelWithDefaults, EnsembleModel, Trainable
         bootstrapped=True,
         save_best_val=False,
         improvement_threshold=0.01,
+        runtime_optimizations=False,
     ):
+        self.runtime_optimizations = bool(runtime_optimizations)
+        self.profile_timings = None
         self.epochs = epochs
         self.iterations = iterations
         self.train_epochs_only_with_latest_data = train_epochs_only_with_latest_data

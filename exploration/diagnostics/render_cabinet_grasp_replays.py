@@ -14,6 +14,7 @@ import torch
 from exploration.cee_us.cee_us_state import CabinetSkillStateEncoder
 from exploration.visualization.scripted_gif import _frame
 from main import build_env
+from exploration.diagnostics.trajectory_store import read_transitions
 
 FPS = 20
 HOLD_FRAMES = 20
@@ -65,7 +66,7 @@ def read_case(root, case_id):
     metadata = json.loads((attempt/'attempt.json').read_text())
     if metadata['case'] != case or metadata['attempt'] != summary['attempt']:
         raise ValueError(f'Attempt metadata mismatch: {attempt}')
-    rows = [json.loads(line) for line in (attempt/'transitions.jsonl').read_text().splitlines() if line.strip()]
+    rows = read_transitions(attempt)
     trace = json.loads((attempt/'phase_trace.json').read_text())
     if len(rows) != summary['control_ticks'] or len(trace) != len(rows) or not rows:
         raise ValueError(f'Inconsistent or empty recorded control ticks: {attempt}')
@@ -82,6 +83,8 @@ def render_case(root, output, manifest, case_id):
     seed = case['seed']
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     config = OmegaConf.create(attempt['environment'])
+    if config.sim_backend != 'cpu':
+        raise ValueError('GPU trajectory replay is unsupported: preserve the recorded backend; CPU replay cannot verify GPU physics')
     if (str(config.action_mode) != 'ee_delta' or not config.headless or config.sim_backend != 'cpu' or
             config.sim.sim_freq != 100 or config.sim.control_freq != FPS or
             config.render_mode is not None or not config.centered_initial_tcp):

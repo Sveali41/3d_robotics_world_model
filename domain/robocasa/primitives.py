@@ -144,6 +144,7 @@ class RAPSActionSchema:
         official_indices = {
             "move_delta_ee_pose": [0, 1, 2], "approach": [3, 4, 5],
             "align_yz": [4, 5], "approach_x": [3],
+            "grasp": [0, 1, 2], "place": [0, 1],
             "lift": [4], "drop": [5], "move_left": [6], "move_right": [7],
             "move_forward": [8], "move_backward": [9],
             "open_gripper": [], "close_gripper": [],
@@ -387,6 +388,9 @@ class PrimitiveContext:
         )
 
     def is_grasping(self, object_id: str) -> bool:
+        binding = getattr(self.env, "_grasp_binding", None)
+        if binding is not None and binding.bound_object_id == object_id:
+            return True
         actor = self.objects[object_id].actor
         result = self.agent.is_grasping(actor)
         if bool(result[0].item()):

@@ -20,6 +20,7 @@ from exploration.raps.raps_replay_compare import events
 
 CLASSES = ('lift', 'displacement', 'contact_only', 'free_motion', 'static')
 SCENES = {'original': (0., 0.), 'shifted': (.03, 0.)}
+COLLECTION_PROTOCOL = 'feedback_gated_v1'
 
 
 def endpoint_hash(state, action, target):
@@ -70,6 +71,33 @@ class ScriptedProvider:
         self.approach_attempts = 0
         self.free_attempts = 0
         self.audit = None
+        self.outcome = None
+        self.grasp_streak = 0
+        self.max_grasp_streak = 0
+
+    def on_step(self, row):
+        obj = row['contact_events'][-1]['objects'][self.plan['object']]
+        held = row['parameters_physical']['gripper'] < 0 and obj['grasped']
+        self.grasp_streak = self.grasp_streak + 1 if held else 0
+        self.max_grasp_streak = max(self.max_grasp_streak, self.grasp_streak)
+
+    def on_skill_end(self, skill):
+        reason = None
+        if not skill['completed'] or skill['status'] != 'success':
+            reason = 'primitive_failed'
+        elif skill['primitive_type'] in {'close_gripper', 'approach'} and self.grasp_streak < 4:
+            reason = 'unconfirmed_grasp'
+        elif (skill['primitive_type'] == 'move_delta_ee_pose' and self.phase == 'approach'
+              and self.plan['intent'] not in {'free_motion', 'static'} and self.approach_attempts >= 12):
+            obj = np.asarray(skill['after']['objects'][self.plan['object']]['position_root'])
+            target = obj + self.plan['jitter'] - np.array([self.args.standoff, 0., 0.])
+            if np.linalg.norm(target - skill['after']['ee_position']) > .015:
+                reason = 'standoff_not_reached'
+        if reason is not None:
+            self.outcome = dict(status='failed', reason=reason, skill_id=skill['skill_id'],
+                                primitive_type=skill['primitive_type'], skill_status=skill['status'],
+                                final_grasp_streak=self.grasp_streak,
+                                max_grasp_streak=self.max_grasp_streak)
 
     def encode(self, name, **parameters):
         for p in self.schema.spec_by_name[name].parameters:
@@ -88,6 +116,8 @@ class ScriptedProvider:
         return self.encode('move_delta_ee_pose', **dict(zip(('dx', 'dy', 'dz'), delta)))
 
     def action(self, state):
+        if self.outcome is not None:
+            raise RuntimeError('Diagnostic attempt has ended; inspect trial_outcome.json')
         tcp = np.asarray(state[18:21], dtype=float)
         obj_index = OBJECT_NAMES.index(self.plan['object'])
         obj = np.asarray(state[33+12*obj_index:36+12*obj_index], dtype=float)
@@ -334,7 +364,7 @@ def resume_inventory(args, plans, candidate):
         raise ValueError('Resume requires an interrupted collect output, not a finished or unrelated output')
     if manifest.get('split') != 'validation_only' or json.loads((args.output/'sampling_plan.json').read_text()) != plans:
         raise ValueError('Resume validation split or sampling plan differs')
-    for key in ('checkpoint', 'checkpoint_sha256', 'state_contract', 'action_contract', 'training_replays', 'args', 'source_config', 'source_config_sha256'):
+    for key in ('collection_protocol', 'checkpoint', 'checkpoint_sha256', 'state_contract', 'action_contract', 'training_replays', 'args', 'source_config', 'source_config_sha256'):
         if manifest.get(key) != candidate[key]:
             raise ValueError(f'Resume {key} differs; preserve original checkpoint, replay exclusions and sampling arguments')
     counts = {}
@@ -348,7 +378,7 @@ def resume_inventory(args, plans, candidate):
             if saved > target:
                 raise ValueError(f'Saved ticks exceed planned budget: {scene} trial {plan["trial_id"]}')
             counts[scene] += saved
-            if attempts and saved < target:
+            if attempts and saved < target and not (attempts[-1][0]/'trial_outcome.json').exists():
                 partial.append(dict(scene=scene, trial_id=plan['trial_id'], saved_ticks=saved,
                                     remaining_ticks=target-saved, reset_required=True,
                                     reason='interrupted native attempt; see failure.json; physics reset before continuation'
@@ -359,9 +389,7 @@ def resume_inventory(args, plans, candidate):
     manifest.setdefault('recoveries', []).append(dict(source_evidence=candidate['source_evidence'],
         script_sha256=candidate['script_sha256'], dependencies=candidate['dependencies'],
         saved_control_ticks=counts, remaining_control_ticks={scene:args.max_steps//2-n for scene,n in counts.items()},
-        partial_trials=partial, change=('explicit path-timing failure status; raw data, goals and event definitions unchanged'
-            if candidate['config']['raps_actor'].get('motion_execution') == 'planner' else
-            'free-motion reached-goal open-gripper dwell; goals and event definitions unchanged'),
+        partial_trials=partial, change='resume matching feedback-gated protocol; retain all raw attempts and reset physics',
         continuity='every new attempt resets physics with its original plan seed; windows never cross attempts'))
     return manifest, sum(counts.values())
 
@@ -398,6 +426,9 @@ def main(argv=None):
     plans = generate_plans(args, math.ceil((args.max_steps//2)/args.trial_steps))
     evidence = source_evidence(args.output)
     manifest = dict(split='validation_only', immutable=True, designed_diagnostic_benchmark=True,
+                    collection_protocol=COLLECTION_PROTOCOL,
+                    attempt_termination='stop after any failed skill or unconfirmed grasp; preserve failures without filling unused budget',
+                    grasp_gate='intended object held with closed gripper for the final four consecutive control ticks',
                     distribution='scripted diagnostic; not natural on-policy', stage=args.stage,
                     checkpoint=str(args.checkpoint.resolve()) if args.checkpoint is not None else None,
                     checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest() if args.checkpoint is not None else None,
@@ -456,7 +487,8 @@ def main(argv=None):
                     attempts = raw_attempts(directory,plan)
                     saved = sum(len(ticks) for _, ticks, _ in attempts)
                     target = min(args.trial_steps,args.max_steps//2-plan['trial_id']*args.trial_steps)
-                    budget = target-saved
+                    ended = attempts and (attempts[-1][0]/'trial_outcome.json').exists()
+                    budget = 0 if ended else target-saved
                     if budget > 0:
                         root = directory/f"trial_{plan['trial_id']:06d}"
                         raw = root if not root.exists() else root/f'attempt_{len(attempts):06d}'
@@ -472,7 +504,14 @@ def main(argv=None):
                                 audit.stop_on_violation = False
                                 audit.set_stage('initial', allowed_items=OBJECT_NAMES)
                                 provider.audit = audit
-                            ticks, skills = collector.collect(budget,'curiosity',seed=plan['seed'],stage='validation_only')
+                            ticks, skills = collector.collect(budget,'curiosity',seed=plan['seed'],stage='validation_only',
+                                on_step=provider.on_step, on_skill_end=provider.on_skill_end,
+                                stop_when=lambda: provider.outcome is not None)
+                            outcome = provider.outcome or dict(status='budget_exhausted',
+                                final_grasp_streak=provider.grasp_streak, max_grasp_streak=provider.max_grasp_streak)
+                            write_json(raw/'trial_outcome.json', dict(outcome,
+                                trial_id=plan['trial_id'], object=plan['object'], intent=plan['intent'],
+                                requested_control_ticks=budget, actual_control_ticks=len(ticks)))
                         except Exception as exc:
                             write_json(raw/'failure.json', dict(error_type=type(exc).__name__, message=str(exc),
                                 traceback=traceback.format_exc(), trial_plan=plan))
@@ -537,6 +576,8 @@ def main(argv=None):
     if planned:
         collision_trials = [json.loads(path.read_text()) for scene in SCENES
                             for path in sorted((args.output/scene).rglob('collision_summary.json'))]
+    trial_outcomes = [dict(json.loads(path.read_text()), raw_path=str(path.relative_to(args.output)))
+                      for scene in SCENES for path in sorted((args.output/scene).rglob('trial_outcome.json'))]
     balanced = select_balanced(all_rows,args.quota,args.seed)
     write_json(args.output/'balanced_index.json',balanced)
     manifest.update(physical_control_ticks=physical,incomplete_or_zero_skills=incomplete,training_overlap_skills=excluded_skills,
@@ -545,7 +586,7 @@ def main(argv=None):
     write_json(args.output/'collection_summary.json', dict(status=balanced['status'],
         physical_control_ticks=physical, scene_counts=scene_counts, strata=balanced['strata'],
         balanced_index_samples=len(balanced['samples']), action_dim=dimension,
-        native_action_dim=8 if planned else 4, collision_trials=collision_trials))
+        native_action_dim=8 if planned else 4, collision_trials=collision_trials, trial_outcomes=trial_outcomes))
     print(json.dumps(dict(status=balanced['status'],physical_control_ticks=physical,output=str(args.output),
                           unmet_strata=sum(s['missing']>0 for s in balanced['strata']),
                           action='Increase explicitly approved budget or revise documented sampling parameters if quotas remain unmet')))

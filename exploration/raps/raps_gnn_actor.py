@@ -6,12 +6,14 @@ Each model transition is one completed skill. All physical ticks are also kept.
 """
 
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import random
 import shutil
 import sys
 import time
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,6 +22,7 @@ import torch
 
 from domain.robocasa.primitives import RAPS_ACTION_SCHEMA, RAPS_COMPACT_ACTION_SCHEMA, RAPS_SPLIT_ACTION_SCHEMA
 from domain.robocasa.skill_execution import RAPSSkillExecution, PlannedSkillExecution
+from domain.robocasa.pick_place import PICK_PLACE_ACTION_SCHEMA, PlannedPickPlaceSkillExecution, pick_place_contract
 from exploration.cee_us.cee_us_backend import CEEUSBackend
 from exploration.cee_us.cee_us_cabinet import (
     ROOT, make_env, prepare_output, replay_arrays, restore_rng, rng_state,
@@ -31,6 +34,7 @@ from exploration.diagnostics.diagnose_cabinet import jsonable, snapshot, write_j
 SCHEMA = "cabinet-raps-gnn-actor-v1"
 RAPS_REFERENCE_COMMIT = "1c56b0fe367cc32d3ee548f407ac3a9af9e3ce2e"
 DEFAULTS = dict(
+    pick_place_primitives=False, grasp_retention="friction",
     skill_set="legacy10", hidden_size=128, actor_layers=2, critic_layers=3, init_std=1.0,
     imagination_horizon=5, imagination_batch_size=64, updates_per_round=100,
     discount=0.8, lambda_return=0.95, actor_lr=8e-5, critic_lr=8e-5,
@@ -67,6 +71,8 @@ def reference_components(device):
 
 
 def skill_schema(settings):
+    if settings.get("pick_place_primitives", False):
+        return PICK_PLACE_ACTION_SCHEMA
     name = settings.get("skill_set", "legacy10")
     if name == "legacy10":
         return RAPS_ACTION_SCHEMA
@@ -90,7 +96,7 @@ def action_contract(settings):
         disagreement="sample_std_dynamic_state_sum_at_shared_state_action",
         discount="fixed_per_skill_no_learned_termination", state_propagation="ensemble_mean",
     )
-    if settings.get("skill_set") == "split7":
+    if settings.get("skill_set") == "split7" and not settings.get("pick_place_primitives", False):
         contract["controller"] = "split_yz_x_on_ee_delta_reset_orientation_v1"
         contract["split_motion"] = dict(
             frame="controller_root", gripper="preserve_latched_command",
@@ -139,6 +145,16 @@ def action_contract(settings):
             contract["controlled_placement"] = dict(version="joint_plan_v1", ground_support_threshold_N=.05,
                 stable_speed_m_s=.01, stable_contact_checks=4, settling_budget_steps=20,
                 hold="current_joint_position", ee_delta_slowdown_used=False)
+    if settings.get("pick_place_primitives", False):
+        contract["controller"] = "bounded_fixed_orientation_planned_grasp_place_v1"
+        contract.pop("ground_support_threshold_N", None)
+        contract["pick_place"] = pick_place_contract(settings.get("grasp_retention", "friction"))
+        if "motion_execution" in contract:
+            motion = contract["motion_execution"]
+            motion["max_control_steps_per_segment"] = motion.pop("max_control_steps_per_skill")
+            motion["target_orientation"] = "shared_reset_orientation_path_and_feedback_audited"
+            motion["intermediate_axes"] = "shared_macro_waypoints_with_checked_joint_paths"
+            motion.pop("legacy_composite_opening", None)
     return contract
 
 
@@ -190,9 +206,19 @@ class RAPSImaginationActor:
             raise ValueError("raps_actor.entropy_scale must be finite and nonnegative")
         if not np.isfinite(self.settings["disagreement_weight"]) or self.settings["disagreement_weight"] < 0:
             raise ValueError("raps_actor.disagreement_weight must be finite and nonnegative")
-        for name in ("hold_closed_during_motion", "latched_gripper", "stop_drop_on_support", "grasp_stop_on_contact", "controlled_placement"):
+        for name in ("hold_closed_during_motion", "latched_gripper", "stop_drop_on_support", "grasp_stop_on_contact", "controlled_placement", "pick_place_primitives"):
             if not isinstance(self.settings[name], bool):
                 raise ValueError(f"{name} must be boolean")
+        if self.settings["grasp_retention"] not in {"friction", "constraint"}:
+            raise ValueError("grasp_retention must be friction or constraint")
+        if self.settings["grasp_retention"] == "constraint" and not self.settings["pick_place_primitives"]:
+            raise ValueError("constraint retention requires pick_place_primitives")
+        if self.settings["pick_place_primitives"]:
+            if self.settings["motion_execution"] != "planner" or not self.settings["latched_gripper"]:
+                raise ValueError("pick_place_primitives requires planner and latched_gripper: true")
+            if any(self.settings[key] for key in ("hold_closed_during_motion", "stop_drop_on_support",
+                                                  "grasp_stop_on_contact", "controlled_placement")):
+                raise ValueError("pick_place_primitives uses its own grasp/support gates; disable legacy flags")
         if self.settings["latched_gripper"] and self.settings["hold_closed_during_motion"]:
             raise ValueError("Select latched_gripper or legacy hold_closed_during_motion, not both")
         if self.settings["controlled_placement"] and not (
@@ -305,11 +331,16 @@ class RAPSImaginationActor:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         parameters = list(module.parameters())
-        if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in parameters):
+        if self.backend.runtime_optimizations:
+            checks = [torch.isfinite(p.grad).all() for p in parameters if p.grad is not None]
+            invalid = bool(checks) and not bool(torch.stack(checks).all())
+        else:
+            invalid = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in parameters)
+        if invalid:
             raise FloatingPointError("Nonfinite imagination gradient; optimizer update stopped")
         norm = torch.nn.utils.clip_grad_norm_(parameters, self.settings["gradient_clip"], error_if_nonfinite=True)
         optimizer.step()
-        return float(norm)
+        return norm.detach() if self.backend.runtime_optimizations else float(norm)
 
     def train(self, replay, updates=None, *, start_groups=None):
         eligible = np.flatnonzero(~np.asarray(replay["terminated"], dtype=bool))
@@ -362,15 +393,21 @@ class RAPSImaginationActor:
             self.updates += 1
             if self.updates % self.settings["target_update_period"] == 0:
                 self.target_critic.load_state_dict(self.critic.state_dict())
-            metrics.append(dict(actor_loss=float(actor_loss.detach()), critic_loss=float(critic_loss.detach()),
+            values = dict(actor_loss=actor_loss.detach(), critic_loss=critic_loss.detach(),
                                 actor_gradient_norm=actor_norm, critic_gradient_norm=critic_norm,
-                                entropy=float(entropy.detach().mean()), imagined_reward=float(trajectory["rewards"].mean()),
-                                disagreement=float(trajectory["components"].sum(-1).mean()),
-                                heuristic=float(trajectory["heuristics"].mean()),
-                                joint_disagreement=float(trajectory["components"][..., 0].mean()),
-                                tcp_disagreement=float(trajectory["components"][..., 1].mean()),
-                                door_disagreement=float(trajectory["components"][..., 2].mean()),
-                                object_disagreement=float(trajectory["components"][..., 3].mean())))
+                                entropy=entropy.detach().mean(), imagined_reward=trajectory["rewards"].mean(),
+                                disagreement=trajectory["components"].sum(-1).mean(),
+                                heuristic=trajectory["heuristics"].mean(),
+                                joint_disagreement=trajectory["components"][..., 0].mean(),
+                                tcp_disagreement=trajectory["components"][..., 1].mean(),
+                                door_disagreement=trajectory["components"][..., 2].mean(),
+                                object_disagreement=trajectory["components"][..., 3].mean())
+            metrics.append(values if self.backend.runtime_optimizations else
+                           {key: float(value) for key, value in values.items()})
+        if self.backend.runtime_optimizations:
+            rows = torch.stack([torch.stack(list(m.values())) for m in metrics]).cpu().numpy()
+            return {**dict(zip(metrics[0], rows.astype(np.float64).mean(0).tolist())),
+                    "updates": count, "total_updates": self.updates}
         return {**{key: float(np.mean([m[key] for m in metrics])) for key in metrics[0]},
                 "updates": count, "total_updates": self.updates}
 
@@ -390,7 +427,7 @@ class RAPSImaginationActor:
 
 
 class SkillCollector:
-    """Run existing primitives THROUGH the unchanged 4D execution path."""
+    """Collect completed skill endpoints and every real control tick."""
     def __init__(self, env, encoder, actor, directory):
         self.env, self.encoder, self.actor = env, encoder, actor
         self.schema = skill_schema(actor.settings)
@@ -404,10 +441,13 @@ class SkillCollector:
         if self.planned_motion:
             if self.env.env.action_mode != "joint_position":
                 raise ValueError("Planned primitive collection requires action_mode: joint_position")
-            executor = PlannedSkillExecution
+            executor = (PlannedPickPlaceSkillExecution if actor.settings.get("pick_place_primitives", False)
+                        else PlannedSkillExecution)
             execution_kwargs = dict(orientation_target=lambda: np.roll(
                 self.env.env._ee_orientation_target.as_quat(), 1),
                 max_control_steps=actor.settings.get("motion_plan_max_steps", 400))
+        if actor.settings.get("pick_place_primitives", False):
+            execution_kwargs["grasp_retention"] = actor.settings.get("grasp_retention", "friction")
         self.execution = executor(
             **execution_kwargs,
             latched_gripper=actor.settings.get("latched_gripper", False),
@@ -424,7 +464,7 @@ class SkillCollector:
         self.state = self.encoder.encode()
 
     def collect(self, count, policy, *, seed, stage, on_step=None,
-                on_skill_start=None, on_skill_end=None):
+                on_skill_start=None, on_skill_end=None, stop_when=None):
         if count < 1 or policy not in {"random", "curiosity", "task"}:
             raise ValueError("Positive real-step budget and random/curiosity/task policy required")
         self.reset(seed)
@@ -469,6 +509,8 @@ class SkillCollector:
                         self.execution.record_action(record.low_actions[0], terminated=terminated, truncated=truncated)
                     else:
                         self.execution.record_action(record.low_actions[0])
+                    if self.actor.settings.get("pick_place_primitives", False):
+                        self.execution.check_retention(self.env.env._context())
                     self.encoder.gripper_command = self.execution.gripper_command
                     self.state = self.encoder.encode()
                     if not np.isfinite(self.state).all():
@@ -493,6 +535,10 @@ class SkillCollector:
                         contact_events=record.contact_events, outcome_metrics=record.outcome_metrics,
                         before=low_before, after=snapshot(self.env), reward=info["exploration_reward"], planner={},
                     ))
+                    if self.actor.settings.get("pick_place_primitives", False):
+                        row["grasp_retention"] = self.actor.settings.get("grasp_retention", "friction")
+                        row["macro_phase"] = primitive.phase
+                        row["macro_status"] = primitive.status
                     if self.planned_motion:
                         row["motion_execution"] = self.execution.last_motion_tick
                     low_log.write(json.dumps(row, allow_nan=False) + "\n")
@@ -501,6 +547,9 @@ class SkillCollector:
                         on_step(row)
                     if len(ticks) % 32 == 0 or terminated or truncated:
                         low_log.flush()
+                    if self.actor.settings.get("pick_place_primitives", False) and primitive.done:
+                        complete = True
+                        break
                     if terminated or truncated:
                         break
                 duration = len(ticks) - start
@@ -522,6 +571,9 @@ class SkillCollector:
                     start_step=self.total_steps - duration, end_step=self.total_steps,
                     before=before, after=snapshot(self.env),
                 ))
+                if self.actor.settings.get("pick_place_primitives", False):
+                    skill["grasp_retention"] = self.actor.settings.get("grasp_retention", "friction")
+                    skill["macro_phase"] = primitive.phase
                 if self.planned_motion:
                     if not complete:
                         self.execution.finish_motion(skill["status"])
@@ -531,6 +583,8 @@ class SkillCollector:
                 skills.append(skill)
                 if on_skill_end is not None:
                     on_skill_end(skill)
+                if stop_when is not None and stop_when():
+                    break
                 if (terminated or truncated) and len(ticks) < count:
                     self.reset(seed + self.episode_id)
         return ticks, skills
@@ -545,18 +599,62 @@ def skill_arrays(skills):
     return arrays
 
 
-def save(path, backend, actor, encoder, config, ticks, skills):
+def _timed(backend, operation):
+    if backend.device.type == "cuda":
+        torch.cuda.synchronize(backend.device)
+    started = time.perf_counter()
+    result = operation()
+    if backend.device.type == "cuda":
+        torch.cuda.synchronize(backend.device)
+    return result, time.perf_counter() - started
+
+
+def _write_checkpoint(path, payload, arrays, low_arrays, timings):
+    started = time.perf_counter()
+    targets = (path.with_suffix(".replay.npz"), path.with_suffix(".low_level.npz"), path)
+    temporary = []
+    try:
+        for target, value in zip(targets, (arrays, low_arrays, payload)):
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix="." + target.name,
+                                             suffix=".tmp", delete=False) as handle:
+                temporary.append(Path(handle.name))
+                if target == path:
+                    torch.save(value, handle)
+                else:
+                    np.savez_compressed(handle, **value)
+        # Publish the checkpoint marker only after both replay files are ready.
+        path.unlink(missing_ok=True)
+        for source, target in zip(temporary, targets):
+            source.replace(target)
+    finally:
+        for source in temporary:
+            source.unlink(missing_ok=True)
+    return dict(path=str(path), **timings, checkpoint_write_s=time.perf_counter() - started)
+
+
+def save(path, backend, actor, encoder, config, ticks, skills, *, executor=None):
     path = Path(path)
+    started = time.perf_counter()
     arrays = skill_arrays(skills)
-    np.savez_compressed(path.with_suffix(".replay.npz"), **arrays)
     # Full low-level data remain usable for subsequent control-step WMs.
-    np.savez_compressed(path.with_suffix(".low_level.npz"), **replay_arrays(ticks))
-    torch.save(dict(schema=SCHEMA, backend=backend.state_dict(), actor=actor.state_dict(),
+    low_arrays = replay_arrays(ticks)
+    replay_seconds = time.perf_counter() - started
+    payload, snapshot_seconds = _timed(backend, lambda: dict(
+                    schema=SCHEMA, backend=backend.state_dict(), actor=actor.state_dict(),
                     rng=rng_state(), state_contract=encoder.contract(),
                     action_contract=action_contract(actor.settings),
                     config=OmegaConf.to_container(config, resolve=True),
                     real_steps=len(ticks), completed_skills=len(arrays["states"]),
-                    environment_state_restored=False), path)
+                    environment_state_restored=False))
+    if executor is not None:
+        # state_dict() aliases live actor/optimizer storage; the writer must own CPU copies.
+        started = time.perf_counter()
+        payload = backend._move_tensors(payload, "cpu")
+        snapshot_seconds += time.perf_counter() - started
+    timings = dict(checkpoint_replay_s=replay_seconds, checkpoint_snapshot_s=snapshot_seconds)
+    if executor is not None:
+        return executor.submit(_write_checkpoint, path, payload, arrays, low_arrays, timings)
+    return _write_checkpoint(path, payload, arrays, low_arrays, timings)
 
 
 def load(path, backend, actor, encoder):
@@ -575,13 +673,15 @@ def resume_history(path, config):
     """Resume only at a saved round boundary, where collection resets physics."""
     path = Path(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("schema") != SCHEMA or path.parent.name != "curiosity":
-        raise ValueError("train --checkpoint requires a curiosity RAPS/GNN round checkpoint")
+    policy = str(config.get("collection_policy", "curiosity"))
+    if payload.get("schema") != SCHEMA or path.parent.name != policy:
+        raise ValueError(f"train --checkpoint requires a {policy} RAPS/GNN round checkpoint")
     old = deepcopy(payload["config"])
     new = OmegaConf.to_container(config, resolve=True)
     for value in (old, new):
         value.pop("rounds", None)
         value.pop("evaluation_steps", None)
+        value.setdefault("collection_policy", "curiosity")
         value["raps_actor"] = {**DEFAULTS, **value["raps_actor"]}
     if old != new:
         raise ValueError("Resume may change only rounds and evaluation_steps; retain saved settings")
@@ -594,7 +694,7 @@ def resume_history(path, config):
         raise ValueError("Resume requires a larger total rounds budget")
     ticks, skills = [], []
     source = path.parent.parent
-    for directory in (source / "bootstrap", source / "curiosity"):
+    for directory in (source / "bootstrap", source / policy):
         with (directory / "transitions.jsonl").open() as handle:
             ticks.extend(row for line in handle if (row := json.loads(line))["stage"] != "evaluation"
                          and row["step"] <= steps)
@@ -610,13 +710,23 @@ def resume_history(path, config):
 
 
 def fit(backend, actor, skills, config, directory, label, *, smoke=False):
+    arrays_started = time.perf_counter()
     arrays = skill_arrays(skills)
+    timings = dict(replay_preparation_s=time.perf_counter() - arrays_started)
     started = time.perf_counter()
-    model_metrics = backend.train(arrays, epochs=1 if smoke else int(config.epochs))
-    actor_metrics = actor.train(arrays, updates=2 if smoke else None)
+    previous_profile = backend.profile_timings
+    backend.profile_timings = {}
+    try:
+        model_metrics, timings["world_model_fit_s"] = _timed(
+            backend, lambda: backend.train(arrays, epochs=1 if smoke else int(config.epochs)))
+        timings.update(backend.profile_timings)
+        actor_metrics, timings["actor_critic_s"] = _timed(
+            backend, lambda: actor.train(arrays, updates=2 if smoke else None))
+    finally:
+        backend.profile_timings = previous_profile
     result = dict(label=label, real_steps=sum(row["duration_low_steps"] for row in skills),
                   completed_skills=len(arrays["states"]), model=model_metrics, actor=actor_metrics,
-                  seconds=time.perf_counter() - started)
+                  seconds=time.perf_counter() - started, timings=timings)
     with (directory / "training.jsonl").open("a") as handle:
         handle.write(json.dumps(result, allow_nan=False) + "\n")
     return result
@@ -633,8 +743,19 @@ def summarize(ticks, skills, schema=RAPS_ACTION_SCHEMA):
 
 
 def run(args, config):
+    wall_started = time.perf_counter()
     config.agent = "raps_gnn_actor"
+    if args.stage in {"train", "smoke"}:
+        config.collection_policy = getattr(args, "policy", "curiosity")
+    policies = ("random", "curiosity") if args.stage == "compare" else (str(config.get("collection_policy", "curiosity")),)
     config.raps_actor = OmegaConf.merge(DEFAULTS, config.get("raps_actor", {}))
+    if config.raps_actor.pick_place_primitives:
+        config.raps_actor.motion_execution = "planner"
+        config.action_mode = "joint_position"
+        config.raps_actor.latched_gripper = True
+        for key in ("hold_closed_during_motion", "stop_drop_on_support",
+                    "grasp_stop_on_contact", "controlled_placement"):
+            config.raps_actor[key] = False
     if args.device:
         config.device = args.device
     if getattr(args, "evaluation_steps", None) is not None:
@@ -649,10 +770,13 @@ def run(args, config):
         write_json(output / "report.json", dict(evaluations=reports, screening=verdict))
         print(json.dumps(verdict, ensure_ascii=False))
         return 0
+    execution = str(config.get("execution", "reference"))
+    if execution not in {"reference", "cuda_graph"}:
+        raise ValueError("execution must be reference or cuda_graph")
+    if execution == "cuda_graph" and config.device != "cuda":
+        raise ValueError("cuda_graph execution requires device=cuda")
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
-    if config.get("execution", "reference") != "reference":
-        raise ValueError("RAPS actor uses reference GNN execution; set execution: reference")
     if config.get("project_goals_to_region", False):
         raise ValueError("Region projection is not supported by the skill endpoint model")
     expected_mode = "joint_position" if config.raps_actor.motion_execution == "planner" else "ee_delta"
@@ -675,6 +799,7 @@ def run(args, config):
     backend = CEEUSBackend(device=str(config.device), seed=int(config.seed),
                            action_dim=skill_schema(config.raps_actor).action_dim,
                            agent_dim=32 + int(config.raps_actor.latched_gripper),
+                           execution=execution,
                            object_heuristic=OmegaConf.to_container(config.object_heuristic, resolve=True)
                            if config.get("object_heuristic") is not None else None,
                            runtime_optimizations=bool(config.get("runtime_optimizations", False)))
@@ -682,12 +807,44 @@ def run(args, config):
     from exploration.cee_us.cee_us_state import CabinetSkillStateEncoder
     env = None
     prepared = False
+    writer = None
+    pending_checkpoint = None
+
+    def timing(row):
+        with (output / "timings.jsonl").open("a") as handle:
+            handle.write(json.dumps(row, allow_nan=False) + "\n")
+
+    def drain_checkpoint():
+        nonlocal pending_checkpoint
+        if pending_checkpoint is not None:
+            timing(dict(stage="checkpoint", **pending_checkpoint.result()))
+            pending_checkpoint = None
+
+    def checkpoint(path, ticks, skills):
+        nonlocal pending_checkpoint
+        # Bound both the task count and the number of owned full replay snapshots.
+        drain_checkpoint()
+        result = save(path, backend, actor, encoder, config, ticks, skills, executor=writer)
+        if writer is None:
+            timing(dict(stage="checkpoint", **result))
+        else:
+            pending_checkpoint = result
+
+    def collect(collector, *arguments, **keywords):
+        if pending_checkpoint is not None and pending_checkpoint.done():
+            drain_checkpoint()
+        result, seconds = _timed(backend, lambda: collector.collect(*arguments, **keywords))
+        timing(dict(stage="collection", label=keywords["stage"], collection_s=seconds))
+        return result
+
     try:
         env, env_config = make_env(
             episode_steps=config.get("episode_steps", 100),
             centered_initial_tcp=config.get("centered_initial_tcp", False),
             object_shift_xy=getattr(args, "object_shift_xy", (0.0, 0.0)),
             action_mode=expected_mode,
+            low_level_episode_steps=(int(config.get("episode_steps", 100))
+                                     if config.raps_actor.pick_place_primitives else None),
         )
         env.reset(seed=int(config.seed))
         encoder = CabinetSkillStateEncoder(env, latched_gripper=actor.settings["latched_gripper"])
@@ -697,6 +854,8 @@ def run(args, config):
         write_json(output / "state_contract.json", encoder.contract())
         manifest = json.loads((output / "manifest.json").read_text())
         manifest.update(agent=config.agent, checkpoint_schema=SCHEMA, raps_reference_commit=RAPS_REFERENCE_COMMIT,
+                        collection_policy=config.get("collection_policy", None),
+                        collection_policies=list(policies) if args.stage != "evaluate" else [],
                         episode_steps=env_config.max_ee_steps_per_episode,
                         prediction_horizon_seconds=None, imagination_horizon_skills=actor.settings["imagination_horizon"],
                         log_flush_interval_steps=32,
@@ -710,21 +869,30 @@ def run(args, config):
                             "Enabled command latch is observed as agent state, excluded from curiosity",
                             "Incomplete skills excluded from endpoint replay; all real ticks preserved",
                         ])
+        if config.raps_actor.pick_place_primitives:
+            manifest.update(
+                action_semantics="5D grasp/place choice plus schema-defined bounded position arguments; completed macro endpoints",
+                action_dim=actor.schema.action_dim,
+                grasp_retention=actor.settings["grasp_retention"],
+                collection_reset="Every collection call resets physics; unfinished macros are excluded from WM replay")
         write_json(output / "manifest.json", manifest)
         if args.stage == "evaluate":
             load(args.checkpoint, backend, actor, encoder)
             collector = SkillCollector(env, encoder, actor, output / "evaluation")
-            ticks, skills = collector.collect(int(config.evaluation_steps), args.policy,
+            ticks, skills = collect(collector, int(config.evaluation_steps), args.policy,
                                               seed=int(config.seed) + 100000, stage="evaluation")
             result = summarize(ticks, skills, actor.schema)
             valid = [row for row in skills if row["trainable"]]
             result["prediction"] = (prediction_metrics(backend, skill_arrays(valid), horizons=(1, 3, 5))
                                     if len(valid) >= 2 else {"status": "insufficient_completed_skills"})
-            result.update(model_updated=False, actor_updated=False, normalizers_updated=False,
+            result.update(policy=args.policy, collection_policy=config.get("collection_policy", None),
+                          model_updated=False, actor_updated=False, normalizers_updated=False,
                           source_checkpoint=str(args.checkpoint.resolve()),
                           object_shift_xy_m=list(getattr(args, "object_shift_xy", (0.0, 0.0))))
             write_json(collector.directory / "evaluation.json", result)
             return 0
+        if backend.runtime_optimizations:
+            writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="raps-checkpoint")
         smoke = args.stage == "smoke"
         resuming = args.stage == "train" and args.checkpoint is not None
         start_round = 1
@@ -735,27 +903,26 @@ def run(args, config):
             initial_skill = max(row["skill_id"] for row in skills)
             # Keep independent complete JSONL logs; do not modify the source run.
             for name, rows in (("transitions.jsonl", ticks), ("skills.jsonl", skills)):
-                for directory in ("bootstrap", "curiosity"):
+                for directory in ("bootstrap", config.collection_policy):
                     target = output / directory
                     target.mkdir(exist_ok=True)
                     with (target / name).open("w") as handle:
                         for row in rows:
                             if (row["stage"] == "bootstrap") == (directory == "bootstrap"):
                                 handle.write(json.dumps(row, allow_nan=False) + "\n")
-            shutil.copy2(args.checkpoint.parent / "training.jsonl", output / "curiosity/training.jsonl")
+            shutil.copy2(args.checkpoint.parent / "training.jsonl", output / config.collection_policy / "training.jsonl")
             manifest.update(resume_checkpoint=str(args.checkpoint.resolve()),
                             imported_training_steps=len(ticks), next_round=start_round,
                             simulation_resume="Physics resets at the next collection round, as in baseline")
             write_json(output / "manifest.json", manifest)
         else:
             bootstrap = SkillCollector(env, encoder, actor, output / "bootstrap")
-            ticks, skills = bootstrap.collect(192 if smoke else int(config.bootstrap_steps), "random",
+            ticks, skills = collect(bootstrap, 192 if smoke else int(config.bootstrap_steps), "random",
                                               seed=int(config.seed), stage="bootstrap")
             fit(backend, actor, skills, config, bootstrap.directory, "bootstrap", smoke=smoke)
-            save(bootstrap.directory / "checkpoint.pt", backend, actor, encoder, config, ticks, skills)
+            checkpoint(bootstrap.directory / "checkpoint.pt", ticks, skills)
             initial_episode, initial_skill = bootstrap.episode_id, bootstrap.skill_id
         initial_model, initial_actor, initial_rng = deepcopy(backend.state_dict()), deepcopy(actor.state_dict()), rng_state()
-        policies = ("random", "curiosity") if args.stage == "compare" else ("curiosity",)
         for policy in policies:
             backend.load_state_dict(deepcopy(initial_model))
             actor.load_state_dict(deepcopy(initial_actor))
@@ -768,14 +935,14 @@ def run(args, config):
             for index in range(start_round, rounds + 1):
                 write_json(output / "progress.json", dict(stage="collecting", policy=policy, round=index,
                                                           arm_training_steps=len(history)))
-                latest, macros = collector.collect(32 if smoke else int(config.steps_per_round), policy,
+                latest, macros = collect(collector, 32 if smoke else int(config.steps_per_round), policy,
                                                      seed=int(config.seed) + 10000 * index, stage=f"round_{index}")
                 history.extend(latest); endpoints.extend(macros)
                 write_json(output / "progress.json", dict(stage="training", policy=policy, round=index,
                                                           arm_training_steps=len(history)))
                 training = fit(backend, actor, endpoints, config, collector.directory, f"round_{index}", smoke=smoke)
                 path = collector.directory / f"round_{index:03d}.pt"
-                save(path, backend, actor, encoder, config, history, endpoints)
+                checkpoint(path, history, endpoints)
                 write_json(path.with_suffix(".json"), dict(training=training, collection=summarize(latest, macros, actor.schema)))
                 print(json.dumps(dict(policy=policy, round=index, real_training_steps=len(history),
                                       completed_skills=training["completed_skills"], actor_loss=training["actor"]["actor_loss"])), flush=True)
@@ -786,16 +953,18 @@ def run(args, config):
                 expected_action = actor.action(replay["states"][0])
                 # Checkpoint stores RNG before the sampled action above.
                 restore_rng(random_before)
-                save(path, backend, actor, encoder, config, history, endpoints)
+                checkpoint(path, history, endpoints)
+                drain_checkpoint()
                 load(path, backend, actor, encoder)
                 np.testing.assert_array_equal(expected, backend.predict(replay["states"][:1], replay["actions"][:1]))
                 np.testing.assert_array_equal(expected_action, actor.action(replay["states"][0]))
             if not smoke and int(config.evaluation_steps) == 0:
-                write_json(collector.directory / "evaluation.json", dict(status="not_run", real_steps=0))
+                write_json(collector.directory / "evaluation.json", dict(status="not_run", real_steps=0, policy=policy))
                 continue
-            evaluation, eval_skills = collector.collect(32 if smoke else int(config.evaluation_steps), "curiosity" if policy == "curiosity" else "random",
+            evaluation, eval_skills = collect(collector, 32 if smoke else int(config.evaluation_steps), "curiosity" if policy == "curiosity" else "random",
                                                          seed=int(config.seed) + 100000, stage="evaluation")
             result = summarize(evaluation, eval_skills, actor.schema)
+            result["policy"] = policy
             # Short smoke/evaluation may contain no complete skill; don't claim
             # that fitting static endpoints validates interaction dynamics.
             valid = [row for row in eval_skills if row["trainable"]]
@@ -808,11 +977,15 @@ def run(args, config):
                                                   + (32 if smoke else int(config.evaluation_steps)))
         if smoke and real_steps > 300:
             raise AssertionError("Physical smoke budget exceeded")
+        drain_checkpoint()
         write_json(output / "result.json", dict(status="completed", real_steps=real_steps,
                                                imported_training_steps=len(ticks) if resuming else 0,
                                                new_real_steps=real_steps - (len(ticks) if resuming else 0),
                                                smoke=smoke, checkpoint_restore_checked=smoke,
-                                               matched_random_baseline=args.stage == "compare"))
+                                               matched_random_baseline=args.stage == "compare",
+                                               collection_policy=config.get("collection_policy", None),
+                                               collection_policies=list(policies),
+                                               wall_seconds=time.perf_counter() - wall_started))
         write_json(output / "progress.json", dict(stage="completed", real_steps=real_steps))
     except BaseException as exc:
         if prepared:
@@ -820,6 +993,16 @@ def run(args, config):
                                                      status="stopped_without_random_fallback"))
         raise
     finally:
-        if env is not None:
-            env.close()
+        try:
+            drain_checkpoint()
+        except BaseException as exc:
+            if prepared:
+                write_json(output / "failure.json", dict(type=type(exc).__name__, message=str(exc),
+                                                         status="stopped_without_random_fallback"))
+            raise
+        finally:
+            if writer is not None:
+                writer.shutdown(wait=True)
+            if env is not None:
+                env.close()
     return 0

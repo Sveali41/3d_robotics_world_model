@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from exploration.diagnostics.trajectory_store import read_transitions, transition_source
+
 TEMPLATES = ('xyz', 'xzy', 'yxz', 'yzx', 'zxy', 'zyx', 'post_grasp', 'mid_lift', 'pre_carry')
 OUTCOMES = ('complete', 'grasp_then_failed', 'no_grasp')
 COLORS = {'complete': '#16804a', 'grasp_then_failed': '#783cad', 'no_grasp': '#db7813'}
@@ -73,7 +75,7 @@ def read_case(case, summary_path):
     attempt = summary['attempt']
     directory = summary_path.parent/f'attempt_{attempt:06d}'
     skills = [json.loads(line) for line in (directory/'skills.jsonl').read_text().splitlines() if line.strip()]
-    rows = [json.loads(line) for line in (directory/'transitions.jsonl').read_text().splitlines() if line.strip()]
+    rows = read_transitions(directory)
     if not skills:
         raise ValueError(f'Closed case lacks an initial skill: {summary_path}')
     if len(rows) != summary['control_ticks']:
@@ -116,7 +118,7 @@ def read_case(case, summary_path):
     closed_command = np.asarray([False] + [bool(t['closed_command']) for t in trace])
     confirmed_grasp = target_grasped & (stable_ticks >= 4)
     return dict(case_id=case['case_id'], object=case['object'], template=case['template'], outcome=outcome,
-                attempt=attempt, summary_path=str(summary_path), transitions_path=str(directory/'transitions.jsonl'),
+                attempt=attempt, summary_path=str(summary_path), transitions_path=str(transition_source(directory)),
                 skills_path=str(directory/'skills.jsonl'), raw_ticks=len(rows), raw_points=len(states),
                 tcp_path_length_m=length(tcp), target_path_length_m=length(target),
                 tcp=tcp, target=target, initial_cup=initial[33:36], initial_bowl=initial[45:48],

@@ -33,6 +33,97 @@ def actor(model):
                                           updates_per_round=2, target_update_period=1))
 
 
+@pytest.mark.parametrize("execution", [None, "reference", "cuda_graph"])
+def test_execution_cli_preserves_default_and_allows_override(monkeypatch, tmp_path, execution):
+    from omegaconf import OmegaConf
+    from exploration.cee_us import cee_us_cabinet as cli
+    import exploration.raps.raps_gnn_actor as module
+
+    path = tmp_path / "config.yaml"
+    OmegaConf.save(OmegaConf.create(dict(agent="raps_gnn_actor", execution="reference")), path)
+    observed = []
+    monkeypatch.setattr(module, "run", lambda args, config: observed.append(config.execution) or 0)
+    arguments = ["train", "--config", str(path)]
+    if execution is not None:
+        arguments += ["--execution", execution]
+    assert cli.main(arguments) == 0
+    assert observed == [execution or "reference"]
+
+
+def test_cuda_graph_cli_rejects_cpu_before_creating_output(tmp_path):
+    from exploration.cee_us.cee_us_cabinet import ROOT, main
+
+    output = tmp_path / "run"
+    with pytest.raises(ValueError, match="CUDA|cuda"):
+        main(["train", "--config", str(ROOT / "configs/raps_gnn_actor_cabinet_split7.yaml"),
+              "--execution", "cuda_graph", "--device", "cpu", "--output", str(output)])
+    assert not output.exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device unavailable")
+@pytest.mark.parametrize("skill_set,action_dim", [("compact6", 12), ("split7", 13)])
+def test_cuda_graph_imagination_updates_and_invalidation_match_reference(skill_set, action_dim):
+    torch.set_num_threads(1)
+    options = dict(device="cuda", agent_dim=33, action_dim=action_dim, hidden_dim=16,
+                   horizon=3, candidates=8, iterations=2, elites=4, batch_size=4,
+                   object_heuristic=dict(approach_weight=50.0))
+    reference = CEEUSBackend(**options)
+    accelerated = CEEUSBackend(**options, execution="cuda_graph")
+    settings = dict(skill_set=skill_set, latched_gripper=True, hidden_size=16,
+                    actor_layers=1, critic_layers=1, imagination_horizon=3,
+                    imagination_batch_size=4, updates_per_round=2, target_update_period=1)
+    policy = RAPSImaginationActor(reference, settings)
+    fast_policy = RAPSImaginationActor(accelerated, settings)
+    fast_policy.load_state_dict(deepcopy(policy.state_dict()))
+    rng = np.random.default_rng(12)
+    states = rng.normal(size=(8, 67)).astype(np.float32)
+    next_states = states.copy()
+    next_states[:, :57] += .01
+    actions = canonical_action(torch.tensor(rng.uniform(-1, 1, (8, action_dim)),
+                                            dtype=torch.float32), policy.schema).numpy()
+    data = dict(states=states, actions=actions, next_states=next_states,
+                terminated=np.zeros(8, bool))
+    for model in (reference, accelerated):
+        np.random.seed(23)
+        torch.manual_seed(23)
+        model.train(data, 1)
+    torch.testing.assert_close(accelerated.state_dict(), reference.state_dict(), rtol=1e-5, atol=1e-6)
+    starts = torch.tensor(states[:4], device="cuda")
+    torch.manual_seed(31)
+    expected = policy.imagine(starts)
+    torch.manual_seed(31)
+    actual = fast_policy.imagine(starts)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    graph = accelerated.prediction_accelerator
+    assert graph._graphs
+    frozen = deepcopy(accelerated.model.model.state_dict())
+    torch.manual_seed(41)
+    expected_metrics = policy.train(data)
+    torch.manual_seed(41)
+    actual_metrics = fast_policy.train(data)
+    assert actual_metrics == pytest.approx(expected_metrics, rel=1e-5, abs=1e-6)
+    assert fast_policy.settings == policy.settings
+    assert fast_policy.updates == policy.updates
+    for name in ("actor", "critic", "target_critic", "actor_optimizer", "critic_optimizer"):
+        torch.testing.assert_close(getattr(fast_policy, name).state_dict(),
+                                   getattr(policy, name).state_dict(), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(accelerated.model.model.state_dict(), frozen, rtol=0, atol=0)
+    accelerated.load_state_dict(reference.state_dict())
+    assert not graph._graphs
+    fast_policy.imagine(starts)
+    assert graph._graphs
+    accelerated.train(data, 1)
+    assert not graph._graphs
+    torch.manual_seed(51)
+    policy.backend = accelerated
+    accelerated.model.predict = graph.original_predict
+    expected = policy.imagine(starts)
+    accelerated.model.predict = graph.predict
+    torch.manual_seed(51)
+    actual = policy.imagine(starts)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_canonical_actions_only_consume_selected_arguments():
     raw = torch.ones(3, 20)
     raw[:, :10] = 0
@@ -104,12 +195,17 @@ def test_disagreement_flag_preserves_heuristic_and_default_reward(weight):
     torch.testing.assert_close(trajectory['rewards'].squeeze(-1), expected)
 
 
-def test_resume_history_reuses_saved_prefix_and_rejects_protocol_change(tmp_path):
+@pytest.mark.parametrize("policy", ["curiosity", "random"])
+@pytest.mark.parametrize("changed_setting", ["seed", "runtime_optimizations", "execution", "collection_policy"])
+def test_resume_history_reuses_saved_prefix_and_rejects_protocol_change(tmp_path, changed_setting, policy):
     import json
     from omegaconf import OmegaConf
     from exploration.raps.raps_gnn_actor import resume_history, SCHEMA
     config = OmegaConf.create(dict(seed=0, bootstrap_steps=1, steps_per_round=1,
-                                    rounds=1, evaluation_steps=0, raps_actor={}))
+                                    rounds=1, evaluation_steps=0, raps_actor={},
+                                    runtime_optimizations=False, execution="reference"))
+    if policy == "random":
+        config.collection_policy = policy
     rows = []
     for step, stage in [(1, 'bootstrap'), (2, 'round_1')]:
         row = dict(step=step, skill_id=step, end_step=step, stage=stage,
@@ -117,19 +213,21 @@ def test_resume_history_reuses_saved_prefix_and_rejects_protocol_change(tmp_path
             episode_id=step, terminated=False, truncated=False,
             trainable=True, duration_low_steps=1)
         rows.append(row)
-        directory = tmp_path / ('bootstrap' if step == 1 else 'curiosity')
+        directory = tmp_path / ('bootstrap' if step == 1 else policy)
         directory.mkdir()
         for name in ['transitions.jsonl', 'skills.jsonl']:
             (directory / name).write_text(json.dumps(row) + '\n')
-    path = tmp_path / 'curiosity/round_001.pt'
+    path = tmp_path / policy / 'round_001.pt'
     torch.save(dict(schema=SCHEMA, config=OmegaConf.to_container(config), real_steps=2), path)
     np.savez_compressed(path.with_suffix('.replay.npz'), **skill_arrays(rows))
+    config.collection_policy = policy  # Historical curiosity configs omit this field.
     config.rounds = 3
     config.evaluation_steps = 1
     ticks, skills, next_round = resume_history(path, config)
     assert ticks == skills == rows and next_round == 2
-    config.seed = 1
-    with pytest.raises(ValueError, match='only rounds and evaluation_steps'):
+    config[changed_setting] = {"seed": 1, "runtime_optimizations": True, "execution": "cuda_graph",
+                               "collection_policy": "random" if policy == "curiosity" else "curiosity"}[changed_setting]
+    with pytest.raises(ValueError, match='only rounds and evaluation_steps|requires a .* round checkpoint'):
         resume_history(path, config)
 
 
@@ -246,6 +344,39 @@ def test_collector_exact_budget_episode_boundaries_and_partial_exclusion(monkeyp
     np.testing.assert_array_equal(ticks[5]["state"], np.zeros(66))
 
 
+@pytest.mark.parametrize('zero_duration', [False, True])
+def test_collector_stop_hook_preserves_failure_before_stopping(monkeypatch, tmp_path, zero_duration):
+    import json
+    import exploration.raps.raps_gnn_actor as module
+
+    class FailedPrimitive(Primitive):
+        def next_action(self, context):
+            if zero_duration or self.steps == 1:
+                self.status = 'no_collision_free_ik'
+                return None
+            return super().next_action(context)
+
+    env = Env()
+    monkeypatch.setattr(module, 'snapshot', lambda env: {})
+    monkeypatch.setattr('domain.robocasa.skill_execution.PRIMITIVE_CLASSES',
+        dict.fromkeys(module.skill_schema({'skill_set': 'split7'}).primitive_names, FailedPrimitive))
+    collector = SkillCollector(env, SimpleNamespace(encode=lambda: np.full(66, env.tick, np.float32)),
+        SimpleNamespace(settings={'hold_closed_during_motion': False, 'skill_set': 'split7'}), tmp_path)
+    completed = []
+
+    def on_end(skill):
+        persisted = [json.loads(line) for line in (tmp_path/'skills.jsonl').read_text().splitlines()]
+        assert persisted[-1] == skill
+        completed.append(skill)
+
+    ticks, skills = collector.collect(100, 'random', seed=0, stage='test',
+        on_skill_end=on_end, stop_when=lambda: bool(completed))
+    assert len(skills) == len(completed) == 1
+    assert skills[0]['status'] == 'no_collision_free_ik'
+    assert skills[0]['duration_low_steps'] == len(ticks) == (0 if zero_duration else 1)
+    assert len((tmp_path/'transitions.jsonl').read_text().splitlines()) == len(ticks)
+
+
 def test_checkpoint_restores_model_actor_optimizers_and_rng(tmp_path):
     from omegaconf import OmegaConf
     model, data = backend(), replay()
@@ -350,3 +481,110 @@ def test_compact_skill_space_sampling_imagination_and_updates():
         RAPSImaginationActor(model)
     with pytest.raises(ValueError, match="Unknown raps_actor.skill_set"):
         skill_schema(dict(skill_set="invalid"))
+
+
+@pytest.mark.parametrize("stage,selected,expected,resuming", [
+    ("train", None, ["curiosity"], False),
+    ("train", "random", ["random"], False),
+    ("train", "random", ["random"], True),
+    ("compare", "random", ["random", "curiosity"], False),
+    ("evaluate", "random", [], False),
+])
+def test_run_selects_and_records_collection_policy(monkeypatch, tmp_path, stage, selected, expected, resuming):
+    import json
+    from omegaconf import OmegaConf
+    from exploration.cee_us import cee_us_state
+    import exploration.raps.raps_gnn_actor as module
+
+    config = OmegaConf.load(module.ROOT / "configs/raps_gnn_actor_cabinet_split7.yaml")
+    config.device = "cpu"
+    config.bootstrap_steps = config.steps_per_round = config.rounds = config.evaluation_steps = 1
+    config.runtime_optimizations = False
+    if stage == "evaluate":
+        config.collection_policy = "curiosity"
+    model = SimpleNamespace(device=torch.device("cpu"), runtime_optimizations=False,
+                            state_dict=lambda: {}, load_state_dict=lambda state: None)
+    policy = SimpleNamespace(settings=dict(module.DEFAULTS), schema=module.RAPS_ACTION_SCHEMA,
+                             state_dict=lambda: {}, load_state_dict=lambda state: None)
+    env = SimpleNamespace(reset=lambda **kw: None, close=lambda: None)
+    encoder = SimpleNamespace(contract=lambda: {})
+    monkeypatch.setattr(module, "CEEUSBackend", lambda **kw: model)
+    monkeypatch.setattr(module, "RAPSImaginationActor", lambda *args: policy)
+    monkeypatch.setattr(module, "make_env", lambda **kw: (env, SimpleNamespace(max_ee_steps_per_episode=800)))
+    monkeypatch.setattr(cee_us_state, "CabinetSkillStateEncoder", lambda *args, **kw: encoder)
+    calls, fits, snapshots = [], [], []
+
+    def prepare(path, config, env_config):
+        path.mkdir()
+        OmegaConf.save(config, path / "config.yaml")
+        (path / "manifest.json").write_text(json.dumps(dict(adaptations=[])))
+
+    class Collector:
+        def __init__(self, env, encoder, actor, directory):
+            self.directory = directory
+            directory.mkdir(exist_ok=True)
+            self.episode_id = self.skill_id = self.total_steps = 0
+
+        def collect(self, count, policy, *, seed, stage):
+            calls.append((self.directory.name, stage, policy, count, seed))
+            self.total_steps += count
+            self.skill_id += 1
+            return [dict(step=self.total_steps)], []
+
+    def fit(*args, **kw):
+        fits.append(args[5])
+        return dict(completed_skills=0, actor=dict(actor_loss=0))
+
+    def save(path, backend, actor, encoder, config, *args, **kw):
+        snapshots.append(OmegaConf.to_container(config))
+        return {}
+
+    monkeypatch.setattr(module, "prepare_output", prepare)
+    monkeypatch.setattr(module, "SkillCollector", Collector)
+    monkeypatch.setattr(module, "fit", fit)
+    monkeypatch.setattr(module, "save", save)
+    monkeypatch.setattr(module, "load", lambda *args: None)
+    monkeypatch.setattr(module, "summarize", lambda *args: {})
+    output = tmp_path / "run"
+    checkpoint = tmp_path / "source.pt" if stage == "evaluate" else None
+    prefix = []
+    if resuming:
+        config.rounds = 2
+        checkpoint = tmp_path / "source/random/round_001.pt"
+        checkpoint.parent.mkdir(parents=True)
+        (checkpoint.parent / "training.jsonl").write_text('{"label": "round_1"}\n')
+        prefix = [dict(step=step, end_step=step, episode_id=1, skill_id=step, stage=phase)
+                  for step, phase in [(1, "bootstrap"), (2, "round_1")]]
+        monkeypatch.setattr(module, "resume_history", lambda *args: (prefix, prefix, 2))
+    arguments = SimpleNamespace(stage=stage, output=output, device=None, checkpoint=checkpoint)
+    if selected is not None:
+        arguments.policy = selected
+    assert module.run(arguments, config) == 0
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["collection_policies"] == expected
+    if stage == "evaluate":
+        assert calls == [("evaluation", "evaluation", "random", 1, int(config.seed) + 100000)]
+        assert config.collection_policy == "curiosity"
+        result = json.loads((output / "evaluation/evaluation.json").read_text())
+        assert result["policy"] == "random" and result["collection_policy"] == "curiosity"
+        assert not fits
+    else:
+        if resuming:
+            assert (output / "random/training.jsonl").read_text() == '{"label": "round_1"}\n'
+            for directory, row in zip(("bootstrap", "random"), prefix):
+                for filename in ("transitions.jsonl", "skills.jsonl"):
+                    assert json.loads((output / directory / filename).read_text()) == row
+        else:
+            assert calls[0][1:4] == ("bootstrap", "random", 1)
+        round_label = "round_2" if resuming else "round_1"
+        assert [(directory, phase, policy) for directory, phase, policy, _, _ in calls[0 if resuming else 1:]] == [
+            (policy, phase, policy) for policy in expected for phase in (round_label, "evaluation")]
+        assert fits == ([] if resuming else ["bootstrap"]) + [round_label] * len(expected)
+        result = json.loads((output / "result.json").read_text())
+        assert result["collection_policies"] == expected
+        assert result["real_steps"] == (2 if resuming else 1) + 2 * len(expected)
+        if stage == "train":
+            resolved = selected or "curiosity"
+            assert manifest["collection_policy"] == result["collection_policy"] == resolved
+            assert OmegaConf.load(output / "config.yaml").collection_policy == resolved
+            assert all(snapshot["collection_policy"] == resolved for snapshot in snapshots)

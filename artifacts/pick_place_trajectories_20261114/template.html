@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pick/place trajectories</title>
+<style>
+:root{font:15px system-ui,sans-serif;color:#182435;background:#f4f6f9}body{margin:22px}h1{font-size:25px;margin:0 0 8px}.intro,.note{max-width:1200px;line-height:1.45}.controls{display:flex;gap:12px 18px;align-items:end;flex-wrap:wrap;margin:18px 0}.control{display:flex;flex-direction:column;gap:5px}select,input,button{font:inherit;padding:7px 9px;border:1px solid #bac4d1;border-radius:5px;background:white;color:inherit}button{cursor:pointer}.warning{color:#8a3b00;background:#fff1d6;border-radius:6px;padding:9px 12px}.error{color:#a40000;white-space:pre-wrap}#totals{white-space:pre-line;line-height:1.5}#charts{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px;margin:12px 0}.chart{height:430px;background:#fff;border-radius:8px}#details{line-height:1.5;white-space:pre-line}.table-wrap{overflow:auto;background:white;border-radius:8px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e4e8ee;white-space:nowrap}th{position:sticky;top:0;background:#edf1f6}tbody tr{cursor:pointer}tbody tr:hover{background:#eef5ff}tbody tr.selected{background:#dcecff}.paging{display:flex;align-items:center;gap:12px;margin:10px 0}.muted{color:#526174}@media(max-width:900px){#charts{grid-template-columns:1fr}.chart{height:350px}}
+</style>
+</head>
+<body>
+<h1>Pick/place trajectories</h1>
+<p class="intro">Recorded trajectories include every physical control tick. Positions use robot-root coordinates in metres in the source and centimetres in the charts. Episodes are kept separate at resets. The all-episodes overview is rendered with a displayed stride; episode and selected-skill views show every available point.</p>
+<div class="controls">
+<label class="control">Arm<select id="arm"><option value="curiosity_heuristic">Curiosity + heuristic</option><option value="curiosity_only">Curiosity only</option><option value="heuristic_only">Heuristic only</option><option value="random" selected>Random</option></select></label>
+<label class="control">Episode<select id="episode"><option value="all">All episodes</option></select></label>
+<label class="control">Primitive<select id="kind"><option value="all">All primitives</option><option value="grasp">Grasp</option><option value="place">Place</option></select></label>
+<label class="control">Status<select id="statusFilter"><option value="all">All statuses</option></select></label>
+<label class="control">Projection<select id="projection"><option value="3d">3D</option><option value="xy">XY</option><option value="xz">XZ</option></select></label>
+<label class="control">Go to skill ID<input id="skillId" type="number" step="1" placeholder="Optional ID"></label>
+<button id="goSkill" type="button">Go</button><button id="clearSelection" type="button">Clear selection</button>
+</div>
+<p id="totals" class="muted">Loading arm data…</p><p id="budgetWarning" class="warning" hidden></p><p id="error" class="error" role="alert"></p>
+<div id="charts"><div id="pathChart" class="chart"></div><div id="heightChart" class="chart"></div></div>
+<p id="details"></p><p id="filterCount" class="muted"></p>
+<div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>Episode</th><th>Primitive</th><th>Start</th><th>End</th><th>Duration</th><th>Status</th></tr></thead><tbody id="skillsBody"></tbody></table></div>
+<div class="paging"><button id="prevPage" type="button">Previous</button><span id="pageLabel"></span><button id="nextPage" type="button">Next</button><span class="muted">Up to 50 rows per page. Select a row to plot that exact skill.</span></div>
+<p class="note">Height is shown relative to the first displayed point of each plotted trajectory. It describes coordinate change and does not identify a lift event. TCP, cup and bowl coordinates are all in the root frame.</p>
+<script>__BUNDLE__</script>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const ARM_LABELS = {
+    curiosity_heuristic: 'Curiosity + heuristic', curiosity_only: 'Curiosity only',
+    heuristic_only: 'Heuristic only', random: 'Random'
+  };
+  const COLORS = {TCP:'#1769aa', cup:'#e87500', bowl:'#378b46'};
+  const state = {arm:null, positions:null, episodes:null, skills:[], summary:{}, episodeIds:[], page:0, selectedSkill:null, loadToken:0, overviewStride:1};
+
+  function decodeBase64Array(encoded, count, bytesPerItem, read) {
+    const raw = atob(encoded);
+    if (raw.length !== count * bytesPerItem) throw new Error(`Expected ${count * bytesPerItem} bytes, received ${raw.length}.`);
+    const buffer = new ArrayBuffer(raw.length), bytes = new Uint8Array(buffer);
+    for (let i=0; i<raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const view = new DataView(buffer), out = new Array(count);
+    for (let i=0; i<count; i++) out[i] = read(view, i * bytesPerItem);
+    return out;
+  }
+  function decodePayload(payload) {
+    if (!payload || !Number.isInteger(payload.n) || payload.n < 0) throw new Error('Arm payload must include a non-negative integer n.');
+    const flat = decodeBase64Array(payload.positions, (payload.n + 1) * 9, 4, (v,o) => v.getFloat32(o, true));
+    const episodes = decodeBase64Array(payload.episodes, payload.n, 4, (v,o) => v.getInt32(o, true));
+    const positions = new Array(payload.n + 1);
+    for (let i=0;i<positions.length;i++) positions[i] = flat.slice(i*9, i*9+9);
+    const skills = (payload.skills || []).map(row => {
+      if (!Array.isArray(row) || row.length < 6) throw new Error('Each skill row must contain [start, end, kind, status, episode, id].');
+      return {start:+row[0], end:+row[1], kind:String(row[2]), status:String(row[3]), episode:+row[4], id:+row[5]};
+    });
+    return {n:payload.n, positions, episodes, skills, summary:payload.summary || {}};
+  }
+  function fmt(value) { return Number(value).toLocaleString('en-US'); }
+  function parseArm(arm) {
+    return new Promise((resolve,reject) => {
+      if (window.TRAJECTORIES && window.TRAJECTORIES[arm]) { resolve(window.TRAJECTORIES[arm]); return; }
+      const script = document.createElement('script');
+      script.src = `${arm}.js`;
+      script.onload = () => window.TRAJECTORIES && window.TRAJECTORIES[arm] ? resolve(window.TRAJECTORIES[arm]) : reject(new Error(`Loaded ${arm}.js but window.TRAJECTORIES.${arm} was not found.`));
+      script.onerror = () => reject(new Error(`Could not load ${arm}.js. Keep this page and its arm scripts in the same directory, and check that the file is present.`));
+      document.head.appendChild(script);
+    });
+  }
+  function statusCounts(skills) {
+    const isSuccess = s => /^success$/i.test(s.status);
+    const isUnfinished = s => /unfinished|truncated|interrupted|incomplete/i.test(s.status);
+    const success = skills.filter(isSuccess).length;
+    const unfinished = skills.filter(s => !isSuccess(s) && isUnfinished(s)).length;
+    const failed = skills.length - success - unfinished;
+    return {success, failed, unfinished};
+  }
+  function setFilterOptions() {
+    const episode = $('episode'), currentEpisode = episode.value;
+    episode.replaceChildren(new Option('All episodes','all'));
+    state.episodeIds.forEach(id => episode.add(new Option(String(id),String(id))));
+    episode.value = state.episodeIds.includes(Number(currentEpisode)) ? currentEpisode : 'all';
+    const status = $('statusFilter'), currentStatus = status.value;
+    status.replaceChildren(new Option('All statuses','all'));
+    [...new Set(state.skills.map(s => s.status))].sort().forEach(s => status.add(new Option(s,s)));
+    status.value = [...status.options].some(o => o.value === currentStatus) ? currentStatus : 'all';
+  }
+  function updateTotals() {
+    const c = statusCounts(state.skills), s = state.summary || {};
+    $('totals').textContent = `${ARM_LABELS[state.arm]}: ${fmt(state.n)} actual control transitions; ${fmt(state.skills.length)} skills (${fmt(c.success)} success, ${fmt(c.failed)} failed, ${fmt(c.unfinished)} unfinished).` +
+      (Number.isFinite(Number(s.actual_controls)) ? `\nSource summary: ${fmt(Number(s.actual_controls))} actual controls.` : '');
+    const totals = window.__sourceTotals || (window.__sourceTotals = {});
+    totals[state.arm] = state.n;
+    const loaded = Object.entries(totals);
+    const vals = loaded.map(([,n])=>n);
+    const unequal = vals.length > 1 && vals.some(n => n !== vals[0]);
+    $('budgetWarning').hidden = !unequal;
+    $('budgetWarning').textContent = unequal ? `Warning: source control totals differ across loaded arms (${loaded.map(([name,n])=>`${ARM_LABELS[name]} ${fmt(n)}`).join('; ')}).` : '';
+  }
+  async function loadArm(arm) {
+    const token = ++state.loadToken;
+    $('error').textContent = '';
+    $('totals').textContent = `Loading ${ARM_LABELS[arm]} data…`;
+    try {
+      const decoded = decodePayload(await parseArm(arm));
+      if (token !== state.loadToken) return;
+      state.arm=arm; state.n=decoded.n; state.positions=decoded.positions; state.episodes=decoded.episodes;
+      state.skills=decoded.skills; state.summary=decoded.summary; state.selectedSkill=null; state.page=0;
+      state.episodeIds=[...new Set(state.episodes)].sort((a,b)=>a-b);
+      setFilterOptions(); updateTotals(); renderAll();
+      const firstSuccess = state.skills.find(s => /success/i.test(s.status));
+      if (firstSuccess) selectSkill(firstSuccess);
+    } catch (e) {
+      if (token !== state.loadToken) return;
+      $('error').textContent = `Data error: ${e && e.message ? e.message : String(e)}`;
+      $('totals').textContent = `${ARM_LABELS[arm]} data unavailable.`;
+      clearCharts();
+    }
+  }
+  function clearCharts() {
+    if (window.Plotly) {
+      Plotly.react('pathChart',[],{title:'Trajectory path'},{responsive:true,displaylogo:false});
+      Plotly.react('heightChart',[],{title:'Relative Z over control steps'},{responsive:true,displaylogo:false});
+    }
+    $('details').textContent='';
+  }
+  function filteredSkills() {
+    const ep=$('episode').value, kind=$('kind').value, status=$('statusFilter').value;
+    return state.skills.filter(s => (ep==='all'||s.episode===Number(ep)) && (kind==='all'||s.kind===kind) && (status==='all'||s.status===status));
+  }
+  function renderTable() {
+    const rows=filteredSkills(), pages=Math.max(1,Math.ceil(rows.length/50));
+    state.page=Math.min(state.page,pages-1);
+    $('filterCount').textContent=`Filtered skill count: ${fmt(rows.length)} of ${fmt(state.skills.length)}.`;
+    $('pageLabel').textContent=`Page ${state.page+1} of ${pages}`;
+    $('prevPage').disabled=state.page<=0; $('nextPage').disabled=state.page>=pages-1;
+    const body=$('skillsBody'); body.replaceChildren();
+    rows.slice(state.page*50,(state.page+1)*50).forEach(skill => {
+      const tr=document.createElement('tr'); tr.className=state.selectedSkill===skill.id?'selected':'';
+      [skill.id,skill.episode,skill.kind,skill.start,skill.end,Math.max(0,skill.end-skill.start),skill.status].forEach(value=>{const td=document.createElement('td');td.textContent=String(value);tr.appendChild(td)});
+      tr.addEventListener('click',()=>selectSkill(skill)); body.appendChild(tr);
+    });
+  }
+  function selectSkill(skill) {
+    state.selectedSkill=skill.id;
+    $('episode').value=String(skill.episode);
+    state.page=Math.max(0,Math.floor(filteredSkills().findIndex(s=>s.id===skill.id)/50));
+    renderTable(); renderCharts();
+  }
+  function coordinatesForRange(start,end,episodeId,skipBoundaryStart) {
+    let first=Math.max(0,start), last=Math.min(state.n,end);
+    if (skipBoundaryStart && first>0 && first<state.n && state.episodes[first]!==state.episodes[first-1]) first++;
+    const indices=[];
+    for(let i=first;i<=last;i++) indices.push(i);
+    return indices;
+  }
+  function episodeRange(episodeId) {
+    const transitions=[];
+    for(let i=0;i<state.n;i++) if(state.episodes[i]===episodeId) transitions.push(i);
+    return transitions.length ? [transitions[0],transitions[transitions.length-1]+1] : [0,0];
+  }
+  function makeSegments() {
+    if(state.selectedSkill!==null) {
+      const s=state.skills.find(x=>x.id===state.selectedSkill);
+      if(!s) return [];
+      const idx=coordinatesForRange(s.start,s.end,s.episode,true);
+      return idx.length ? [{label:`Episode ${s.episode} · skill ${s.id}`,indices:idx}] : [];
+    }
+    const ep=$('episode').value;
+    if(ep!=='all') {
+      const id=Number(ep), [a,b]=episodeRange(id), idx=coordinatesForRange(a,b,id,true);
+      return idx.length ? [{label:`Episode ${id}`,indices:idx}] : [];
+    }
+    const stride=Math.max(1,Math.ceil((state.n+1)*3/20000)); state.overviewStride=stride;
+    const segments=[];
+    state.episodeIds.forEach(id=>{
+      const [a,b]=episodeRange(id), indices=[];
+      let first=a;
+      if(first>0 && first<state.n && state.episodes[first]!==state.episodes[first-1]) first++;
+      for(let i=first;i<=b;i++) if(i===first || i===b || i%stride===0) indices.push(i);
+      if(indices.length) segments.push({label:`Episode ${id}`,indices});
+    });
+    return segments;
+  }
+  function pointAt(index, offset) { return state.positions[index].slice(offset,offset+3).map(v=>v*100); }
+  function traceData(segments, projection) {
+    const dims=projection==='xy'?[0,1]:[0,2];
+    const traces=[], heightTraces=[];
+    for(const name of ['TCP','cup','bowl']) {
+      const offset={TCP:0,cup:3,bowl:6}[name], xs=[],ys=[],zs=[], hs=[], steps=[];
+      for(const segment of segments) {
+        if(xs.length){xs.push(null);ys.push(null);zs.push(null);hs.push(null);steps.push(null)}
+        const baseline=pointAt(segment.indices[0],offset)[2];
+        segment.indices.forEach((idx,j)=>{
+          const p=pointAt(idx,offset), localStep=segment.indices.length>1 ? idx-segment.indices[0] : 0;
+          if(projection==='3d'){xs.push(p[0]);ys.push(p[1]);zs.push(p[2]);}
+          else {xs.push(p[dims[0]]);ys.push(p[dims[1]]);}
+          hs.push(p[2]-baseline); steps.push(localStep);
+        });
+      }
+      if(projection==='3d') traces.push({type:'scatter3d',mode:'lines',name,x:xs,y:ys,z:zs,line:{color:COLORS[name],width:4},connectgaps:false});
+      else traces.push({type:'scatter',mode:'lines',name,x:xs,y:ys,line:{color:COLORS[name],width:2},connectgaps:false});
+      heightTraces.push({type:'scatter',mode:'lines',name,x:steps,y:hs,line:{color:COLORS[name],width:2},connectgaps:false});
+    }
+    return {traces,heightTraces};
+  }
+  async function renderCharts() {
+    if(!state.positions || !window.Plotly) return;
+    const segments=makeSegments(), projection=$('projection').value, {traces,heightTraces}=traceData(segments,projection);
+    const overview=state.selectedSkill===null && $('episode').value==='all';
+    const label=overview ? `All episodes overview · rendering stride ${state.overviewStride} control(s)` : state.selectedSkill!==null ? `Selected skill ${state.selectedSkill}` : `Episode ${$('episode').value}`;
+    const common={margin:{l:55,r:20,t:55,b:50},legend:{orientation:'h',y:-.18},paper_bgcolor:'white',plot_bgcolor:'white'};
+    const pathLayout=projection==='3d' ? {...common,title:label+' · root-frame position (cm)',scene:{xaxis:{title:'X (cm)'},yaxis:{title:'Y (cm)'},zaxis:{title:'Z (cm)'},aspectmode:'data'}} : {...common,title:label+' · root-frame projection (cm)',xaxis:{title:(projection==='xy'?'X':'X')+' (cm)'},yaxis:{title:(projection==='xy'?'Y':'Z')+' (cm)',scaleanchor:'x',scaleratio:1}};
+    await Promise.all([
+      Plotly.react('pathChart',traces,pathLayout,{responsive:true,displaylogo:false}),
+      Plotly.react('heightChart',heightTraces,{...common,title:label+' · relative Z over control steps',xaxis:{title:'Control steps from first displayed point'},yaxis:{title:'Relative Z (cm)'},hovermode:'x unified'},{responsive:true,displaylogo:false})
+    ]);
+    let description=`${label}. `;
+    if(state.selectedSkill!==null) {
+      const s=state.skills.find(x=>x.id===state.selectedSkill);
+      if(s) description+=`Skill ${s.id}: episode ${s.episode}, ${s.kind}, controls ${s.start}–${s.end} (${Math.max(0,s.end-s.start)} transitions), status ${s.status}.`;
+    } else if(overview) description+=`Rendered ${segments.reduce((n,s)=>n+s.indices.length,0)} positions across ${segments.length} episode segments; no paths are joined across resets.`;
+    else description+=`Full episode positions shown; no paths are joined across resets.`;
+    $('details').textContent=description;
+  }
+  function renderAll() { renderTable(); renderCharts().catch(e=>{$('error').textContent=`Plot error: ${e.message||e}`;}); }
+
+  window.trajectoryViewer = {state, loadArm, render:renderAll, renderCharts, selectSkill, filteredSkills, makeSegments};
+
+  $('arm').addEventListener('change',e=>loadArm(e.target.value));
+  $('episode').addEventListener('change',()=>{state.selectedSkill=null;state.page=0;renderAll()});
+  $('kind').addEventListener('change',()=>{state.page=0;renderTable()});
+  $('statusFilter').addEventListener('change',()=>{state.page=0;renderTable()});
+  $('projection').addEventListener('change',renderCharts);
+  $('prevPage').addEventListener('click',()=>{state.page=Math.max(0,state.page-1);renderTable()});
+  $('nextPage').addEventListener('click',()=>{state.page++;renderTable()});
+  $('clearSelection').addEventListener('click',()=>{state.selectedSkill=null;renderAll()});
+  $('goSkill').addEventListener('click',()=>{
+    const id=Number($('skillId').value), skill=state.skills.find(s=>s.id===id);
+    if(!Number.isFinite(id)||!skill){$('error').textContent='Enter a skill ID present in the loaded arm.';return;}
+    $('error').textContent='';selectSkill(skill);
+  });
+  loadArm($('arm').value);
+})();
+</script>
+</body>
+</html>

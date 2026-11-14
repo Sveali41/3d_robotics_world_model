@@ -1,0 +1,59 @@
+--- a/src/physx/physx_system.cpp
++++ b/src/physx/physx_system.cpp
+@@ -759,6 +759,11 @@
+                             mCudaRigidDynamicHandle.ptr, mCudaRigidDynamicIndexBuffer.ptr,
+                             indices.ptr, mCudaRigidDynamicOffsetBuffer.ptr, indices.shape.at(0),
+                             mCudaStream);
++  // PxGpuActorPair retains srcIndex from the full body buffer. Keep the data
++  // globally indexed instead of the packed data produced by the sparse gather.
++  body_data_sapien_to_physx(mCudaRigidDynamicScratch.ptr, mCudaRigidDynamicHandle.ptr,
++                            mCudaRigidDynamicOffsetBuffer.ptr,
++                            mCudaRigidDynamicIndexBuffer.shape.at(0), mCudaStream);
+   mCudaEventRecord.record(mCudaStream);
+   mPxScene->applyActorData(mCudaRigidDynamicScratch.ptr,
+                            (PxGpuActorPair *)mCudaRigidDynamicIndexScratch.ptr,
+@@ -863,7 +868,7 @@
+   ensureCudaDevice();
+ 
+   mCudaEventRecord.record(mCudaStream);
+-  mPxScene->applyArticulationData(mCudaQposHandle.ptr, mCudaArticulationIndexBuffer.ptr,
++  mPxScene->applyArticulationData(mCudaQposHandle.ptr, indices.ptr,
+                                   PxArticulationGpuDataType::eJOINT_POSITION, indices.shape.at(0),
+                                   mCudaEventRecord.event, mCudaEventWait.event);
+   mCudaEventWait.wait(mCudaStream);
+@@ -886,7 +891,7 @@
+   ensureCudaDevice();
+ 
+   mCudaEventRecord.record(mCudaStream);
+-  mPxScene->applyArticulationData(mCudaQvelHandle.ptr, mCudaArticulationIndexBuffer.ptr,
++  mPxScene->applyArticulationData(mCudaQvelHandle.ptr, indices.ptr,
+                                   PxArticulationGpuDataType::eJOINT_VELOCITY, indices.shape.at(0),
+                                   mCudaEventRecord.event, mCudaEventWait.event);
+   mCudaEventWait.wait(mCudaStream);
+@@ -909,7 +914,7 @@
+   ensureCudaDevice();
+ 
+   mCudaEventRecord.record(mCudaStream);
+-  mPxScene->applyArticulationData(mCudaQfHandle.ptr, mCudaArticulationIndexBuffer.ptr,
++  mPxScene->applyArticulationData(mCudaQfHandle.ptr, indices.ptr,
+                                   PxArticulationGpuDataType::eJOINT_FORCE, indices.shape.at(0),
+                                   mCudaEventRecord.event, mCudaEventWait.event);
+   mCudaEventWait.wait(mCudaStream);
+@@ -932,7 +937,7 @@
+   ensureCudaDevice();
+ 
+   mCudaEventRecord.record(mCudaStream);
+-  mPxScene->applyArticulationData(mCudaQTargetPosHandle.ptr, mCudaArticulationIndexBuffer.ptr,
++  mPxScene->applyArticulationData(mCudaQTargetPosHandle.ptr, indices.ptr,
+                                   PxArticulationGpuDataType::eJOINT_TARGET_POSITION,
+                                   indices.shape.at(0), mCudaEventRecord.event,
+                                   mCudaEventWait.event);
+@@ -956,7 +961,7 @@
+   ensureCudaDevice();
+ 
+   mCudaEventRecord.record(mCudaStream);
+-  mPxScene->applyArticulationData(mCudaQTargetVelHandle.ptr, mCudaArticulationIndexBuffer.ptr,
++  mPxScene->applyArticulationData(mCudaQTargetVelHandle.ptr, indices.ptr,
+                                   PxArticulationGpuDataType::eJOINT_TARGET_VELOCITY,
+                                   indices.shape.at(0), mCudaEventRecord.event,
+                                   mCudaEventWait.event);

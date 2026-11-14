@@ -1,4 +1,5 @@
 """Native-free checks of the collision planner's safety boundaries."""
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -215,3 +216,195 @@ def test_plan_api_classifies_only_known_topp_failure(monkeypatch, message):
         assert "no motion was executed" in error.value.detail
     else:
         assert error.value is failure
+
+
+def _diagnostic_planner(monkeypatch, inverse_kinematics, *, collision=None, path=None):
+    planner = CabinetMotionPlanner.__new__(CabinetMotionPlanner)
+    planner.env = SimpleNamespace(cabinet_items=[], control_freq=20)
+    planner.robot = SimpleNamespace(get_qpos=lambda: np.zeros((1, 9)),
+        get_qlimits=lambda: np.tile([-3., 3.], (1, 9, 1)))
+    planner.pindices = np.arange(9)
+    planner.controlled = np.arange(7)
+    planner.root_link = SimpleNamespace(pose=pose())
+    planner.links = []
+    planner.kin = SimpleNamespace(end_link_idx=0, qmask=np.ones(9), pmodel=SimpleNamespace(
+        compute_forward_kinematics=lambda _: None,
+        get_link_pose=lambda _: pose(), compute_inverse_kinematics=inverse_kinematics))
+    planner._planning_attachment = lambda: None
+    planner._pose = lambda value: value
+    planner.snapshot_scene = lambda: {}
+    planner._scene_geometry = lambda: None
+    planner._check = collision or (lambda _: [])
+    planner.obstacles = []
+    planner.support_contacts = {}
+    if path is not None:
+        planner._make_planner = lambda: SimpleNamespace(
+            move_group_joint_indices=np.arange(9), set_base_pose=lambda _: None,
+            plan_qpos_to_qpos=path)
+    monkeypatch.setattr('domain.robocasa.motion_planning._native_modules',
+        lambda: (SimpleNamespace(__version__="test"), SimpleNamespace(), SimpleNamespace(Pose=pose)))
+    return planner
+
+
+def test_no_collision_free_ik_reports_each_seed_rejection_as_json_safe(monkeypatch):
+    ik_calls = []
+
+    def inverse_kinematics(*args, **kwargs):
+        index = len(ik_calls)
+        ik_calls.append((args, kwargs))
+        q = np.zeros(9)
+        if index == 0:
+            return q, False, None
+        if index == 1:
+            q[0] = np.nan
+        elif index == 2:
+            q[7] = 4.
+        elif index == 3:
+            q[0] = 1.
+        else:
+            q[0] = 2.
+        return q, True, None
+
+    contacts = [dict(first="panda_link3", second="cabinet/door/0", kind="environment")]
+    planner = _diagnostic_planner(monkeypatch, inverse_kinematics,
+        collision=lambda q: contacts if q[0] == 2. else [])
+    fk_state = {"q": np.zeros(9)}
+    planner.kin.pmodel.compute_forward_kinematics = lambda q: fk_state.update(q=np.asarray(q).copy())
+    planner.kin.pmodel.get_link_pose = lambda _: pose(p=(.01, 0., 0.) if fk_state["q"][0] == 1. else (0., 0., 0.))
+    with pytest.raises(MotionPlanningError) as error:
+        planner.plan_to_pose([0., 0., 0.], [1., 0., 0., 0.], seed=9)
+
+    assert error.value.status == "no_collision_free_ik"
+    assert error.value.detail["message"] == "No valid collision-free solution in 16 fixed-orientation IK starts"
+    diagnostics = error.value.detail["ik_diagnostics"]
+    assert diagnostics["candidate_count"] == len(diagnostics["candidates"]) == len(ik_calls) == 16
+    assert diagnostics["counts"] == dict(solver_failure=1, nonfinite_solution=1,
+        joint_limit_violation=1, fk_mismatch=1, collision=12, accepted=0)
+    assert [candidate["reason"] for candidate in diagnostics["candidates"][:5]] == [
+        "solver_failure", "nonfinite_solution", "joint_limit_violation", "fk_mismatch", "collision"]
+    assert diagnostics["candidates"][0]["initial_seed_source"] == "current_qpos"
+    assert diagnostics["candidates"][1]["initial_seed_source"] == "random_uniform"
+    assert diagnostics["candidates"][1]["solution_qpos_rad"][0] is None
+    assert diagnostics["candidates"][1]["nonfinite_solution_indices"] == [0]
+    assert diagnostics["candidates"][2]["joint_limit_violations"][0]["joint_index"] == 7
+    assert diagnostics["candidates"][4]["collision_contacts"] == contacts
+    json.dumps(error.value.detail, allow_nan=False)
+
+    rng = np.random.default_rng(9)
+    expected_starts = [np.zeros(9)]
+    for _ in range(15):
+        start = np.zeros(9)
+        start[:7] = rng.uniform(-3., 3., size=7)
+        expected_starts.append(start)
+    for index, ((args, kwargs), expected) in enumerate(zip(ik_calls, expected_starts)):
+        assert len(args) == 2
+        assert args[0] == 0
+        np.testing.assert_array_equal(kwargs["initial_qpos"], expected)
+        np.testing.assert_array_equal(kwargs["active_qmask"], np.ones(9))
+        assert kwargs["max_iterations"] == 1000
+        assert diagnostics["candidates"][index]["initial_seed_qpos_rad"] == expected.tolist()
+
+
+def test_successful_plan_keeps_nearest_accepted_ik_and_records_diagnostics(monkeypatch):
+    ik_calls, plan_calls = [], []
+
+    def inverse_kinematics(*args, **kwargs):
+        index = len(ik_calls)
+        ik_calls.append((args, kwargs))
+        q = np.zeros(9)
+        q[0] = 2. if index == 0 else .2 if index == 1 else .5
+        return q, True, None
+
+    def plan_qpos_to_qpos(**kwargs):
+        plan_calls.append(kwargs)
+        target = kwargs["goal_qposes"][0]
+        return dict(status="Success", position=np.stack([np.zeros(9), target]),
+                    time=np.array([0., .1]))
+
+    planner = _diagnostic_planner(monkeypatch, inverse_kinematics, path=plan_qpos_to_qpos)
+    planner.mplib = SimpleNamespace(__version__="test")
+    result = planner.plan_to_pose([0., 0., 0.], [1., 0., 0., 0.], seed=9)
+
+    assert len(ik_calls) == 16
+    np.testing.assert_allclose(plan_calls[0]["goal_qposes"][0], [ .2, 0., 0., 0., 0., 0., 0., 0., 0.])
+    np.testing.assert_allclose(result.position[0], np.zeros(9))
+    np.testing.assert_allclose(result.position[-1], plan_calls[0]["goal_qposes"][0])
+    diagnostics = result.metadata["ik_diagnostics"]
+    assert diagnostics["counts"]["accepted"] == 16
+    assert diagnostics["candidates"][0]["solution_qpos_rad"][0] == 2.
+    assert all(item["reason"] == "accepted" for item in diagnostics["candidates"])
+    json.dumps(result.metadata, allow_nan=False)
+
+
+@pytest.mark.parametrize("target_x,expected", [(.6, True), (3., False)])
+def test_bounded_pose_ik_uses_redundancy_and_rejects_unreachable_goal(target_x, expected):
+    planner = CabinetMotionPlanner.__new__(CabinetMotionPlanner)
+    planner.controlled = np.arange(7)
+    model = SimpleNamespace()
+    model.compute_forward_kinematics = lambda q: setattr(model, 'q', np.asarray(q).copy())
+    def fk(_):
+        q = model.q
+        return SimpleNamespace(p=np.asarray([q[0]+q[6], q[1], q[2]], dtype=np.float32),
+            q=np.roll(Rotation.from_rotvec(q[3:6]).as_quat(), 1))
+    model.get_link_pose = fk
+    planner.kin = SimpleNamespace(pmodel=model, end_link_idx=0)
+    start = np.array([0., 0., 0., 0., 0., 0., .39, .03, .03])
+    limits = np.tile([-1., 1.], (9, 1)); limits[6] = [0., .4]
+    goal = SimpleNamespace(p=np.array([target_x, 0., 0.]), q=np.array([1., 0., 0., 0.]))
+    q, success, detail = planner._bounded_pose_ik(goal, start, limits)
+    assert bool(success) == expected
+    assert np.all(q >= limits[:, 0]) and np.all(q <= limits[:, 1])
+    np.testing.assert_array_equal(q[7:], start[7:])
+    assert detail['evaluations'] <= 200
+    if expected:
+        assert q[0] > .19
+        np.testing.assert_allclose(q[0]+q[6], target_x, atol=.001)
+
+
+@pytest.mark.parametrize('samples', [0, 1])
+def test_short_bounded_cartesian_timing_keeps_endpoint_and_physical_duration(monkeypatch, samples):
+    planner = _diagnostic_planner(monkeypatch, lambda *a, **kw: pytest.fail('Reference IK was used'))
+    model = planner.kin.pmodel
+    model.compute_forward_kinematics = lambda q: setattr(model, 'q', np.asarray(q).copy())
+    model.get_link_pose = lambda _: pose(p=model.q[:3])
+    def bounded(goal, start, limits):
+        q = start.copy(); q[:3] = goal.p
+        return q, True, {}
+    planner._bounded_pose_ik = bounded
+    planner._make_planner = lambda: SimpleNamespace(
+        move_group_joint_indices=np.arange(9), set_base_pose=lambda _: None,
+        TOPP=lambda waypoints, dt: (np.zeros(samples), np.zeros((samples, 9)), None, None, .02))
+    result = planner.plan_to_pose([.0005, 0., 0.], [1., 0., 0., 0.],
+                                  method='bounded_ik', maintain_orientation=True)
+    np.testing.assert_allclose(result.time, [0., .05])
+    assert result.position[-1, 0] == .0005
+    assert result.metadata['source_duration_s'] == .02
+    assert result.metadata['scheduled_duration_s'] == .05
+
+
+def test_opt_in_rrt_densifies_before_topp_and_retains_exact_collision_gate(monkeypatch):
+    calls, timed = [], []
+    goal = np.zeros(9); goal[0] = .2
+    planner = _diagnostic_planner(monkeypatch, lambda *a, **kw: (goal.copy(), True, None))
+    def raw_plan(start, goals, **kwargs):
+        calls.append(kwargs)
+        return "Exact solution", np.stack([start, goals[0]])
+    def timing(points, dt):
+        timed.append(points.copy())
+        return np.array([0., .1]), points[[0, -1]], None, None, .1
+    planner._make_planner = lambda: SimpleNamespace(
+        robot=SimpleNamespace(set_qpos=lambda *_: None),
+        planning_world=SimpleNamespace(set_use_point_cloud=lambda _: None,
+                                       set_use_attach=lambda _: None),
+        planner=SimpleNamespace(plan=raw_plan), move_group_joint_indices=np.arange(9),
+        set_base_pose=lambda _: None, TOPP=timing)
+    result = planner.plan_to_pose([0., 0., 0.], [1., 0., 0., 0.], densify_rrt_path=True)
+    assert np.max(np.abs(np.diff(timed[0], axis=0))) <= .02500001
+    np.testing.assert_array_equal(timed[0][[0, -1]], np.stack([np.zeros(9), goal]))
+    assert calls[0] == dict(range=.1, time=3., fixed_joints=set(),
+        planner_name="RRTConnect", no_simplification=False, verbose=False)
+    assert result.metadata["rrt_pre_TOPP_max_joint_step_rad"] == .025
+    planner._check = lambda q: ([dict(kind="synthetic_timed_collision")]
+                                if .09 < q[0] < .11 else [])
+    with pytest.raises(MotionPlanningError, match="path_collision"):
+        planner.plan_to_pose([0., 0., 0.], [1., 0., 0., 0.], densify_rrt_path=True)

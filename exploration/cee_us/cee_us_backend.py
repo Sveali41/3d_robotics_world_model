@@ -107,7 +107,8 @@ class CEEUSBackend:
             model_params=dict(n=ensemble_size, hidden_dim=hidden_dim, num_layers=2,
                               num_message_passing=1, layer_norm=True),
             train_params=dict(epochs=1, batch_size=batch_size, learning_rate=1e-5,
-                              weight_decay=.001, bootstrapped=False),
+                              weight_decay=.001, bootstrapped=False,
+                              runtime_optimizations=self.runtime_optimizations),
         )
         if not attach_icem and (execution != 'reference' or action_projection is not None or object_heuristic is not None):
             raise ValueError('Model-only backend requires reference execution without cabinet heuristics or projection')
@@ -311,9 +312,18 @@ class CEEUSBackend:
                 raise FloatingPointError(f'Nonfinite CEE-US normalizer: {name}')
         self.model.epochs = int(epochs)
         self._fit_updates = 0
+        self.model.profile_timings = self.profile_timings
         try:
             metrics = timed('model_training_s', lambda: self.model.train(buffer, maybe_update_normalizer=False))
+        except torch.cuda.OutOfMemoryError as exc:
+            if self.runtime_optimizations:
+                raise RuntimeError(
+                    'CEE-US device-resident training ran out of memory; turn off '
+                    'runtime_optimizations to use reference minibatch transfers.'
+                ) from exc
+            raise
         finally:
+            self.model.profile_timings = None
             if self.prediction_accelerator is not None:
                 self.prediction_accelerator.invalidate()
         loss = float(metrics['epoch_train_loss'])

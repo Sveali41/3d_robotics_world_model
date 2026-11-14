@@ -179,6 +179,16 @@ def _angle(q, r):
         q / np.linalg.norm(q), r / np.linalg.norm(r))), 0., 1.))))
 
 
+def _finite_list(values):
+    """Convert numeric diagnostics to JSON-safe values without NaN or infinity."""
+    return [float(value) if np.isfinite(value) else None for value in np.asarray(values).reshape(-1)]
+
+
+def _finite_float(value):
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
 def _validate_goal(position, quaternion):
     try:
         position = np.asarray(position, dtype=float)
@@ -193,6 +203,20 @@ def _validate_goal(position, quaternion):
         raise MotionPlanningError("invalid_goal", "Quaternion must be nonzero")
     quaternion = quaternion / scale
     return position.copy(), quaternion / np.linalg.norm(quaternion)
+
+
+def _lower_support_contact_allowed(contacts, world_to_root, surface_z):
+    """Allow only shallow downward payload contacts on an explicit shelf top."""
+    if not contacts:
+        return False
+    for contact in contacts:
+        normal = world_to_root[:3, :3] @ np.asarray(contact.normal)
+        position = world_to_root @ np.r_[np.asarray(contact.pos), 1.]
+        depth = float(contact.penetration_depth)
+        if (not np.isfinite(np.r_[normal, position, depth]).all() or normal[2] > -.99
+                or abs(position[2] - surface_z) > .002 or not 0 <= depth <= .001 + 1e-9):
+            return False
+    return True
 
 
 def _native_modules():
@@ -320,7 +344,11 @@ class CabinetMotionPlanner:
     def _grasp_contacts(self):
         agent = self.env.agent
         result = {}
+        binding = getattr(self.env, "_grasp_binding", None)
         for actor in self.env.cabinet_items:
+            if binding is not None and binding.bound_object_id == actor.name:
+                result[actor.name] = True
+                continue
             grasped = bool(_array(agent.is_grasping(actor)).reshape(-1)[0])
             if not grasped:
                 left = getattr(agent, "finger1pad_link", None) or agent.finger1_link
@@ -364,7 +392,9 @@ class CabinetMotionPlanner:
         actual = self.attachment_state()
         contacts = self._grasp_contacts()
         if expected is None:
-            if actual is not None or any(contacts.values()):
+            permitted_open_contact = (plan.metadata.get("allow_open_grasp_contact", False)
+                                      and self.gripper_command >= 0)
+            if actual is not None or (any(contacts.values()) and not permitted_open_contact):
                 raise MotionPlanningError("unexpected_attachment", "Grasp/contact changed; confirm the grasp and replan")
             return None
         if actual is None or actual["name"] != expected["name"] or not contacts[expected["name"]]:
@@ -436,6 +466,20 @@ class CabinetMotionPlanner:
                     geom=self._geometry(shape), groups=shape.get_collision_groups(),
                     pose=self._shape_pose(shape, self._pose(actor.pose) * shape.local_pose)))
         self.payload_shapes, self.support_contacts = [], {}
+        self.lower_support_obstacles = set()
+        surface_z = getattr(self, "support_surface_root_z", None)
+        if surface_z is not None:
+            for obstacle in self.obstacles:
+                if obstacle["actor"] != "cabinet/frame" or self._kind(obstacle["shape"]) != "Box":
+                    continue
+                relative = self.root.inv() * obstacle["pose"]
+                rotation = _rotation(relative).as_matrix()
+                top_z = relative.p[2] + float(obstacle["shape"].half_size[2])
+                if np.allclose(np.abs(rotation[:, 2]), [0., 0., 1.], atol=1e-6) and abs(top_z - surface_z) < 1e-4:
+                    self.lower_support_obstacles.add(obstacle["name"])
+                    self.support_contacts[obstacle["name"]] = .001
+            if len(self.lower_support_obstacles) != 1:
+                raise MotionPlanningError("invalid_support_surface", "Expected exactly one horizontal frame box at the requested shelf top")
         if self.attachment is not None:
             actor = next(actor for actor in self.env.cabinet_items if actor.name == self.attachment["name"])
             relative = self.attachment["tcp_to_object_pose"]
@@ -460,6 +504,50 @@ class CabinetMotionPlanner:
                             max(c.penetration_depth for c in contacts)+1e-6)
             if not self.payload_shapes:
                 raise MotionPlanningError("unsupported", "Payload has no collision shapes")
+
+    def placement_bounds(self, attachment, tcp_quaternion):
+        """Payload collision AABB relative to a zero-position TCP in root axes."""
+        actor = next(actor for actor in self.env.cabinet_items if actor.name == attachment["name"])
+        relative = attachment["tcp_to_object_pose"]
+        payload = self.sapien.Pose(q=tcp_quaternion) * self.sapien.Pose(relative[:3], relative[3:])
+        lower, upper = np.full(3, np.inf), np.full(3, -np.inf)
+        for shape in actor._bodies[0].get_collision_shapes():
+            pose = self._shape_pose(shape, payload * shape.local_pose)
+            for axis, vector in enumerate(np.eye(3)):
+                # Plane normals are +/- root axes; reuse exact shape support.
+                rotation = Rotation.align_vectors([vector], [[0., 0., 1.]])[0]
+                plane = self.sapien.Pose(q=np.roll(rotation.as_quat(), 1))
+                lower[axis] = min(lower[axis], _plane_min_distance(shape, pose, plane, self._kind(shape)))
+                rotation = Rotation.align_vectors([-vector], [[0., 0., 1.]])[0]
+                plane = self.sapien.Pose(q=np.roll(rotation.as_quat(), 1))
+                upper[axis] = max(upper[axis], -_plane_min_distance(shape, pose, plane, self._kind(shape)))
+        bounds = np.array([lower, upper])
+        if not np.isfinite(bounds).all() or np.any(lower > upper):
+            raise MotionPlanningError("invalid_goal", "Placement requires finite payload collision bounds")
+        return bounds
+
+    def support_descent_step(self, surface_z, *, max_step=.005):
+        """Shorten only the last support-seeking step using live collision geometry."""
+        if not np.isfinite(surface_z) or not np.isfinite(max_step) or max_step <= 0:
+            raise MotionPlanningError("invalid_support_surface", "Finite support height and positive step required")
+        self.attachment = self._planning_attachment()
+        if self.attachment is None:
+            raise MotionPlanningError("missing_grasp", "Support descent requires a confirmed physical payload")
+        self.support_surface_root_z = float(surface_z)
+        self._scene_geometry()
+        actor = next(actor for actor in self.env.cabinet_items if actor.name == self.attachment["name"])
+        gap = np.inf
+        for item in self.payload_shapes:
+            obj = self._object(item["geom"], self._shape_pose(item["shape"],
+                               self._pose(actor.pose) * item["local"]))
+            for obstacle in self.obstacles:
+                if obstacle["name"] in self.lower_support_obstacles:
+                    distance = self.fcl.distance(obj, self._object(obstacle["geom"], obstacle["pose"]),
+                                                self.fcl.DistanceRequest(enable_signed_distance=True))
+                    gap = min(gap, float(distance.min_distance))
+        if not np.isfinite(gap):
+            raise MotionPlanningError("invalid_support_surface", "No finite payload-to-shelf distance")
+        return min(float(max_step), max(.0005, gap + .0005))
 
     def _make_planner(self):
         from mani_skill.agents.robots.panda.panda import Panda
@@ -566,7 +654,14 @@ class CabinetMotionPlanner:
                         collision = result.is_collision()
                         if collision and obstacle["name"] in self.support_contacts:
                             cs = result.get_contacts()
-                            collision = not cs or max(c.penetration_depth for c in cs) > self.support_contacts[obstacle["name"]]
+                            if obstacle["name"] in self.lower_support_obstacles:
+                                matrix = np.eye(4)
+                                matrix[:3, :3] = _rotation(self.root).as_matrix()
+                                matrix[:3, 3] = self.root.p
+                                collision = not _lower_support_contact_allowed(cs, np.linalg.inv(matrix),
+                                                                              self.support_surface_root_z)
+                            else:
+                                collision = not cs or max(c.penetration_depth for c in cs) > self.support_contacts[obstacle["name"]]
                     if collision:
                         contacts.append(dict(first=item["name"], second=obstacle["name"], kind="payload_environment"))
                 for link, robot_obj, _ in robot:
@@ -577,9 +672,77 @@ class CabinetMotionPlanner:
                         contacts.append(dict(first=item["name"], second=link["link"], kind="payload_self"))
         return contacts
 
+    def _fixed_orientation_path(self, positions, quaternion, limits):
+        """Project a candidate's TCP positions with the upstream IK, then audit it."""
+        projected = [np.asarray(positions[0]).copy()]
+        points = list(_interpolate(positions, max_step=.025))
+        for index, point in enumerate(points[1:], 1):
+            if index == len(points) - 1:
+                projected.append(point.copy())
+                break
+            self.kin.pmodel.compute_forward_kinematics(point[self.pindices])
+            position = np.asarray(self.kin.pmodel.get_link_pose(self.kin.end_link_idx).p).copy()
+            seed = point[self.pindices].copy()
+            q, success, _ = self.kin.pmodel.compute_inverse_kinematics(
+                self.kin.end_link_idx, self.sapien.Pose(position, quaternion), initial_qpos=seed,
+                active_qmask=_array(self.kin.qmask), max_iterations=1000)
+            q = np.asarray(q).copy()
+            if not success or not np.isfinite(q).all():
+                raise MotionPlanningError("orientation_projection_failed", "Fixed-orientation IK failed along candidate path")
+            for joint in self.controlled:
+                if self.pindices[joint] >= 7:
+                    continue
+                lo = int(np.ceil((limits[joint, 0] - q[joint]) / (2*np.pi)))
+                hi = int(np.floor((limits[joint, 1] - q[joint]) / (2*np.pi)))
+                if lo <= hi:
+                    q[joint] += 2*np.pi*int(np.clip(np.rint((seed[joint]-q[joint])/(2*np.pi)), lo, hi))
+            if np.any(q < limits[:, 0]-1e-6) or np.any(q > limits[:, 1]+1e-6):
+                raise MotionPlanningError("orientation_projection_failed", "Projected path exceeds joint limits")
+            self.kin.pmodel.compute_forward_kinematics(q)
+            actual = self.kin.pmodel.get_link_pose(self.kin.end_link_idx)
+            if np.linalg.norm(actual.p-position) > .001 or _angle(actual.q, quaternion) > .1:
+                raise MotionPlanningError("orientation_projection_failed", "Projected IK failed FK verification")
+            full = point.copy()
+            full[self.pindices] = q
+            if np.max(np.abs(full-projected[-1])) > 1e-8:
+                projected.append(full)
+        return np.asarray(projected)
+
+    def _bounded_pose_ik(self, goal, start, limits):
+        """Solve a nearby pose with explicit bounds on all controlled joints."""
+        from scipy.optimize import least_squares
+
+        target_rotation = _rotation(goal)
+        indices = self.controlled
+        def residual(values):
+            q = start.copy()
+            q[indices] = values
+            self.kin.pmodel.compute_forward_kinematics(q)
+            actual = self.kin.pmodel.get_link_pose(self.kin.end_link_idx)
+            return np.r_[np.asarray(actual.p) - goal.p,
+                         (target_rotation.inv() * _rotation(actual)).as_rotvec()]
+
+        # Native FK is float32; default finite differences are below its resolution.
+        fit = least_squares(residual, start[indices],
+            bounds=(limits[indices, 0], limits[indices, 1]), diff_step=1e-4,
+            xtol=1e-10, ftol=1e-10, gtol=1e-10, max_nfev=200)
+        q = start.copy()
+        q[indices] = fit.x
+        error = residual(fit.x)
+        success = np.linalg.norm(error[:3]) <= .001 and np.linalg.norm(error[3:]) <= np.radians(.1)
+        return q, success, dict(optimizer_status=int(fit.status), evaluations=int(fit.nfev))
+
     def plan_to_pose(self, position_root3, quaternion_wxyz4, *, planning_time_s=3.0,
-                     seed=0, allowed_contact_objects=()):
+                     seed=0, allowed_contact_objects=(), support_surface_root_z=None,
+                     maintain_orientation=False, method="rrt_connect", densify_rrt_path=False):
         position, quaternion = _validate_goal(position_root3, quaternion_wxyz4)
+        if method not in {"rrt_connect", "bounded_ik"}:
+            raise MotionPlanningError("invalid_goal", "Unknown pose planning method")
+        if support_surface_root_z is not None and not np.isfinite(support_surface_root_z):
+            raise MotionPlanningError("invalid_support_surface", "Support height must be finite")
+        self.support_surface_root_z = support_surface_root_z
+        if not isinstance(maintain_orientation, bool):
+            raise MotionPlanningError("invalid_goal", "maintain_orientation must be boolean")
         if not np.isfinite(planning_time_s) or planning_time_s <= 0:
             raise MotionPlanningError("invalid_goal", "planning_time_s must be positive and finite")
         self.allowed_contacts = tuple(allowed_contact_objects)
@@ -606,18 +769,36 @@ class CabinetMotionPlanner:
         if start_contacts:
             raise MotionPlanningError("path_collision", {"start_contacts": start_contacts})
         rng = np.random.default_rng(seed)
-        starts = [q0.copy()]
-        for _ in range(15):
+        starts = [q0.copy()] if method == "rrt_connect" else []
+        for _ in range(15 if method == "rrt_connect" else 0):
             start = q0.copy()
             start[self.controlled] = rng.uniform(limits[self.controlled, 0], limits[self.controlled, 1])
             starts.append(start)
         candidates = []
+        ik_diagnostics = dict(candidate_count=len(starts),
+            counts=dict(solver_failure=0, nonfinite_solution=0, joint_limit_violation=0,
+                        fk_mismatch=0, collision=0, accepted=0),
+            candidates=[])
         goal = self.sapien.Pose(position, quaternion)
-        for start in starts:
+        for candidate_index, start in enumerate(starts):
             q, success, _ = self.kin.pmodel.compute_inverse_kinematics(self.kin.end_link_idx, goal,
                 initial_qpos=start, active_qmask=_array(self.kin.qmask), max_iterations=1000)
             q = np.asarray(q).copy()
-            if not success or not np.all(np.isfinite(q)):
+            diagnostic = dict(candidate_index=candidate_index,
+                initial_seed_source="current_qpos" if candidate_index == 0 else "random_uniform",
+                random_draw_index=None if candidate_index == 0 else candidate_index - 1,
+                initial_seed_qpos_rad=_finite_list(start))
+            if not success:
+                diagnostic.update(status="rejected", reason="solver_failure")
+                ik_diagnostics["counts"]["solver_failure"] += 1
+                ik_diagnostics["candidates"].append(diagnostic)
+                continue
+            if not np.all(np.isfinite(q)):
+                diagnostic.update(status="rejected", reason="nonfinite_solution",
+                    solution_qpos_rad=_finite_list(q),
+                    nonfinite_solution_indices=np.flatnonzero(~np.isfinite(q)).astype(int).tolist())
+                ik_diagnostics["counts"]["nonfinite_solution"] += 1
+                ik_diagnostics["candidates"].append(diagnostic)
                 continue
             for j in self.controlled:
                 # Only the seven Panda revolute joints have 2pi equivalents.
@@ -628,15 +809,48 @@ class CabinetMotionPlanner:
                 if lo <= hi:
                     k = int(np.clip(np.rint((q0[j]-q[j])/(2*np.pi)), lo, hi))
                     q[j] += 2*np.pi*k
-            if np.any(q < limits[:, 0]-1e-6) or np.any(q > limits[:, 1]+1e-6):
+            violations = np.flatnonzero((q < limits[:, 0]-1e-6) | (q > limits[:, 1]+1e-6))
+            if len(violations):
+                diagnostic.update(status="rejected", reason="joint_limit_violation",
+                    solution_qpos_rad=_finite_list(q),
+                    joint_limit_violations=[dict(joint_index=int(j), value_rad=float(q[j]),
+                        lower_rad=float(limits[j, 0]), upper_rad=float(limits[j, 1]))
+                        for j in violations])
+                ik_diagnostics["counts"]["joint_limit_violation"] += 1
+                ik_diagnostics["candidates"].append(diagnostic)
                 continue
             self.kin.pmodel.compute_forward_kinematics(q)
             fk = self.kin.pmodel.get_link_pose(self.kin.end_link_idx)
-            if np.linalg.norm(fk.p-position) <= .001 and _angle(fk.q, quaternion) <= .1 and not self._check(q):
-                candidates.append(q)
+            fk_position_error = float(np.linalg.norm(fk.p-position))
+            diagnostic.update(solution_qpos_rad=_finite_list(q),
+                fk_position_error_m=_finite_float(fk_position_error))
+            if fk_position_error <= .001:
+                fk_angle_error = _angle(fk.q, quaternion)
+                diagnostic["fk_orientation_error_deg"] = _finite_float(fk_angle_error)
+                if fk_angle_error <= .1:
+                    contacts = self._check(q)
+                    if contacts:
+                        diagnostic.update(status="rejected", reason="collision", collision_contacts=contacts)
+                        ik_diagnostics["counts"]["collision"] += 1
+                        ik_diagnostics["candidates"].append(diagnostic)
+                        continue
+                    candidates.append(q)
+                    diagnostic.update(status="accepted", reason="accepted")
+                    ik_diagnostics["counts"]["accepted"] += 1
+                else:
+                    diagnostic.update(status="rejected", reason="fk_mismatch",
+                        fk_mismatch_axes=["orientation"])
+                    ik_diagnostics["counts"]["fk_mismatch"] += 1
+            else:
+                diagnostic.update(status="rejected", reason="fk_mismatch",
+                    fk_mismatch_axes=["position"])
+                ik_diagnostics["counts"]["fk_mismatch"] += 1
+            ik_diagnostics["candidates"].append(diagnostic)
         candidates.sort(key=lambda q: np.linalg.norm((q-q0)[self.controlled]))
-        if not candidates:
-            raise MotionPlanningError("no_collision_free_ik", "No valid collision-free solution in 16 fixed-orientation IK starts")
+        if not candidates and method == "rrt_connect":
+            raise MotionPlanningError("no_collision_free_ik", {
+                "message": "No valid collision-free solution in 16 fixed-orientation IK starts",
+                "ik_diagnostics": ik_diagnostics})
         planner = self._make_planner()
         planner.set_base_pose(_pose_vector(self.root))
         inflated, uninflated, omitted = [], [], []
@@ -645,18 +859,73 @@ class CabinetMotionPlanner:
             if kind == "Plane" or obstacle["actor"] in self.allowed_contacts or obstacle["name"] in self.support_contacts:
                 omitted.append(obstacle["name"])
                 continue
+            if method == "bounded_ik":
+                # Bounded Cartesian waypoints use the actual-shape audit below.
+                continue
             changed = kind in ("Box", "Cylinder", "Sphere")
             geometry = self._geometry(obstacle["shape"], .001 if changed else 0.)
             planner.set_normal_object(obstacle["name"], self._object(geometry, obstacle["pose"]))
             (inflated if changed else uninflated).append(obstacle["name"])
         dt = 1 / self.env.control_freq
         attempts = []
-        for q in candidates[:3]:
+        for q in ([None] if method == "bounded_ik" else candidates[:3]):
             qfull = q0full.copy()
-            qfull[self.pindices] = q
+            if q is not None:
+                qfull[self.pindices] = q
             try:
-                path = planner.plan_qpos_to_qpos(goal_qposes=[qfull], current_qpos=q0full.copy(),
-                    time_step=dt, fix_joint_limits=False, planning_time=float(planning_time_s))
+                if method == "bounded_ik":
+                    self.kin.pmodel.compute_forward_kinematics(q0)
+                    initial_position = np.asarray(self.kin.pmodel.get_link_pose(self.kin.end_link_idx).p).copy()
+                    count = max(1, int(np.ceil(np.linalg.norm(position-initial_position)/.005)))
+                    waypoints = [q0full.copy()]
+                    seed_q = q0.copy()
+                    for point in np.linspace(initial_position, position, count+1)[1:]:
+                        candidate, success, detail = self._bounded_pose_ik(
+                            self.sapien.Pose(point, quaternion), seed_q, limits)
+                        contacts = self._check(candidate) if success else []
+                        if not success or contacts:
+                            raise MotionPlanningError("cartesian_path_failed", dict(
+                                target_position_root=point.tolist(), contacts=contacts,
+                                pose_ik_succeeded=bool(success), **detail))
+                        ik_diagnostics["candidates"].append(dict(
+                            status="accepted", solution_qpos_rad=_finite_list(candidate), **detail))
+                        full = q0full.copy()
+                        full[self.pindices] = candidate
+                        waypoints.append(full)
+                        seed_q = candidate
+                    ik_diagnostics["candidate_count"] = count
+                    ik_diagnostics["counts"]["accepted"] = count
+                    qfull = waypoints[-1]
+                    times, pos, vel, acc, duration = planner.TOPP(
+                        np.asarray(waypoints)[:, planner.move_group_joint_indices], dt)
+                    # MPLib samples int(duration/dt) points: a short segment can
+                    # omit its endpoint or even have no samples. Preserve its
+                    # actual TOPP duration before control-grid resampling.
+                    if duration > 0 and len(times) < 2:
+                        times = np.array([0., duration])
+                        pos = np.stack([q0full, qfull])[:, planner.move_group_joint_indices]
+                    path = dict(status="Success", time=times, position=pos)
+                elif densify_rrt_path:
+                    # TOPP's cubic spline can cut corners of sparse RRT paths.
+                    # Preserve the same upstream RRT settings, adding waypoints
+                    # before its existing timing; exact postchecks remain below.
+                    planner.robot.set_qpos(q0full, True)
+                    planner.planning_world.set_use_point_cloud(False)
+                    planner.planning_world.set_use_attach(False)
+                    status, raw_path = planner.planner.plan(
+                        q0full[planner.move_group_joint_indices],
+                        [qfull[planner.move_group_joint_indices]], range=.1,
+                        time=float(planning_time_s), fixed_joints=set(),
+                        planner_name="RRTConnect", no_simplification=False, verbose=False)
+                    if status == "Exact solution":
+                        dense = np.asarray(list(_interpolate(raw_path, max_step=.025)))
+                        times, pos, _, _, duration = planner.TOPP(dense, dt)
+                        path = dict(status="Success", time=times, position=pos)
+                    else:
+                        path = dict(status="RRT Failed. "+status)
+                else:
+                    path = planner.plan_qpos_to_qpos(goal_qposes=[qfull], current_qpos=q0full.copy(),
+                        time_step=dt, fix_joint_limits=False, planning_time=float(planning_time_s))
             except RuntimeError as exc:
                 if str(exc) != "Fail to parameterize path":
                     raise
@@ -676,6 +945,26 @@ class CabinetMotionPlanner:
                     or np.max(np.abs(positions[-1] - qfull)) > 1e-4):
                 attempt["postcheck_status"] = "invalid_path"
                 continue
+            if maintain_orientation and method == "rrt_connect" and len(positions) > 1:
+                try:
+                    projected = self._fixed_orientation_path(positions, quaternion, limits)
+                    times, joint_positions, _, _, _ = planner.TOPP(projected[:, planner.move_group_joint_indices], dt)
+                    positions = np.tile(q0full, (len(joint_positions), 1))
+                    positions[:, planner.move_group_joint_indices] = joint_positions
+                    times = np.asarray(times).reshape(-1)
+                except MotionPlanningError as exc:
+                    attempt.update(postcheck_status=exc.status, detail=exc.detail)
+                    continue
+                except RuntimeError as exc:
+                    attempt.update(postcheck_status="orientation_time_parameterization_failed", detail=str(exc))
+                    continue
+            if maintain_orientation and (not len(positions) or not np.isfinite(positions).all()
+                    or times.shape != (len(positions),) or not np.isfinite(times).all()
+                    or times[0] != 0. or np.any(np.diff(times) <= 0)
+                    or np.max(np.abs(positions[0]-q0full)) > 1e-4
+                    or np.max(np.abs(positions[-1]-qfull)) > 1e-4):
+                attempt.update(postcheck_status="invalid_projected_path")
+                continue
             source_duration = float(times[-1])
             positions, times = _resample_to_control_dt(positions, times, dt)
             checked = 0
@@ -683,28 +972,42 @@ class CabinetMotionPlanner:
                 checked += 1
                 qp = point[self.pindices]
                 contacts = self._check(qp)
+                if maintain_orientation:
+                    angle = _angle(self.kin.pmodel.get_link_pose(self.kin.end_link_idx).q, quaternion)
+                    if angle > .5:
+                        attempt.update(postcheck_status="orientation_path_violation", observed_angle_deg=angle)
+                        break
                 if np.any(qp < limits[:, 0]-1e-6) or np.any(qp > limits[:, 1]+1e-6) or contacts:
                     attempt.update(postcheck_status="path_collision", contacts=contacts)
                     break
             else:
                 metadata = dict(status="Success", planner="MPLib", version=self.mplib.__version__,
-                    algorithm="RRTConnect", requested_seed=int(seed), ik_seed_applied=True,
+                    algorithm="RRTConnect" if method == "rrt_connect" else "bounded_Cartesian_IK_TOPP",
+                    rrt_pre_TOPP_max_joint_step_rad=.025 if densify_rrt_path else None,
+                    requested_seed=int(seed), ik_seed_applied=method == "rrt_connect",
                     planner_seed_applied=False, planner_seed_limitation="MPLib 0.1.1 exposes no seed setter",
-                    obstacle_margin_m=.001, inflated_obstacles=inflated, uninflated_obstacles=uninflated,
+                    obstacle_margin_m=.001 if method == "rrt_connect" else 0., inflated_obstacles=inflated, uninflated_obstacles=uninflated,
                     uninflated_reason="Actual convex geometry retained; no approximate inflation",
                     omitted_from_planner=omitted, allowed_contact_objects=list(self.allowed_contacts),
                     allowed_contact_links=["panda_leftfinger", "panda_rightfinger"], base_ground_contact_allowed=True,
                     attached_objects_supported=True, attachment=self.attachment,
                     attachment_planning_geometry="Fixed TCP collision link with actual compound shapes; exact compound postcheck" if self.attachment else None,
                     support_contacts=dict(self.support_contacts), maximum_initial_support_penetration_m=.001,
+                    support_surface_root_z=support_surface_root_z,
+                    maintain_orientation=maintain_orientation,
+                    fixed_orientation_path_method=("RRT_TCP_positions_projected_by_SAPIEN_IK_then_TOPP"
+                        if method == "rrt_connect" else "bounded_Cartesian_IK_TOPP") if maintain_orientation else None,
                     attachment_position_tolerance_m=.002, attachment_angle_tolerance_deg=2.,
                     postcheck_points=checked, max_postcheck_joint_step_rad=.01,
                     collision_limitation="Finite samples do not certify continuous collision freedom",
                     planning_time_s_per_candidate=float(planning_time_s), time_step_s=dt,
                     source_duration_s=source_duration, scheduled_duration_s=float(times[-1]),
                     resampled_to_control_dt=True,
-                    joint_velocity_limit_rad_s=.5, joint_acceleration_limit_rad_s2=1., attempts=attempts)
+                    joint_velocity_limit_rad_s=.5, joint_acceleration_limit_rad_s2=1., attempts=attempts,
+                    ik_diagnostics=ik_diagnostics)
                 return MotionPlan(positions, times, position, quaternion,
                                   q0full, _pose_vector(self.root), signature, metadata)
         status = "path_collision" if any("postcheck_status" in a for a in attempts) else "planning_failed"
-        raise MotionPlanningError(status, {"attempts": attempts})
+        if maintain_orientation:
+            status = next((a["postcheck_status"] for a in attempts if "postcheck_status" in a), "planning_failed")
+        raise MotionPlanningError(status, {"attempts": attempts, "ik_diagnostics": ik_diagnostics})

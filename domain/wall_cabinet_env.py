@@ -837,6 +837,57 @@ class WallCabinetEnv(BaseEnv):
     def door_angle(self):
         return self.door_joint.qpos
 
+    def _clear_grasp_binding(self):
+        binding = self.__dict__.get("_grasp_binding")
+        if binding is not None:
+            binding.release()
+            self.__dict__.pop("_grasp_binding")
+
+    def reset(self, *args, **kwargs):
+        self._clear_grasp_binding()
+        return super().reset(*args, **kwargs)
+
+    def close(self):
+        self._clear_grasp_binding()
+        return super().close()
+
+    def set_grasp_retention(self, mode):
+        if mode not in {"friction", "constraint"}:
+            raise ValueError("grasp_retention must be friction or constraint")
+        if mode == "friction":
+            self._clear_grasp_binding()
+        elif "_grasp_binding" not in self.__dict__:
+            from domain.robocasa.grasp_binding import GraspBinding
+            self.motion_planner
+            self._grasp_binding = GraspBinding(self)
+        self._grasp_retention_mode = mode
+
+    def _before_control_step(self):
+        super()._before_control_step()
+        if self.__dict__.get("_grasp_retention_mode") == "constraint" and "_grasp_binding" not in self.__dict__:
+            self.set_grasp_retention("constraint")
+        binding = self.__dict__.get("_grasp_binding")
+        if binding is not None and binding.bound_object_id is not None:
+            gripper = self.agent.controller.controllers["gripper"]
+            target = float(gripper._target_qpos.detach().cpu().numpy().reshape(-1)[0])
+            midpoint = (float(gripper.config.lower) + float(gripper.config.upper)) / 2
+            if target >= midpoint:
+                binding.release()
+            else:
+                binding.begin_control()
+
+    def _before_simulation_step(self):
+        super()._before_simulation_step()
+        binding = self.__dict__.get("_grasp_binding")
+        if binding is not None:
+            binding.apply_finger_hold()
+
+    def _after_simulation_step(self):
+        super()._after_simulation_step()
+        binding = self.__dict__.get("_grasp_binding")
+        if binding is not None:
+            binding.observe_substep(1. / self.sim_freq)
+
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         # Reconfiguration can replace the robot and its FK model.
         self.__dict__.pop("_cabinet_motion_planner", None)
@@ -900,6 +951,11 @@ class WallCabinetEnv(BaseEnv):
         planner = getattr(self, "_cabinet_motion_planner", None)
         if planner is not None:
             planner.observe_grasp()
+            binding = self.__dict__.get("_grasp_binding")
+            if binding is not None and binding.bound_object_id is None and planner.gripper_command < 0:
+                attachment = planner.attachment_state()
+                if attachment is not None:
+                    binding.bind_confirmed(attachment["name"])
 
     def execute_motion_plan(self, plan, *, gripper_command=None,
                             max_steps=400, on_step=None):

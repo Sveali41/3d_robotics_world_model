@@ -16,6 +16,7 @@ The goal is an experimental workflow connecting 3D interaction, data collection,
 | Skill-level exploration | `exploration/raps/raps_gnn_actor.py` | RAPS/GNN imagination actor–critic as a separate research variant |
 | Point-cloud dynamics comparison | `exploration/pointworld/pointworld_cabinet_offline.py`, `exploration/pointworld/official/` | Paired interaction data and offline GNN / PointWorld training and evaluation; offline comparisons alone do not establish suitability as a replacement for the online planning model |
 | PointWorld exploration components | `exploration/pointworld/pointworld_raps.py`, `exploration/pointworld/robot_flow_bridge.py`, `exploration/pointworld/round_loop.py` | Candidate actions, robot flow, ensemble disagreement, and round-based collection; integration and validation depend on the experiment |
+| RGB stochastic JEPA exploration | `exploration/jepa/` | Split7 collection, flow-matching visual learning, sampled-future variance and mixed CEM; an experimental pure-curiosity branch |
 | Household skills | `domain/household/` | PARTNR oracle skill interaction and a Habitat-Sim room viewer |
 | THOR environments | `domain/thor/` | iTHOR / ProcTHOR scene interaction |
 
@@ -81,15 +82,55 @@ Main exploration configurations:
 
 `exploration.cee_us.cee_us_cabinet` provides `smoke / compare / train / evaluate / report`. The offline comparison entry provides `collect / audit / train-gnn / train-pointworld / evaluate`. Consult each entry's `--help` for parameters. Configured budgets do not indicate completed experiments.
 
+The separate `epic_jepa_cem` agent uses RGB and primitive action history only;
+it does not feed the existing diagnostic robot/object states into planning.
+Use `configs/epic_jepa_cabinet_split7.yaml`; `smoke` caps collection at 2,000
+controls, and new `train` runs require an explicit `--total-controls` budget.
+See [JEPA setup, algorithm, commands and validation](docs/jepa_curiosity.md).
+
 The validation-only collector and planner diagnostics use the reorganized diagnostic package:
 
 ```bash
 python -m exploration.diagnostics.collect_wm_validation --help
 python -m exploration.diagnostics.calibrate_wm_validation --help
 python -m exploration.diagnostics.validate_cabinet_planner --help
+python -m exploration.diagnostics.diagnose_grasp_targets --help
+python -m exploration.diagnostics.probe_grasp_region --help
+python -m exploration.diagnostics.collect_primitive_combinations --help
+python -m exploration.diagnostics.plot_primitive_collection --help
 ```
 
 Existing datasets and checkpoint action contracts remain unchanged. New split7 data has a 13D skill action and cannot directly evaluate an older 12D world model. Diagnostic source fingerprints still require matching code versions.
+
+The collector uses the `feedback_gated_v1` protocol: a failed primitive ends the current attempt, and grasp sequences require the intended object to be held with a closed gripper for the final four consecutive control ticks before proceeding. Raw failed skills remain in `skills.jsonl`; `trial_outcome.json` records why the attempt ended. Budgets are upper bounds and unused steps are not filled with extra actions. Resumption skips attempts with saved outcomes and rejects datasets from the old protocol. These gates apply to the diagnostic script; the general `lift` primitive still permits empty-gripper motion. Planner records include per-start IK rejection reasons, joint-limit violations, FK errors, and collision pairs.
+
+`diagnose_grasp_targets` audits the live TCP/finger geometry and checks 17 explicit position/orientation requests for each cup/bowl and original/shifted case. Run it in the MPLib/NumPy 1.26 robotics runtime with `--sampling-plan <saved sampling_plan.json> --output <new directory>`. It performs nine stationary open-gripper setup ticks per case; candidate trajectories are planned but not executed. Endpoint IK feasibility, path status, and unverified physical grasp success remain separate. Object bounds reuse the planner's native-shape support and cylinder-axis conversion; the installed ManiSkill collision-mesh helper's axis-swapped cylinder bounds are recorded for comparison rather than used to generate goals. Existing WM state geometry features are unchanged.
+
+`probe_grasp_region --source <completed endpoint diagnostic directory> --output <new directory>` samples each selected anchor at nine heights and sixteen continuous Latin-hypercube position/orientation offsets. It records every IK/path rejection, then physically tests at most three path-accepted candidates per case (anchor and height extremes), capped at 300 control ticks each. Approach must succeed before closure; four final consecutive closed-grasp ticks on the intended object plus its measured attachment are required before a planned 4 cm lift. Independent physics-substep contact auditing stops forbidden contacts. Raw requests, control feedback, payload planning, event metrics, and PNG/SVG projections are retained. These finite local probes do not certify a continuous feasible region and are not an unbiased WM validation dataset. No production primitive, planner goal, or WM feature is changed.
+
+`collect_primitive_combinations` uses protocol `object_relative_split7_v1`: sample desired closure positions from each object's corrected native collision AABB (X/Y padded 2 cm, Z inset 1 cm), invert five fixed primitive recipes, and execute through the real `SkillCollector` and `PlannedSkillExecution`. The existing 67D state, 13D action, planner, reset orientation, collision checks, and grasp checks are preserved. One random position per 2x2x2 cell is shared across recipes; original and shifted layouts share normalized positions and recipe IDs. These are attempted positions, not known feasible grasps. Parameters are recomputed from measured EE feedback before each primitive; out-of-range or backward approach requests are recorded and rejected without clipping.
+
+```bash
+# Default: save 160 candidate attempts; initialize geometry but execute no primitives.
+python -m exploration.diagnostics.collect_primitive_combinations --stage plan --output logs/object_plan
+# Two attempts per object/layout: YZ-first and X-first, at most 400 controls each / 3200 total.
+python -m exploration.diagnostics.collect_primitive_combinations --stage pilot --output logs/object_pilot
+# Formal collection requires an explicit global budget and separate sampling seed.
+# Replace the budget and replay paths with the approved budget and ALL compared models' training replays.
+python -m exploration.diagnostics.collect_primitive_combinations --stage collect \
+  --output logs/object_validation --seed 5100000 --max-steps <approved-control-budget> \
+  --calibration-data logs/object_pilot --exclude-replay <training-replay.npz>
+```
+
+Five recipes cover YZ-first approach, approach/refinement, elevated approach/descent, X-first alignment/refinement, and X-first closure without refinement. All now target the same nominal closure position: the last recipe compensates its internal reference by +2 cm X, replacing the historical reference-relative early-close convention. `--recipes`, `--scene`, and `--object` restrict attempts; `--grid`, `--seed`, `--trial-controls`, `--max-steps`, and `--quota` control the declared plan. Sampling seeds default to 4100000 for plan/pilot and 5100000 for collect. Every attempt uses four real closing primitives, then requires four final consecutive intended-object held ticks before lift. Failed approach ends the attempt. Shallow initial shelf support remains allowed during closure/initial lift; forbidden contact retains the current tick and ends the attempt. No hidden control steps, target adjustment, or orientation search is added.
+
+Outputs include `sampling_plan.json`, geometry/contracts/seeds in `manifest.json`, scheduled trial IDs, raw transitions/skills, rejection reasons, physics contacts, and completed nonzero endpoints (including executed failures with status, duration, and raw references). Zero-duration planning rejections remain raw records without becoming dynamic transitions. `windows_index.json` contains deduplicated h=1/3/5 continuous skill sequences built within individual attempts; balanced object rows are never spliced into rollouts. `balanced_index.json` selects by layout/object/observed event (lift, displacement, contact-only, free motion, static), defaulting to 20 **object-level skill indices** per stratum. This quota is neither a control-step count nor a count of independent trajectories. `full_state_index.json` deduplicates the selected object rows by endpoint; `coverage_report.json` reports candidate cells, recipe coverage, event deficits, duplicates, and window counts. Candidate-cell coverage does not imply successful physical visitation or grasp coverage.
+
+Plan/pilot artifacts are calibration data and cannot be marked validation-ready. Formal collection never increases the supplied budget to fill deficits. Supply every compared model's 67D/13D replay with repeated `--exclude-replay` and calibration directories with repeated `--calibration-data`; source hashes are saved. A supplied calibration dataset with the same sampling seed is rejected. An exact state/action/next-state overlap with either source excludes the entire attempt from evaluation indices while retaining its raw data and labels. These checks detect exact duplicates, not broader statistical dependence. Without both source checks, all event quotas, h=1/3/5 windows in every object/layout case, and completion of scheduled attempts, readiness stays false and deficits remain explicit. An incomplete formal collection returns exit code 2. A successful pilot verifies the execution/recording pipeline only; it does not establish sufficient grasp coverage or an unbiased validation distribution. No model is trained.
+
+For an original-layout dataset with 500 attempts per object, use `--stage collect --scene original --grid 5 5 4 --max-steps 400000`: 100 spatial cells per object times five recipes gives 1000 attempts, each capped at 400 controls. The sampling bounds and primitive semantics remain unchanged; the finer grid increases coverage. Raw failed attempts and partially executed budget-truncated skills remain available. This budget is an upper bound and does not guarantee successful grasps or a validation-ready dataset.
+
+`plot_primitive_collection --source <collection directory>` reads all saved attempts, including nested per-object collection directories, and exports actual EE paths and endpoints in robot-root meters. It generates endpoint and full-trajectory projections for both objects, with actual outcomes distinguished from requested closure targets. Labeled object references use the saved corrected native collision bounds at reset; they show initial occupied bounds, not exact object silhouettes or final object positions after interaction. Both objects appear as references, and different layouts are shown separately. The source transitions retain every recorded control step; plotting does not replace actual endpoints with targets, filter out failed attempts, concatenate paths across resets, or jitter repeated positions. Identical endpoints can overlap on the plot, so use the accompanying tabular/array exports for counts. The same command can visualize a partial dataset while a longer collection continues, then regenerate the complete figures afterward.
 
 For new skill-level curiosity runs, use the direct-execution split7 configuration:
 
@@ -100,6 +141,115 @@ For new skill-level curiosity runs, use the direct-execution split7 configuratio
 ```
 
 This selects the existing RAPS imagination actor with the CEE-US GNN ensemble, using completed primitive endpoints. It preserves the compact6 baseline's ensemble-disagreement reward, object approach heuristic, training budgets and 100/20 Hz timing. The action is now 7 primitive choices plus 6 shared parameters: `move_delta_ee_pose`, `align_yz`, `approach_x`, `lift`, `drop`, `open_gripper`, `close_gripper`. The actor selects their order; `approach_x` does not automatically close the gripper. Execution uses the existing direct `ee_delta` controller and latched gripper. Start a fresh actor and WM without `--checkpoint`; compact6 checkpoints and the 12D `logs/cabinet_grasp_sequences_972` dataset are incompatible. This configuration does not migrate those artifacts. The split7 planner configuration remains a separate variant, and the 4D iCEM entry retains its existing configuration.
+
+The persistent [grasp-retention and primitive contract](docs/pick_place_primitives.md) requires closed-gripper transport, per-control grasp/slip checks and supported release. Physical retention is not guaranteed by a closing command alone.
+
+The experimental `--pick-place-primitives` flag replaces the selected RAPS skill set with two macros and a shared three-slot argument bank (5D action): grasp uses TCP XYZ and place uses object-target XY, with its inactive Z slot zeroed. It defaults to false; `--no-pick-place-primitives` overrides a YAML opt-in. YAML uses `raps_actor.pick_place_primitives: true`. The resolved run enables gripper-command memory and disables the legacy contact/drop/placement hooks, because the macros own those gates. This mode selects the existing joint planner (`motion_execution: planner`, `action_mode: joint_position`), requires a fresh 5D WM/actor and a new output directory. Existing split7 replay/checkpoints are incompatible; strict resume checks remain enabled. The original skill set remains selected when the flag is disabled. To bind a physically confirmed grasp until opening, add `--grasp-retention constraint` (YAML `raps_actor.grasp_retention: constraint`). This CPU-physics mode locks the object's current pose relative to the hand with a native positional constraint and angular drive, then removes it on opening, reset or close. `--grasp-retention friction` preserves contact/friction holding and is the default. Settings, action contracts and recorded rows distinguish these modes; strict resume rejects switching them. Under the previous version 4 TCP-XYZ placement contract, cup and bowl each passed one complete planned grasp/place/release/home example plus 20 postcheck controls; those fixed-layout examples do not validate version 5 object-target placement.
+
+`grasp(x,y,z)` opens, approaches the bounded TCP position with the common reset orientation, closes, confirms continuous grasp, lifts 8 cm and carries to the shared intermediate TCP `[0.18, 0, 0.84]`. `place(x,y)` targets the object collision-AABB center projected onto the lower shelf. The measured confirmed TCP-relative payload geometry compensates XY grasp offset and computes the shelf-touch TCP height. Place preserves closure, retreats through shared preplace TCP `[0.28, 0.15, 0.56]`, approaches 4 cm above the predicted shelf-touch TCP, descends until settled shelf support, opens, clears the object and returns through preplace to the episode's initial TCP. Cabinet-exterior preplace transport may rotate when TCP X<0.29 m, restoring the common fixed orientation at the preplace endpoint; grasp, placement and cabinet-interior motion retain fixed orientation. The interface and route are macro contract version 5; earlier macro checkpoints are incompatible. Return poses are TCP poses, not exact joint configurations. Placement uses actual held-object collision geometry, with no object-type offsets, automatic object selection or teleportation. Missing/lost grasp, unsupported release and timeouts are recorded as failures; failed completed macros remain valid WM endpoints, while budget-truncated macros are excluded.
+
+All coordinates are **robot controller-root meters**, not world coordinates:
+
+| Variable | Grasp (upper) | Place (lower) |
+| --- | --- | --- |
+| X | 0.370–0.671 | 0.370–0.671 |
+| Y | -0.070–0.310 | -0.070–0.310 |
+| Z | 0.692–0.872 | Automatic from grasp geometry and shelf height |
+
+Grasp retains the nominal support +0–22 cm Z band and a 2 cm endpoint margin (+2–20 cm). XY retains an 8 cm margin from cabinet edges. Place additionally rejects goals whose full object footprint would approach within 2 cm of the nominal cabinet edges, keeping the hand closed. Grasp bounds refer to TCP coordinates; place bounds refer to the object collision-AABB center at the fixed placement orientation. They do not guarantee robot reachability or collision-free paths. Place height is computed automatically, and explicit place Z arguments are rejected; release still requires positive cabinet-frame force at lower-shelf contact geometry and low object speed for four consecutive controls. Constraint mode uses the peak pose-displacement speed across the latest control’s physics substeps, recording native speed alongside it; friction mode retains native speed. On first shelf contact, constraint mode holds measured finger drive positions while retaining logical closure and binding to remove continued squeeze pressure. Targets outside the physical bounds are rejected by encoding; normalized policy values are mapped into the bounds. Full bounds, routes and safety gates are included in the checkpoint action contract. Except for the explicitly permitted exterior preplace rotation, sampled paths and per-control feedback must remain within 0.5 degrees of the reset orientation. Fixed-orientation RRT transfers project TCP positions using existing SAPIEN IK before TOPP. Exterior preplace transfers densify RRT joint waypoints to at most 0.025 rad before TOPP to reduce spline corner-cutting. Both paths retain limit, collision and endpoint-orientation audits. Failed projections stop explicitly. Finite path/control samples are not a continuous-motion certificate. Each macro is bounded at 2000 controls, each planned segment at `motion_plan_max_steps` (default 400), and support seeking at 1000 controls. Descent uses at most 5 mm per planned segment and shortens the final step using collision-shape clearance; only shallow (at most 1 mm) payload contact with the matching lower shelf top is allowed. Other collision checks remain active.
+
+This is an opt-in experimental controller. See `artifacts/complete_pick_place_20261113/index.html` for historical version 4 complete cup/bowl videos, measured postchecks and retained failure diagnostics; version 5 physical placement remains unverified, and synthetic state-machine tests alone do not establish successful lower-shelf placement. No existing experiment is migrated or restarted automatically. Collection still resets at each collection call and retains the configured physical budget: the existing 800-control episode and 1000-control collection chunks can truncate longer macros. Choose a new experiment budget explicitly before formal training; the flag does not silently extend those budgets.
+
+The fresh pick/place preset is [configs/raps_gnn_actor_cabinet_pick_place.yaml](configs/raps_gnn_actor_cabinet_pick_place.yaml). It connects the same CEE-US GNN world model, RAPS imagination actor/critic, random bootstrap, online fitting, evaluation, checkpoints and strict resume to the 5D macro interface. Physical planning/constraint retention uses CPU simulation; WM and actor/critic use CUDA. The existing prediction/runtime flags remain independent.
+
+This explicitly uses 2000 bootstrap controls, 398 rounds of 2000 controls, 2000 evaluation controls and 2200-control episodes: **800000 controls per arm, including evaluation**. Both the primitive wrapper and native TimeLimit receive the episode budget. The legacy split7 preset is unchanged. Every collection call resets physics; a macro can still be truncated near the remaining chunk boundary and then is excluded from WM endpoints while all executed controls count.
+
+The existing three-container launcher accepts the new preset:
+
+```bash
+/opt/anaconda3/bin/python scripts/launch_raps_comparison.py \
+  --config configs/raps_gnn_actor_cabinet_pick_place.yaml \
+  --numpy-shim /tmp/raps-three-arm-ls76ex80/numpy126 \
+  --output logs/raps_pick_place_comparison
+```
+
+This command **starts the full experiment**; integration validation does not execute it. It creates curiosity+heuristic, curiosity-only and random arms with identical resolved settings except collection policy/object heuristic. Their actual completed-macro sample counts and WM minibatch counts may differ. The original approach-progress heuristic is retained on macro endpoints, without adding a task/grasp/place bonus; its usefulness under the new action semantics is not established. Native RRT is unseeded, so independent-container bootstraps are not guaranteed identical even with matched environment/IK seeds. Shared GPU use prevents controlled wall-time comparisons.
+
+Add `--include-heuristic-only` to launch four arms: curiosity+heuristic, curiosity-only, heuristic-only and random. The heuristic-only arm retains the learned RAPS actor, world model and existing heuristic, but sets `raps_actor.disagreement_weight: 0.0`. All arms retain the base training/control budgets; the pick/place preset totals 800000 controls per arm (3200000 for four arms, including evaluation). Each arm owns its output/checkpoints and uses the launcher's frozen source snapshot. The three-arm default is preserved.
+
+Start fresh: old 13D split7/4D iCEM checkpoints, replays and validation actions cannot be reused as 5D macro data. New macro checkpoints can resume with matching per-arm saved config and a new output directory; only total rounds/evaluation budget may change. The separate 4D iCEM implementation remains unchanged. See [the primitive contract](docs/pick_place_primitives.md) and bounded integration evidence in artifacts/pick_place_pipeline_20261113/.
+
+RAPS supports `--execution reference` (the existing default) and `--execution cuda_graph` with `--device cuda`. Both use the same FP32 GNN, ensemble, imagination batch/horizon, rewards and optimizer updates. CUDA Graph mode reuses the existing CEE-US prediction capture for each input shape; fitting or loading the world model invalidates captures. First use after invalidation includes capture overhead. This accelerates imagined GNN predictions; simulation, world-model fitting and checkpoint compression retain their existing paths. CUDA unavailability or capture errors stop the run explicitly.
+
+```bash
+# Run in the existing environment with PyTorch/CUDA and the project dependencies.
+python -m exploration.cee_us.cee_us_cabinet train \
+  --config configs/raps_gnn_actor_cabinet_split7.yaml \
+  --device cuda --execution cuda_graph --output logs/raps_split7_cuda_graph
+# Use --execution reference with a separate output directory for the baseline.
+```
+
+The flag overrides YAML `execution` and the resolved value is saved in the run configuration. Training resume retains the saved execution setting under the existing strict configuration check; frozen evaluation can select either execution mode for a compatible checkpoint. Neither mode changes the primitive controller or enables GPU physics.
+
+RAPS also accepts `--runtime-optimizations` and `--no-runtime-optimizations`, independently of `--execution`. These override YAML `runtime_optimizations`; the default remains false. Opt-in fitting keeps replay arrays on the training device for the duration of each fit and uploads the original NumPy-sampled ensemble indices once per epoch. It retains batch sizes, tail batches, sampling/RNG order and optimizer updates. Actor/critic gradient checks are aggregated before their optimizer steps, and detached diagnostic values are transferred in batches. Nonfinite checks remain enabled. Device-memory exhaustion stops with an instruction to disable runtime optimizations.
+
+With runtime optimizations enabled, one background CPU thread compresses and saves independent CPU checkpoint snapshots while the next collection/training runs. Only one save may be outstanding; reading a newly saved checkpoint, successful completion and shutdown wait for it, and write failures propagate to the main run. Existing checkpoint/NPZ formats and save frequency are retained; `.pt` is published after both replay files. The collection/WM/actor update sequence remains synchronous, with no old-policy collection or GPU-physics migration.
+
+```bash
+python -m exploration.cee_us.cee_us_cabinet train \
+  --config configs/raps_gnn_actor_cabinet_split7.yaml \
+  --device cuda --execution cuda_graph --runtime-optimizations \
+  --output logs/raps_split7_optimized
+```
+
+Use `--no-runtime-optimizations` with a separate output directory for the baseline. The resolved runtime setting is saved and must match on training resume. Collection and checkpoint timings are written to `timings.jsonl`; each `training.jsonl` entry includes replay preparation, normalizer/WM and actor/critic stage timings. Device-resident fitting additionally reports bulk-upload time; reference minibatch transfers remain included in WM time. `result.json` records wall time after all saves complete. Concurrent save/work durations overlap and must not be summed to infer wall time.
+
+`PYTHONPATH=. python scripts/benchmark_raps_runtime.py --checkpoint <checkpoint.pt> --output <new-directory>` performs bounded offline comparisons using the checkpoint's real skill replay. Defaults are 512 samples, one WM epoch, five actor updates and three warmed alternating-order repeats. It measures replay/WM, scalar-sync and background-save components plus the combined mode, verifies state/RNG/replay parity and includes save drain in wall time. If the checkpoint's companion `.low_level.npz` is absent, supply `--low-level-replay <actual-control-replay.npz>`; that source is recorded and used only for serialization, never fitting. No physics is run and original checkpoints are not modified.
+
+The A5000 bounded check in `artifacts/raps_runtime_20261111/` found no overall speedup: isolated replay transfer/gather was about 2.06x faster, while combined offline median was 0.363s versus 0.344s reference. Both 256-control split7 smokes reproduced identical recorded trajectories/replays and matching model/optimizer/RNG state, but wall times were 20.90s optimized versus 20.11s reference. These small runs do not establish long-training performance; external GPU activity and trial variability were observed. Runtime optimizations remain opt-in and the 10% target is unproven.
+
+For three simultaneous matched exploration arms, run `/opt/anaconda3/bin/python scripts/launch_raps_comparison.py --output logs/raps_split7_three_arm_<unique-name>` on the Apptainer host. This explicitly starts three independent named instances of the same existing SIF, with a shared read-only snapshot of the actual working source/Git evidence and private process RNG/logs/checkpoints. It derives `curiosity_heuristic`, `curiosity_only` and `random` configurations from the same split7 YAML, changing only `object_heuristic` and `collection_policy`. The current budget is 1000 random bootstrap controls, 398 rounds of1000 online controls, then1000 frozen evaluation controls:400000 real20Hz controls per arm, not400000 skill decisions. All use seed0, the same reset-seed schedule, direct CPU physics/GPU networks, WM25epochs and actor100updates per round, reference execution and runtime optimizations disabled. Effective skill counts and resulting WM minibatch-update counts can differ because exploration changes executed skill durations and completion. The random arm still fits the same WM/actor/critic, but never uses the actor for collection or evaluation. The existing `train --policy random|curiosity` option now selects the actual training collection policy; default remains curiosity and `compare` keeps its original two-arm behavior. Random checkpoints resume from their `random/` prefix with the saved policy enforced.
+
+Each launch writes `comparison.json`, derived arm configs, `source_sha256.json`, exact launch commands, `stdout.log`, process IDs and per-arm `exit_code`; the corresponding instance stops when its training process exits. A new output directory is required and automatic retries are not performed. The verified NumPy1.26 shim is copied to an executable private `/tmp` runtime directory; no dependency downloads or container upgrades occur. The single shared GPU can contend, so this is an exploration-quality comparison with equal interaction/configuration budgets, not a controlled wall-time benchmark or multi-seed result. Final WM prediction metrics use each policy's own evaluation trajectories; absolute cross-policy accuracy claims additionally require a common independent evaluation dataset.
+
+### GPU batched split7 collection
+
+The original SAPIEN 3.0.3 has confirmed sparse joint/body indexing defects. Use the isolated, same-version native correction described in [docs/sapien_gpu_reset.md](docs/sapien_gpu_reset.md). The original SIF and installed libraries remain unchanged. The collector checks actual sparse joint/body writes at startup and exact live-peer sensor continuity on each refill; an incompatible runtime stops clearly. CPU scalar collection retains the original reference runtime.
+
+`collect_cabinet_grasp_sequences` accepts `--collector gpu_batch --skill-set split7 --num-envs N`. The default `scalar` collector remains the CPU reference. GPU collection keeps one scene batch alive, advances each slot's primitive independently, and refills completed slots with the next case ID. Case seeds, nine templates, 800-control per-case budget, 100/20 Hz timing and 67D/13D contracts are retained. It runs direct EE control without a motion planner, training, image capture or goal projection. `--num-envs` is required; unsupported settings fail explicitly.
+
+Use the existing pinned runtime. On this machine `/data/data/siyao/3d_world_model.sif` contains ManiSkill `e406239d2b1c554e4b99010bc9b40ad2bbd91f05` and Torch 2.3.1/CUDA. Its default NumPy 2 installation requires a separate historical NumPy 1.26.4 directory; install once without replacing the container packages:
+
+```bash
+apptainer exec /data/data/siyao/3d_world_model.sif python -m pip install \
+  --no-deps --target /tmp/wm_gated_numpy126 numpy==1.26.4
+apptainer exec /data/data/siyao/3d_world_model.sif \
+  python scripts/build_sapien_sparse_patch.py
+apptainer exec --nv /data/data/siyao/3d_world_model.sif env \
+  PYTHONPATH="/tmp/wm_gated_numpy126:$PWD" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python scripts/run_patched_sapien.py --runtime .runtime/sapien_sparse_patch -- \
+  -m exploration.diagnostics.collect_cabinet_grasp_sequences \
+  --checkpoint logs/raps_compact6_train_400k_episode40s_centered_20261026T173840/curiosity/round_398.pt \
+  --output logs/cabinet_split7_gpu_smoke --stage smoke \
+  --skill-set split7 --collector gpu_batch --num-envs 2
+```
+
+Use `--stage plan` to inspect the original 972 cases without simulation. For a separately authorized full run, change to `--stage collect`, select a measured environment count, and use a new output directory. The compact6 checkpoint supplies configuration/state provenance only; its 12D weights are not converted or used. Source snapshots, backend, dependency versions, environment count, actual runtime state contract, original native binaries, overlay build manifest and per-attempt slot assignments are recorded. GPU and CPU trajectories are different numerical protocols; seeds identify requested cases but do not guarantee identical trajectories across backends or batch sizes.
+
+GPU steps are stored losslessly in `trajectory_chunks/`: each atomic chunk has one uncompressed numeric `.npy` pool plus a typed schema and routing index. The default chunk spans at most 256 batch control steps. Full before/after states, requested/executed actions, seven controller values, contacts, rewards, phase and case/attempt/skill identity remain available. A bounded single writer process overlaps writes with simulation and applies backpressure; it does not discard rows. `skills.jsonl`, attempt metadata, phase traces and summaries stay readable JSON. Case completion is published only after its trajectory chunks are durable. Periodic reports use cached summaries; `evaluation.npz` is rebuilt every 64 closed cases by default (`--export-every-cases`) and at normal shutdown.
+
+Repeat the identical command with `--resume` to skip closed cases. Interrupted attempts retain committed chunks and start a new attempt from reset; trajectories never join across attempts. Resume requires identical sources, configuration, backend and batch size. Historical JSONL and numeric chunks share the `read_transitions` interface and the existing visualization CLI. The viewer still requires an existing offline Plotly bundle through `--plotly-source`. GPU action-video replay is explicitly unsupported by the CPU replay renderer; it stops rather than publishing an unverified movie.
+
+The audited A5000 calibration recommends **128 environments** among the tested sizes: **294.65 active controls/s including initialization and final writes, 14.32x the retained CPU baseline**, with whole-device peak 3069 MiB of 24564 MiB. All 16384 benchmark controls and 49 refills passed exact continuity/endpoint audits. These bounded samples shared the GPU with other training jobs; they do not predict full-dataset or grasp-success throughput. See the [performance report and ready-to-use collection command](docs/gpu_split7_performance.md). No formal 972-case collection was launched.
+
+A bounded calibration compares the scalar collector and GPU batches of 16/32/64/128, keeping complete recording enabled:
+
+```bash
+python -m exploration.diagnostics.benchmark_split7_collection \
+  --checkpoint <source-checkpoint.pt> --output logs/split7_collection_benchmark
+```
+
+Run it through `scripts/run_patched_sapien.py -- -m` inside the same GPU-visible pinned runtime shown above. GPU workers reenter the isolated launcher. Each configuration stops at 4096 active controls or 60 seconds of collection; initialization, final drain and export are reported separately. All configurations use the same fixed 128-case pool in case-ID order. Reports include control/endpoint/case rates and sampled whole-device memory, retaining failures. The recommendation selects the fastest measured end-to-end control rate below 80% GPU memory; within 5% of fastest it prefers fewer environments. These short, different-length prefixes measure control throughput, not complete-dataset runtime, successful-grasp throughput or independent dynamics coverage. Calibration data is marked separately from validation data.
 
 ### Automatic multi-point cabinet grasp collection
 

@@ -123,7 +123,8 @@ def test_budget_validation():
         with pytest.raises(ValueError):validate_args(a)
 
 
-def test_global_budget_shared_trial_plans_without_physics(tmp_path,monkeypatch):
+@pytest.mark.parametrize('early_failure', [False, True])
+def test_global_budget_shared_trial_plans_without_physics(tmp_path,monkeypatch,early_failure):
     import exploration.diagnostics.collect_wm_validation as m
     settings=dict(DEFAULTS,skill_set='compact6',latched_gripper=True)
     checkpoint=tmp_path/'input.pt';checkpoint.write_bytes(b'fake')
@@ -143,10 +144,13 @@ def test_global_budget_shared_trial_plans_without_physics(tmp_path,monkeypatch):
         def action_projection_contract(self):return region()
     class Collector:
         def __init__(self,env,encoder,provider,directory):
-            self.plan=provider.plan;self.directory=directory
+            self.plan=provider.plan;self.directory=directory;self.provider=provider
         def collect(self,count,policy,**kw):
             calls.append((count,deepcopy(self.plan)))
             self.directory.mkdir()
+            if early_failure:
+                self.provider.outcome=dict(status='failed',reason='primitive_failed',skill_status='no_collision_free_ik')
+                return [None],[]
             return [None]*count,[]
     monkeypatch.setattr(m,'make_env',lambda **kw:(Env(),m.OmegaConf.create({})))
     monkeypatch.setattr(m,'CabinetSkillStateEncoder',Encoder)
@@ -156,7 +160,11 @@ def test_global_budget_shared_trial_plans_without_physics(tmp_path,monkeypatch):
     assert [c[0] for c in calls]==[3,2,3,2]
     assert calls[:2]==calls[2:]
     import json
-    assert json.loads((output/'manifest.json').read_text())['physical_control_ticks']==10
+    assert json.loads((output/'manifest.json').read_text())['physical_control_ticks']==(4 if early_failure else 10)
+    summary=json.loads((output/'collection_summary.json').read_text())
+    assert len(summary['trial_outcomes'])==4
+    if early_failure:
+        assert all(r['actual_control_ticks']==1 and r['status']=='failed' for r in summary['trial_outcomes'])
 
 
 def test_training_exclusion_union_and_missing_referenced_source(tmp_path):
@@ -335,3 +343,88 @@ def test_planner_free_goal_has_bounded_attempts_and_keeps_original_target():
     goal = provider.goal.copy()
     assert provider.schema.decode(provider.action(state)).primitive_type == 'open_gripper'
     np.testing.assert_array_equal(provider.goal, goal)
+
+
+def feedback_provider():
+    plan = dict(object=OBJECT_NAMES[0], intent='lift', jitter=[0., 0., 0.], lift=.04,
+                neighborhood_offset=[0., .01, 0.])
+    provider = ScriptedProvider(dict(DEFAULTS, skill_set='split7', motion_execution='planner'),
+                                plan, region(), args())
+    state = np.zeros(67)
+    state[18:21] = [.35, 0., .72]
+    state[33:36] = [.45, .02, .74]
+    return provider, state
+
+
+@pytest.mark.parametrize('primitive,phase', [('align_yz', 'interact'), ('approach_x', 'approach_x')])
+def test_failed_alignment_or_approach_ends_attempt_before_closure(primitive, phase):
+    provider, state = feedback_provider()
+    provider.phase = phase
+    assert provider.schema.decode(provider.action(state)).primitive_type == primitive
+    provider.on_skill_end(dict(skill_id=3, primitive_type=primitive, completed=True,
+                              status='no_collision_free_ik'))
+    assert provider.outcome['reason'] == 'primitive_failed'
+    assert provider.outcome['skill_status'] == 'no_collision_free_ik'
+    with pytest.raises(RuntimeError, match='attempt has ended'):
+        provider.action(state)
+
+
+@pytest.mark.parametrize('held,command,expected', [
+    ([False]*9, -1., False), ([True]*3, -1., False),
+    ([True]*4, -1., True), ([True]*4+[False], -1., False), ([True]*4, 1., False),
+])
+def test_only_current_stable_target_grasp_allows_lift(held, command, expected):
+    provider, state = feedback_provider()
+    provider.phase = 'approach_x'
+    provider.action(state)
+    provider.on_skill_end(dict(skill_id=1, primitive_type='approach_x', completed=True, status='success'))
+    assert provider.schema.decode(provider.action(state)).primitive_type == 'close_gripper'
+    for grasped in held:
+        provider.on_step(dict(parameters_physical=dict(gripper=command), contact_events=[dict(objects={
+            OBJECT_NAMES[0]: dict(grasped=grasped), OBJECT_NAMES[1]: dict(grasped=True)})]))
+    provider.on_skill_end(dict(skill_id=2, primitive_type='close_gripper', completed=True, status='success'))
+    if expected:
+        assert provider.outcome is None
+        assert provider.schema.decode(provider.action(state)).primitive_type == 'lift'
+    else:
+        assert provider.outcome['reason'] == 'unconfirmed_grasp'
+        assert provider.outcome['skill_status'] == 'success'
+        with pytest.raises(RuntimeError, match='attempt has ended'):
+            provider.action(state)
+
+
+def test_standoff_attempt_limit_does_not_allow_blind_interaction():
+    provider, state = feedback_provider()
+    provider.phase = 'approach'
+    provider.approach_attempts = 11
+    provider.action(state)
+    provider.on_skill_end(dict(skill_id=12, primitive_type='move_delta_ee_pose', completed=True,
+        status='success', after=dict(ee_position=state[18:21].tolist(), objects={
+            OBJECT_NAMES[0]: dict(position_root=state[33:36].tolist())})))
+    assert provider.outcome['reason'] == 'standoff_not_reached'
+
+
+def test_resume_does_not_reopen_closed_early_failures_or_mix_old_protocols(tmp_path):
+    import json
+    import exploration.diagnostics.collect_wm_validation as m
+    a=args();a.output=tmp_path;a.stage='collect';a.max_steps=80;a.trial_steps=20
+    plans=generate_plans(a,2)
+    candidate={key:None for key in ['checkpoint','checkpoint_sha256','state_contract','action_contract',
+        'training_replays','args','source_config','source_config_sha256']}
+    candidate.update(collection_protocol=m.COLLECTION_PROTOCOL,split='validation_only',stage='collect',
+        source_evidence={},script_sha256='test',dependencies={})
+    (tmp_path/'manifest.json').write_text(json.dumps(candidate))
+    (tmp_path/'sampling_plan.json').write_text(json.dumps(plans))
+    for trial,n in [(0,6),(1,7)]:
+        raw=tmp_path/'original'/f'trial_{trial:06d}';raw.mkdir(parents=True)
+        (raw/'transitions.jsonl').write_text('{}\n'*n)
+        if trial==0:
+            (raw/'trial_outcome.json').write_text(json.dumps(dict(status='failed',reason='unconfirmed_grasp')))
+    manifest,saved=m.resume_inventory(a,plans,candidate)
+    assert saved==13
+    partial=manifest['recoveries'][-1]['partial_trials']
+    assert [(p['trial_id'],p['remaining_ticks']) for p in partial]==[(1,13)]
+    old_protocol=dict(candidate);old_protocol.pop('collection_protocol')
+    (tmp_path/'manifest.json').write_text(json.dumps(old_protocol))
+    with pytest.raises(ValueError,match='collection_protocol differs'):
+        m.resume_inventory(a,plans,candidate)

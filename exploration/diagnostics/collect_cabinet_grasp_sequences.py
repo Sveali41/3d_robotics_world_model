@@ -23,6 +23,9 @@ from exploration.raps.raps_gnn_actor import SkillCollector, action_contract, ski
 TEMPLATES = ('xyz', 'xzy', 'yxz', 'yzx', 'zxy', 'zyx', 'post_grasp', 'mid_lift', 'pre_carry')
 INSERTION_M = .03
 SOURCES = BASE_SOURCES + ('exploration/diagnostics/collect_cabinet_grasp_sequences.py',)
+GPU_SOURCES = ('domain/robocasa/batched_cabinet.py', 'domain/robocasa/batched_skills.py',
+               'exploration/diagnostics/collect_gpu_split7.py',
+               'exploration/diagnostics/trajectory_store.py')
 
 
 def cases(seed=1000000):
@@ -235,11 +238,39 @@ def identity(args, payload, config, settings):
                     templates=list(TEMPLATES), insertion=dict(frame='controller_root', out_delta_m=[0., INSERTION_M, 0.],
                     return_target='pre_insertion_tcp', position_tolerance_m=.012),
                     source_sha256={name: sha256(ROOT/name) for name in SOURCES})
+    if getattr(args, 'collector', 'scalar') == 'gpu_batch':
+        import importlib.metadata
+        import hashlib
+        import subprocess
+        import mani_skill
+        import sapien
+        from exploration.diagnostics.trajectory_store import FORMAT
+        manifest.update(collector='gpu_batch', sim_backend='gpu', num_envs=args.num_envs,
+                        trajectory_format=FORMAT, export_every_cases=args.export_every_cases,
+                        native_sapien_sha256=hashlib.sha256(Path(sapien.pysapien.__file__).read_bytes()).hexdigest(),
+                        dependencies={name: importlib.metadata.version(name)
+                                      for name in ('numpy', 'torch', 'sapien', 'mani_skill', 'gymnasium')})
+        upstream = Path(mani_skill.__file__).resolve().parents[1]
+        try:
+            commit = subprocess.check_output(['git', '-C', str(upstream), 'rev-parse', 'HEAD'], text=True).strip()
+            patch = subprocess.check_output(['git', '-C', str(upstream), 'diff', '--binary', 'HEAD'])
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f'GPU source provenance requires the pinned ManiSkill checkout at {upstream}') from error
+        manifest['mani_skill_source'] = dict(commit=commit, tracked_patch_sha256=hashlib.sha256(patch).hexdigest())
+        native_library = Path(sapien.pysapien.__file__).parent.parent/'sapien.libs'/'libsapien.so'
+        manifest['native_sapien_library_sha256'] = sha256(native_library)
+        patch_manifest = os.environ.get('SAPIEN_SPARSE_PATCH_MANIFEST')
+        if patch_manifest:
+            patch_manifest = Path(patch_manifest)
+            manifest['native_sparse_patch'] = dict(
+                manifest_sha256=sha256(patch_manifest),
+                build=json.loads(patch_manifest.read_text()))
+        manifest['source_sha256'].update({name: sha256(ROOT/name) for name in GPU_SOURCES})
     return manifest
 
 
-def results(output, planned):
-    result = base_results(output, planned)
+def results(output, planned, *, summaries=None):
+    result = base_results(output, planned, summaries=summaries)
     result['per_template'] = {}
     for template in TEMPLATES:
         rows = [s for s in result['cases'] if s['case']['template'] == template]
@@ -310,7 +341,19 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=1000000)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--skill-set', choices=('compact6', 'split7'), default='compact6')
+    parser.add_argument('--collector', choices=('scalar', 'gpu_batch'), default='scalar')
+    parser.add_argument('--num-envs', type=int)
+    parser.add_argument('--export-every-cases', type=int, default=64)
     args = parser.parse_args(argv)
+    if args.export_every_cases < 1:
+        parser.error('--export-every-cases must be positive')
+    if args.collector == 'gpu_batch':
+        if args.skill_set != 'split7':
+            parser.error('gpu_batch requires --skill-set split7')
+        if args.num_envs is None or args.num_envs < 1:
+            parser.error('gpu_batch requires an explicit positive --num-envs')
+    elif args.num_envs not in (None, 1):
+        parser.error('scalar supports only one environment')
     if not 0 <= args.seed <= 2**32 - 1 - 107:
         raise ValueError('Seed must leave all 108 base case seeds in the NumPy uint32 range')
     if args.stage == 'plan':
@@ -320,6 +363,8 @@ def main(argv=None):
                     action_dim=13 if args.skill_set == 'split7' else 12,
                     primitive_names=list(skill_schema({'skill_set': args.skill_set}).primitive_names), max_control_ticks_per_case=BUDGET,
                     max_control_ticks=972*BUDGET, physics_hz=100, control_hz=20)
+        if args.collector == 'gpu_batch':
+            plan.update(collector=args.collector, num_envs=args.num_envs, sim_backend='gpu')
         args.output.mkdir(parents=True, exist_ok=False)
         write_json(args.output/'plan.json', plan)
         print(json.dumps(plan))
@@ -336,13 +381,17 @@ def main(argv=None):
                 raise ValueError(f'Resume source snapshot mismatch: {name}')
     else:
         args.output.mkdir(parents=True, exist_ok=False)
-        for name in SOURCES:
+        for name in manifest['source_sha256']:
             destination = args.output/'sources'/name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT/name, destination)
         write_json(args.output/'manifest.json', manifest)
     os.environ['OMP_NUM_THREADS'] = os.environ['MKL_NUM_THREADS'] = '1'
     torch.set_num_threads(1)
+    if args.collector == 'gpu_batch':
+        from exploration.diagnostics.collect_gpu_split7 import run_gpu
+        run_gpu(args.output, manifest, payload, settings, args.num_envs, args.export_every_cases)
+        return 0
     for case in manifest['cases']:
         if not (args.output/'cases'/f"case_{case['case_id']:03d}"/'summary.json').exists():
             run_case(args.output, case, payload, settings)

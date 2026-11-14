@@ -126,15 +126,16 @@ def export(output, omitted=None, action_dim=12):
     return len(rows)
 
 
-def results(output, planned):
-    summaries = []
-    for case in planned:
-        path = output/'cases'/f"case_{case['case_id']:03d}"/'summary.json'
-        if path.exists():
-            summary = json.loads(path.read_text())
-            if summary['case'] != case:
-                raise ValueError(f'Case summary mismatch: {path}')
-            summaries.append(summary)
+def results(output, planned, *, summaries=None):
+    if summaries is None:
+        summaries = []
+        for case in planned:
+            path = output/'cases'/f"case_{case['case_id']:03d}"/'summary.json'
+            if path.exists():
+                summary = json.loads(path.read_text())
+                if summary['case'] != case:
+                    raise ValueError(f'Case summary mismatch: {path}')
+                summaries.append(summary)
     def counts(items):
         successes = sum(bool(s['success']) for s in items)
         failures = {}

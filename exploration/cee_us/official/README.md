@@ -33,6 +33,12 @@ Compatibility changes:
   reference path keeps the upstream index construction and prediction math.
   Captures replay the original prediction function and are discarded after
   fitting or loading, so updated normalizer tensors are captured afresh.
+- Opt-in `runtime_optimizations` uploads each fit's training arrays and each
+  epoch's original NumPy-sampled ensemble indices to the training device.
+  Detached training losses are transferred together at the existing logging
+  boundaries and summed in their original Python order. The disabled path
+  retains reference minibatch transfers and scalar logging. Batch sizes,
+  tail batches, sampling calls, normalizers and update order are preserved.
 
 Original initialization, MLP/LayerNorm math, parameter independence, loss reduction,
 Adam epsilon (1e-4), shuffled non-bootstrap ensemble minibatches, normalization

@@ -1,7 +1,8 @@
 """Budgeted state-GNN/iCEM exploration in the existing ManiSkill cabinet.
 
 Run ``python -m exploration.cee_us.cee_us_cabinet --help``. Explicit ``compare`` or
-``train`` starts training; ``smoke`` is capped at 300 real controller steps.
+``train`` starts training; state-model smoke is capped at 300 real controller
+steps, while the RGB JEPA branch has its own explicit 2000-control smoke cap.
 """
 
 import argparse
@@ -76,7 +77,8 @@ def replay_view(storage, count):
 
 
 def make_env(*, project_goals_to_region=False, episode_steps=None, centered_initial_tcp=False,
-             object_shift_xy=(0.0, 0.0), action_mode="ee_delta", obs_mode="state", sensor_configs=None):
+             object_shift_xy=(0.0, 0.0), action_mode="ee_delta", obs_mode="state", sensor_configs=None,
+             sim_backend="cpu", num_envs=1, raw_env=False, low_level_episode_steps=None):
     from main import build_env
     cfg = OmegaConf.load(ROOT / "configs/exploration.yaml")
     if action_mode not in {"ee_delta", "joint_position"}:
@@ -92,14 +94,22 @@ def make_env(*, project_goals_to_region=False, episode_steps=None, centered_init
         cfg.object_shift_xy = list(object_shift_xy)
     cfg.headless = True
     cfg.render_mode = None
-    cfg.sim_backend = "cpu"
+    if isinstance(num_envs, bool) or int(num_envs) != num_envs or num_envs < 1:
+        raise ValueError("num_envs must be a positive integer")
+    cfg.num_envs = int(num_envs)
+    cfg.sim_backend = sim_backend
     cfg.sim.sim_freq, cfg.sim.control_freq = 100, 20
     cfg.ppo.record_dense_trajectory = False
     if episode_steps is not None:
         if isinstance(episode_steps, bool) or int(episode_steps) != episode_steps or episode_steps < 1:
             raise ValueError("episode_steps must be a positive integer")
         cfg.max_ee_steps_per_episode = int(episode_steps)
-    return build_env(cfg), cfg
+    if low_level_episode_steps is not None:
+        if (isinstance(low_level_episode_steps, bool) or int(low_level_episode_steps) != low_level_episode_steps
+                or low_level_episode_steps < 1):
+            raise ValueError("low_level_episode_steps must be a positive integer")
+        cfg.max_low_level_steps_per_episode = int(low_level_episode_steps)
+    return build_env(cfg, raw_env=raw_env), cfg
 
 
 def prepare_output(output, config, env_config):
@@ -492,8 +502,18 @@ def main(argv=None):
                         help="Frozen evaluation only: move both objects in cabinet XY (meters); +X is deeper")
     parser.add_argument("--evaluation-steps", type=int, help="Frozen evaluation control-step budget")
     parser.add_argument("--policy", choices=("random", "curiosity"), default="curiosity")
-    parser.add_argument("--agent", choices=("icem", "raps_gnn_actor"),
+    parser.add_argument("--agent", choices=("icem", "raps_gnn_actor", "epic_jepa_cem"),
                         help="Exploration implementation; omitted keeps the configured agent, default iCEM")
+    parser.add_argument("--execution", choices=("reference", "cuda_graph"),
+                        help="Model prediction execution; omitted keeps the configured setting")
+    parser.add_argument("--runtime-optimizations", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable runtime optimizations; omitted keeps the configured setting")
+    parser.add_argument("--pick-place-primitives", action=argparse.BooleanOptionalAction, default=None,
+                        help="Use bounded grasp/place macros for the RAPS actor; omitted keeps YAML")
+    parser.add_argument("--grasp-retention", choices=("friction", "constraint"),
+                        help="Pick/place holding physics; omitted keeps YAML, default friction")
+    parser.add_argument("--total-controls", type=int,
+                        help="Explicit physical-control budget required for new JEPA training runs")
     args = parser.parse_args(argv)
     if (any(args.object_shift_xy) or args.evaluation_steps is not None) and args.stage != "evaluate":
         parser.error("Position shift and evaluation budget overrides require evaluate")
@@ -502,9 +522,27 @@ def main(argv=None):
     if args.evaluation_steps is not None and args.evaluation_steps < 1:
         parser.error("evaluation-steps must be positive")
     selected_agent = args.agent or OmegaConf.load(args.config).get("agent", "icem")
+    if (args.pick_place_primitives is not None or args.grasp_retention is not None) and selected_agent != "raps_gnn_actor":
+        parser.error("Pick/place flags require --agent raps_gnn_actor")
+    if selected_agent == "epic_jepa_cem":
+        from exploration.jepa.cabinet import run
+        return run(args, OmegaConf.load(args.config))
     if selected_agent == "raps_gnn_actor":
         from exploration.raps.raps_gnn_actor import run
-        return run(args, OmegaConf.load(args.config))
+        config = OmegaConf.load(args.config)
+        if args.execution is not None:
+            config.execution = args.execution
+        if args.runtime_optimizations is not None:
+            config.runtime_optimizations = args.runtime_optimizations
+        if args.pick_place_primitives is not None:
+            if "raps_actor" not in config:
+                config.raps_actor = {}
+            config.raps_actor.pick_place_primitives = args.pick_place_primitives
+        if args.grasp_retention is not None:
+            if "raps_actor" not in config:
+                config.raps_actor = {}
+            config.raps_actor.grasp_retention = args.grasp_retention
+        return run(args, config)
     if selected_agent != "icem":
         parser.error(f"Unknown exploration agent: {selected_agent}")
     if args.stage == "report":
@@ -519,6 +557,10 @@ def main(argv=None):
         config.evaluation_steps = args.evaluation_steps
     if args.agent is not None:
         config.agent = args.agent
+    if args.execution is not None:
+        config.execution = args.execution
+    if args.runtime_optimizations is not None:
+        config.runtime_optimizations = args.runtime_optimizations
     if args.device:
         config.device = args.device
     for key in ("bootstrap_steps", "rounds", "steps_per_round", "evaluation_steps", "epochs"):

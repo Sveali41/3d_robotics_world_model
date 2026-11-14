@@ -193,6 +193,7 @@ def payload_collision_planner(penetration_depth=0.):
                                    local=Pose(), groups=[1, 1, 0, 0])]
     planner.tcp_to_payload = Pose()
     planner.support_contacts = {}
+    planner.lower_support_obstacles = set()
 
     def collide(first, second, _request):
         pair = {first.geom, second.geom}
@@ -228,3 +229,15 @@ def test_designated_support_allows_shallow_touch_but_rejects_deeper_penetration(
     )
     contacts = planner._check(np.zeros(1))
     assert [contact["kind"] for contact in contacts] == ["payload_environment"]
+
+
+def test_only_explicit_open_approach_allows_unconfirmed_finger_contact():
+    planner, _, forces, _, _ = planner_with_items()
+    forces[("left", "cup")] = (.1, 0., 0.)
+    forces[("right", "cup")] = (.1, 0., 0.)
+    planner.gripper_command = 1.
+    plan = SimpleNamespace(metadata={"attachment": None, "allow_open_grasp_contact": True})
+    assert planner.check_attachment_feedback(plan) is None
+    planner.gripper_command = -1.
+    with pytest.raises(MotionPlanningError, match="unexpected_attachment"):
+        planner.check_attachment_feedback(plan)

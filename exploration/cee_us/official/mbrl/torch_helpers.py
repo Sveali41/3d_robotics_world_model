@@ -342,7 +342,8 @@ class output_to_numpy(Decorator):
 # Gets both torch and numpy as input, but for numpy returns extra dimension (1, ensemble_size, batch_size, data_dim)
 # For torch: (ensemble_size, batch_size, data_dim)
 class TorchTrainingIterator:
-    def __init__(self, data_dict, shuffle=True, ensemble=False, ensemble_size=None):
+    def __init__(self, data_dict, shuffle=True, ensemble=False, ensemble_size=None, runtime_optimizations=False):
+        self.runtime_optimizations = runtime_optimizations
         self.data_dict = data_dict
         self.size = list(self.data_dict.values())[0].shape[0]
         self.data_dict_keys = data_dict.keys()
@@ -353,6 +354,16 @@ class TorchTrainingIterator:
         self.ensemble_size = ensemble_size
 
         assert self.ensemble and self.ensemble_size > 0
+
+    def _device_indices(self, indices):
+        if self.runtime_optimizations:
+            return torch.as_tensor(indices, device=next(iter(self.data_dict.values())).device)
+        return indices
+
+    def _batch(self, indices):
+        if self.runtime_optimizations:
+            return {key: value[indices].unsqueeze(0) for key, value in self.data_dict.items()}
+        return {key: value[[indices]] for key, value in self.data_dict.items()}
 
     def get_epoch_iterator(self, batch_size, number_of_epochs):
         if self.ensemble:
@@ -369,12 +380,13 @@ class TorchTrainingIterator:
                 if self.shuffle:
                     subsampled_idx_permuted = np.asarray([np.random.permutation(x) for x in subsampled_idx])
                 #
+                subsampled_idx_permuted = self._device_indices(subsampled_idx_permuted)
                 iterations = int(np.ceil(self.size / batch_size))
 
                 for j in range(iterations):
                     idx = subsampled_idx_permuted[:, j * batch_size : (j + 1) * batch_size]
 
-                    batch = {key: value[[idx]] for key, value in self.data_dict.items()}
+                    batch = self._batch(idx)
 
                     yield batch
 
@@ -387,12 +399,13 @@ class TorchTrainingIterator:
                     subsampled_idx = np.asarray([np.random.permutation(self.size) for _ in range(self.ensemble_size)])
                 else:
                     subsampled_idx = np.tile(np.arange(0, self.size), (self.ensemble_size, 1))
+                subsampled_idx = self._device_indices(subsampled_idx)
                 iterations = int(np.ceil(self.size / batch_size))
 
                 for j in range(iterations):
                     idx = subsampled_idx[:, j * batch_size : (j + 1) * batch_size]
 
-                    batch = {key: value[[idx]] for key, value in self.data_dict.items()}
+                    batch = self._batch(idx)
 
                     yield batch
 
@@ -433,10 +446,11 @@ class TorchTrainingIterator:
             if self.shuffle:
                 subsampled_idx_permuted = np.asarray([np.random.permutation(x) for x in subsampled_idx])
             #
+            subsampled_idx_permuted = self._device_indices(subsampled_idx_permuted)
             for j in range(number_of_iterations):
                 idx = subsampled_idx_permuted[:, j * batch_size : (j + 1) * batch_size]
 
-                batch = {key: value[[idx]] for key, value in self.data_dict.items()}
+                batch = self._batch(idx)
 
                 yield batch
 

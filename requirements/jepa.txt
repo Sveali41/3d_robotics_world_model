@@ -1,0 +1,21 @@
+# Isolated additions to 3d_world_model.sif (Torch 2.3.1); no pretrained weights.
+# python -m pip install --target /tmp/jepa-runtime -r requirements/jepa.txt
+transformers==4.46.3
+einops==0.8.0
+numpy==1.26.4
+PyYAML==6.0.3
+certifi==2026.10.23
+charset-normalizer==3.5.2
+filelock==4.1.0
+fsspec==2026.9.0
+hf-xet==1.8.0
+huggingface_hub==0.36.2
+idna==3.20
+packaging==26.3
+regex==2026.9.29
+requests==2.34.2
+safetensors==0.8.0
+tokenizers==0.20.3
+tqdm==4.70.1
+typing_extensions==4.16.0
+urllib3==2.8.0

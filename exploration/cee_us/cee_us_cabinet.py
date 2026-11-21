@@ -51,12 +51,12 @@ def replay_arrays(rows):
             "truncated": np.asarray([r["truncated"] for r in rows], dtype=bool)}
 
 
-def allocate_replay(capacity):
+def allocate_replay(capacity, state_dim=66):
     if capacity < 1:
         raise ValueError('Replay capacity must be positive')
     return {key: np.empty((capacity, *shape), dtype=dtype) for key, shape, dtype in (
-        ('states', (66,), np.float32), ('actions', (4,), np.float32),
-        ('next_states', (66,), np.float32), ('episode_ids', (), np.int64),
+        ('states', (state_dim,), np.float32), ('actions', (4,), np.float32),
+        ('next_states', (state_dim,), np.float32), ('episode_ids', (), np.int64),
         ('terminated', (), bool), ('truncated', (), bool))}
 
 
@@ -77,6 +77,8 @@ def replay_view(storage, count):
 
 
 def make_env(*, project_goals_to_region=False, episode_steps=None, centered_initial_tcp=False,
+             cabinet_door=False, cabinet_grid=False, cabinet_grid_layout="legacy_3x4",
+             cabinet_item_layout="two_upper_second_row",
              object_shift_xy=(0.0, 0.0), action_mode="ee_delta", obs_mode="state", sensor_configs=None,
              sim_backend="cpu", num_envs=1, raw_env=False, low_level_episode_steps=None):
     from main import build_env
@@ -87,6 +89,11 @@ def make_env(*, project_goals_to_region=False, episode_steps=None, centered_init
     cfg.exploration_mode = "baseline"
     cfg.project_goals_to_region = bool(project_goals_to_region)
     cfg.centered_initial_tcp = centered_initial_tcp
+    cfg.cabinet_door = cabinet_door
+    cfg.cabinet_grid = cabinet_grid
+    cfg.cabinet_grid_layout = cabinet_grid_layout
+    # Keep historical two-object experiments independent of miniature scene defaults.
+    cfg.cabinet_item_layout = cabinet_item_layout
     cfg.obs_mode = obs_mode
     if sensor_configs is not None:
         cfg.sensor_configs = sensor_configs
@@ -139,7 +146,8 @@ def prepare_output(output, config, env_config):
         "log_flush_interval_steps": 32 if config.get('runtime_optimizations', False) else 1,
         "log_durability": 'Normal close and handled exceptions flush all records; abrupt termination may lose buffered records.',
         "adaptations": ["Panda and cup/bowl replace Fetch and blocks", "20 Hz control",
-                        "Robot joints and moving door included in global state",
+                        ("Robot joints and moving door included in global state" if env_config.get("cabinet_door", False)
+                         else "Robot joints included; absent door omitted from world-model state"),
                         "Object type and collision dimensions are static features",
                         "Shared random bootstrap differs from original zero-bootstrap CEE-US"],
     })
@@ -345,7 +353,7 @@ def compare(env, backend, encoder, config, output):
     capacity = int(config.bootstrap_steps) + int(config.rounds) * int(config.steps_per_round)
     bootstrap = Collector(env, backend, encoder, output / "bootstrap", runtime_optimizations=optimized)
     common = bootstrap.collect(int(config.bootstrap_steps), "random", seed=config.seed, stage="bootstrap")
-    cache = allocate_replay(capacity) if optimized else None
+    cache = allocate_replay(capacity, backend.state_dim) if optimized else None
     options = {}
     if optimized:
         append_replay(cache, 0, common)
@@ -362,7 +370,7 @@ def compare(env, backend, encoder, config, output):
         rows = list(common)
         if optimized:
             # Each arm owns storage; bootstrap is its only shared data.
-            cache = allocate_replay(capacity)
+            cache = allocate_replay(capacity, backend.state_dim)
             append_replay(cache, 0, common)
         # Shared bootstrap and each arm use distinct episode namespaces in replay.
         collector.episode_id = max(r["episode_id"] for r in common)
@@ -403,7 +411,8 @@ def train(env, backend, encoder, config, output):
     rows = collector.collect(int(config.bootstrap_steps), "random", seed=config.seed, stage="bootstrap")
     options = {}
     if optimized:
-        cache = allocate_replay(int(config.bootstrap_steps) + int(config.rounds) * int(config.steps_per_round))
+        cache = allocate_replay(int(config.bootstrap_steps) + int(config.rounds) * int(config.steps_per_round),
+                                backend.state_dim)
         append_replay(cache, 0, rows)
         options['arrays'] = replay_view(cache, len(rows))
     train_round(backend, rows, int(config.epochs), collector.directory, "bootstrap", **options)
@@ -508,6 +517,8 @@ def main(argv=None):
                         help="Model prediction execution; omitted keeps the configured setting")
     parser.add_argument("--runtime-optimizations", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable runtime optimizations; omitted keeps the configured setting")
+    parser.add_argument("--collection-optimizations", action=argparse.BooleanOptionalAction, default=None,
+                        help="RAPS collection geometry/state caches; omitted keeps the configured setting")
     parser.add_argument("--pick-place-primitives", action=argparse.BooleanOptionalAction, default=None,
                         help="Use bounded grasp/place macros for the RAPS actor; omitted keeps YAML")
     parser.add_argument("--grasp-retention", choices=("friction", "constraint"),
@@ -522,6 +533,8 @@ def main(argv=None):
     if args.evaluation_steps is not None and args.evaluation_steps < 1:
         parser.error("evaluation-steps must be positive")
     selected_agent = args.agent or OmegaConf.load(args.config).get("agent", "icem")
+    if args.collection_optimizations is not None and selected_agent != "raps_gnn_actor":
+        parser.error("Collection optimizations require --agent raps_gnn_actor")
     if (args.pick_place_primitives is not None or args.grasp_retention is not None) and selected_agent != "raps_gnn_actor":
         parser.error("Pick/place flags require --agent raps_gnn_actor")
     if selected_agent == "epic_jepa_cem":
@@ -534,6 +547,8 @@ def main(argv=None):
             config.execution = args.execution
         if args.runtime_optimizations is not None:
             config.runtime_optimizations = args.runtime_optimizations
+        if args.collection_optimizations is not None:
+            config.collection_optimizations = args.collection_optimizations
         if args.pick_place_primitives is not None:
             if "raps_actor" not in config:
                 config.raps_actor = {}
@@ -599,7 +614,10 @@ def main(argv=None):
         prepare_output(output, config, env_config)
         prepared = True
         write_json(output / "state_contract.json", encoder.contract())
+        contract = encoder.contract()
         backend = CEEUSBackend(device=str(config.device), seed=int(config.seed),
+                               agent_dim=contract["agent_dim"], num_objects=len(contract["object_names"]),
+                               object_names=contract["object_names"],
                                candidates=candidates, execution=execution,
                                action_projection=(encoder.action_projection_contract()
                                    if env_config.project_goals_to_region else None),

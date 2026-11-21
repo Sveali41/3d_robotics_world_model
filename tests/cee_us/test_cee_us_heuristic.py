@@ -118,8 +118,24 @@ def test_invalid_settings(setting):
 
 
 def test_fixed_layout_required():
-    with pytest.raises(ValueError, match='requires agent_dim=32'):
-        backend({}, agent_dim=31)
+    with pytest.raises(ValueError, match='requires cabinet agent_dim'):
+        backend({}, agent_dim=29)
+
+
+@pytest.mark.parametrize('agent_dim', [30, 32])
+def test_first_object_disagreement_is_not_reported_as_door(monkeypatch, agent_dim):
+    b = backend(agent_dim=agent_dim, num_objects=1, object_names=('cabinet_item_16',))
+    std = torch.zeros(3, b.state_dim)
+    std[:, agent_dim] = 1.
+
+    def action(observation, state):
+        b.planner.selected_std = std
+        return np.zeros(4, np.float32)
+
+    monkeypatch.setattr(b.planner, 'get_action', action)
+    _, diagnostics = b.action(np.zeros(b.state_dim, np.float32))
+    assert diagnostics['score_decomposition']['door'] == 0.
+    assert diagnostics['score_decomposition']['objects'] == 3.
 
 
 def test_action_diagnostics_and_zero_weight_parity():

@@ -1,4 +1,4 @@
-# RAPS contact exploration in WallCabinetTwoItems-v1.
+# RAPS contact exploration in the cup-only miniature cabinet.
 # primitives: existing 20D RAPS; ee_delta: 4D normalized xyz delta + gripper.
 # ee_delta executes exactly one 20 Hz control step, with fixed wrist orientation.
 # Native Panda translation range is +/-0.1 m per axis; no action repetition.
@@ -7,6 +7,10 @@ action_mode: primitives
 exploration_mode: baseline
 # Position constraint independent of the selected reward.
 project_goals_to_region: false
+cabinet_grid: true
+cabinet_grid_layout: trapezoid_4_3_2_1
+cabinet_item_layout: single_upper_second_row
+cabinet_door: false
 policy: ppo
 seed: 0
 primitives: 100

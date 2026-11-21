@@ -51,7 +51,17 @@ class CEEUSBackend:
                  hidden_dim=128, horizon=30, candidates=128, iterations=3,
                  elites=10, batch_size=125, execution='reference', action_projection=None,
                  object_heuristic=None, runtime_optimizations=False, action_dim=4,
-                 object_names=None, attach_icem=True, forward_model_class=GNNForwardEnsembleModel):
+                 object_names=None, attach_icem=True, forward_model_class=GNNForwardEnsembleModel,
+                 learning_rate=1e-5, position_loss_scale_m=None):
+        for name, value in (('learning_rate', learning_rate), ('position_loss_scale_m', position_loss_scale_m)):
+            if value is None and name == 'position_loss_scale_m':
+                continue
+            if isinstance(value, (bool, np.bool_)) or not np.isscalar(value) or not np.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be a positive finite number')
+        if position_loss_scale_m is not None and (object_dyn_dim < 3 or num_objects < 1 or forward_model_class is not GNNForwardEnsembleModel):
+            raise ValueError('position_loss_scale_m requires the standard GNN with object XYZ')
+        self.training_contract = dict(learning_rate=float(learning_rate),
+                                      position_loss_scale_m=None if position_loss_scale_m is None else float(position_loss_scale_m))
         if isinstance(action_dim, bool) or not isinstance(action_dim, (int, np.integer)) or action_dim < 1:
             raise ValueError('action_dim must be a positive integer')
         if action_projection is not None and action_dim != 4:
@@ -68,8 +78,8 @@ class CEEUSBackend:
             raise ValueError('object_names must contain one unique nonempty name per object')
         self.object_names = tuple(object_names)
         self.object_heuristic = self._validate_object_heuristic(object_heuristic, self.object_names)
-        if self.object_heuristic is not None and (agent_dim not in (32, 33) or object_dyn_dim != 12 or len(self.object_names) != num_objects):
-            raise ValueError('object_heuristic requires agent_dim=32 or 33, object_dyn_dim=12, and object_names for all objects')
+        if self.object_heuristic is not None and (agent_dim not in (30, 31, 32, 33) or object_dyn_dim != 12 or len(self.object_names) != num_objects):
+            raise ValueError('object_heuristic requires cabinet agent_dim=30, 31, 32 or 33, object_dyn_dim=12, and object_names for all objects')
         torch_helpers.device = torch.device(device)
         torch.manual_seed(seed)
         self.device = torch.device(device)
@@ -106,10 +116,12 @@ class CEEUSBackend:
             env=self.env, normalize_w_running_stats=False,
             model_params=dict(n=ensemble_size, hidden_dim=hidden_dim, num_layers=2,
                               num_message_passing=1, layer_norm=True),
-            train_params=dict(epochs=1, batch_size=batch_size, learning_rate=1e-5,
+            train_params=dict(epochs=1, batch_size=batch_size, learning_rate=float(learning_rate),
                               weight_decay=.001, bootstrapped=False,
                               runtime_optimizations=self.runtime_optimizations),
         )
+        if position_loss_scale_m is not None:
+            self.model.loss = self._physical_position_loss
         if not attach_icem and (execution != 'reference' or action_projection is not None or object_heuristic is not None):
             raise ValueError('Model-only backend requires reference execution without cabinet heuristics or projection')
         self.planner = None
@@ -128,6 +140,20 @@ class CEEUSBackend:
             from exploration.cee_us.cee_us_cuda_graph import CudaGraphPrediction
             self.prediction_accelerator = CudaGraphPrediction(self.model)
             self.model.predict = self.prediction_accelerator.predict
+
+    def _physical_position_loss(self, batch, target=None):
+        if target is not None:
+            raise ValueError('Targets must come from next_observations')
+        agent, objects, static, actions, target_agent, target_objects = self.model._process_batch(batch)
+        pred_agent, pred_objects = self.model.model(agent, objects, static, actions)
+        agent_errors = (pred_agent - target_agent).square()
+        object_errors = (pred_objects - target_objects).square()
+        xyz_weights = (self.dynamic_dim / (3 * self.env.nObj) *
+                       self.model.output_obj_normalizer.std[..., :3].square() /
+                       self.training_contract['position_loss_scale_m'] ** 2)
+        weighted_xyz = object_errors[..., :3] * xyz_weights
+        errors = torch.cat((agent_errors, weighted_xyz.flatten(2), object_errors[..., 3:].flatten(2)), dim=-1)
+        return errors.mean((1, 2)).sum()
 
     def _attach_icem(self, horizon, candidates, iterations, elites):
         self.planner = _MeasuredPlanner(
@@ -274,7 +300,7 @@ class CEEUSBackend:
             else:
                 self.model.memory_is_preallocated = False
 
-    def train(self, replay, epochs):
+    def train(self, replay, epochs, *, training_indices=None):
         # Captures reference normalizer storage; recomputing statistics replaces it.
         if self.prediction_accelerator is not None:
             self.prediction_accelerator.invalidate()
@@ -289,6 +315,16 @@ class CEEUSBackend:
         if not np.array_equal(states[:, self.dynamic_dim:], batch['next_observations'][:, self.dynamic_dim:]):
             raise ValueError('Object static fields must remain unchanged across transitions')
         buffer = RolloutBuffer(rollouts=[Rollout.from_dict(**batch)])
+        training_buffer = buffer
+        if training_indices is not None:
+            indices = np.asarray(training_indices)
+            if (indices.ndim != 1 or indices.dtype.kind not in 'iu' or len(indices) < 2
+                    or np.any(indices < 0) or np.any(indices >= len(states))):
+                raise ValueError('training_indices must be valid one-dimensional replay indices')
+            if epochs != 1 or len(indices) % self.model.batch_size:
+                raise ValueError('Sampled replay requires one epoch and complete minibatches')
+            training_buffer = RolloutBuffer(rollouts=[Rollout.from_dict(
+                **{key: value[indices] for key, value in batch.items()})])
         def timed(label, operation):
             if self.profile_timings is None:
                 return operation()
@@ -314,7 +350,7 @@ class CEEUSBackend:
         self._fit_updates = 0
         self.model.profile_timings = self.profile_timings
         try:
-            metrics = timed('model_training_s', lambda: self.model.train(buffer, maybe_update_normalizer=False))
+            metrics = timed('model_training_s', lambda: self.model.train(training_buffer, maybe_update_normalizer=False))
         except torch.cuda.OutOfMemoryError as exc:
             if self.runtime_optimizations:
                 raise RuntimeError(
@@ -349,8 +385,9 @@ class CEEUSBackend:
         action = self._array(action, (self.action_dim,), 'action').copy()
         self.planner.last_action = torch.as_tensor(action, device=self.device).clone()
         std = self.planner.selected_std
+        door_end = 32 if self.env.agent_dim in (32, 33) else 30
         components = dict(joint=float(std[:, :18].sum()), tcp=float(std[:, 18:30].sum()),
-                          door=float(std[:, 30:32].sum()), objects=float(std[:, 32:self.dynamic_dim].sum()))
+                          door=float(std[:, 30:door_end].sum()), objects=float(std[:, self.env.agent_dim:self.dynamic_dim].sum()))
         diagnostics = dict(planning_seconds=perf_counter()-started,
                             candidate_rollout_seconds=self.planner.rollout_seconds,
                             curiosity_score=float(std.sum()), score_decomposition=components)
@@ -392,7 +429,7 @@ class CEEUSBackend:
     def state_dict(self):
         payload = dict(
             model=self.model.model.state_dict(), optimizer=self.model.optimizer.state_dict(),
-            action_dim=self.action_dim,
+            action_dim=self.action_dim, training_contract=self.training_contract,
             normalizers={n: getattr(self.model, n).state_dict() for n in self.normalizer_names},
             planner={n: getattr(self.planner, n, None) for n in
                      ('mean_', 'std_', 'last_action', 'was_reset', 'forward_model_state')},
@@ -403,6 +440,12 @@ class CEEUSBackend:
         return self._move_tensors(payload, 'cpu')
 
     def load_state_dict(self, payload, *, restore_planner=True):
+        saved_agent_dim = int(payload['normalizers']['input_normalizer_agent']['mean'].shape[-1])
+        if saved_agent_dim != self.env.agent_dim:
+            raise ValueError('Checkpoint agent_dim differs from backend; door state layout changed. '
+                             'Start a new run with matching state/data contracts; legacy checkpoints are not converted.')
+        if payload.get('training_contract', {'learning_rate': 1e-5, 'position_loss_scale_m': None}) != self.training_contract:
+            raise ValueError('Checkpoint training_contract does not match backend learning rate and position loss')
         if restore_planner:
             has_icem_state = any(value is not None for value in payload['planner'].values())
             if has_icem_state != (self.planner is not None):

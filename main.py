@@ -23,7 +23,7 @@ import numpy as np
 from omegaconf import DictConfig
 
 
-def build_env(cfg: DictConfig):
+def build_env(cfg: DictConfig, *, raw_env=False):
     import gymnasium as gym
 
     # Importing the class registers WallCabinetTwoItems-v1 with Gymnasium.
@@ -52,8 +52,15 @@ def build_env(cfg: DictConfig):
         raise ValueError("exploration_mode must be baseline or D")
 
     render_mode = cfg.render_mode or (None if cfg.headless else "human")
+    item_layout = getattr(cfg, "cabinet_item_layout", "two_upper_second_row")
+    environment_ids = {
+        "single_upper_second_row": "WallCabinetSingleItem-v1",
+        "two_upper_second_row": "WallCabinetTwoItems-v1",
+    }
+    if item_layout not in environment_ids:
+        raise ValueError(f"Unsupported miniature cabinet_item_layout={item_layout!r}")
     base_env = gym.make(
-        "WallCabinetTwoItems-v1",
+        environment_ids[item_layout],
         obs_mode=str(getattr(cfg, "obs_mode", "state")),
         sensor_configs=OmegaConf.to_container(cfg.sensor_configs, resolve=True)
         if cfg.get("sensor_configs") is not None else {},
@@ -61,6 +68,7 @@ def build_env(cfg: DictConfig):
         control_mode="pd_ee_delta_pose",
         render_mode=render_mode,
         sim_backend=cfg.sim_backend,
+        num_envs=int(getattr(cfg, "num_envs", 1)),
         sim_config={
             "sim_freq": int(cfg.sim.sim_freq),
             "control_freq": int(cfg.sim.control_freq),
@@ -68,8 +76,16 @@ def build_env(cfg: DictConfig):
         visualize_exploration_region=not cfg.headless,
         viewer_camera_configs={"shader_pack": cfg.shader},
         centered_initial_tcp=getattr(cfg, "centered_initial_tcp", False),
+        cabinet_door=getattr(cfg, "cabinet_door", False),
+        cabinet_grid=getattr(cfg, "cabinet_grid", False),
+        cabinet_grid_layout=getattr(cfg, "cabinet_grid_layout", "legacy_3x4"),
         object_shift_xy=getattr(cfg, "object_shift_xy", (0.0, 0.0)),
     )
+    if raw_env:
+        return base_env
+    if int(getattr(cfg, "num_envs", 1)) != 1:
+        base_env.close()
+        raise ValueError("Multiple environments require raw_env=True and a batched collector")
     raps_env = RAPSEnvWrapper(
         base_env,
         robot="panda",

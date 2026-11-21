@@ -63,10 +63,18 @@ def test_reject_non_split_or_missing_heuristic():
                          object_heuristic=None))
 
 
-def test_pick_place_preset_and_three_arm_parity():
+@pytest.mark.parametrize("preset", [
+    "raps_gnn_actor_cabinet_pick_place.yaml",
+    "raps_gnn_actor_cabinet_pick_place_target.yaml",
+    "raps_gnn_actor_cabinet_grasp_only.yaml",
+    "raps_gnn_actor_cabinet_grasp_grid.yaml",
+    "raps_gnn_actor_cabinet_grasp_grid_fast.yaml",
+    "raps_gnn_actor_cabinet_pick_place_grid.yaml",
+])
+def test_pick_place_preset_and_three_arm_parity(preset):
     root = Path(__file__).resolve().parents[2]
     legacy = OmegaConf.to_container(OmegaConf.load(root / "configs/raps_gnn_actor_cabinet_split7.yaml"))
-    base = OmegaConf.to_container(OmegaConf.load(root / "configs/raps_gnn_actor_cabinet_pick_place.yaml"))
+    base = OmegaConf.to_container(OmegaConf.load(root / "configs" / preset))
     assert (base["bootstrap_steps"], base["rounds"], base["steps_per_round"],
             base["evaluation_steps"], base["episode_steps"]) == (2000, 398, 2000, 2000, 2200)
     assert base["bootstrap_steps"] + base["rounds"] * base["steps_per_round"] + base["evaluation_steps"] == 800000
@@ -78,6 +86,10 @@ def test_pick_place_preset_and_three_arm_parity():
                 "target_update_period"):
         assert base["raps_actor"][key] == legacy["raps_actor"][key]
     actor = base["raps_actor"]
+    if actor.get("pick_place_grid", False):
+        from exploration.raps.raps_gnn_actor import skill_schema
+        assert actor["grasp_orientation_candidates"]
+        assert skill_schema(actor).action_dim == (61 if actor.get("grasp_only", False) else 73)
     assert base["action_mode"] == "joint_position"
     assert actor["pick_place_primitives"] and actor["motion_execution"] == "planner"
     assert actor["grasp_retention"] == "constraint" and actor["latched_gripper"]
@@ -123,3 +135,37 @@ def test_optional_heuristic_only_arm_preserves_base_and_other_settings():
     assert arms["curiosity_only"]["object_heuristic"] is None
     assert arms["random"]["collection_policy"] == "random"
     assert arms["random"]["object_heuristic"] is None
+
+
+def test_current_cup_trapezoid_four_arm_contract_and_budget():
+    from exploration.raps.raps_gnn_actor import skill_schema, action_contract
+    root = Path(__file__).resolve().parents[2]
+    base = OmegaConf.to_container(OmegaConf.load(
+        root / 'configs/raps_gnn_actor_cabinet_grasp_trapezoid.yaml'), resolve=True)
+    arms = arm_configs(base, include_heuristic_only=True)
+    assert tuple(arms) == ('curiosity_heuristic', 'curiosity_only', 'heuristic_only', 'random')
+    expected = action_contract(base['raps_actor'])
+    for name, config in arms.items():
+        assert config['cabinet_item_layout'] == 'single_upper_second_row'
+        assert config['cpu_sampling'] == {'workers': 2, 'streams': 2}
+        assert config['wm_replay'] == base['wm_replay']
+        assert config['wm_replay']['updates'] == 100
+        assert config['wm_replay']['mode'] == 'bounded_dynamic'
+        assert config['wm_training'] == {'learning_rate': .0001, 'position_loss_scale_m': .01}
+        assert config['raps_actor']['reconfigure_on_reset'] is True
+        assert config['cabinet_door'] is False and config['centered_initial_tcp'] is True
+        assert skill_schema(config['raps_actor']).action_dim == 31
+        assert config['raps_actor']['grasp_preflight'] is False
+        assert 'grasp_preflight' not in action_contract(config['raps_actor'])
+        contract = action_contract(config['raps_actor'])
+        contract.pop('disagreement_weight', None)
+        assert contract == expected
+        assert config['bootstrap_steps'] + config['rounds'] * config['steps_per_round'] + config['evaluation_steps'] == 400000
+        assert config['raps_actor']['imagination_horizon'] == 1
+        assert config['raps_actor']['discount'] == 0.0
+        assert config['collection_policy'] == ('random' if name == 'random' else 'curiosity')
+        if name in ('curiosity_heuristic', 'heuristic_only'):
+            assert config['object_heuristic']['object_weights'] == {'cabinet_item_16': 1.0}
+        else:
+            assert config['object_heuristic'] is None
+    assert arms['heuristic_only']['raps_actor']['disagreement_weight'] == 0.

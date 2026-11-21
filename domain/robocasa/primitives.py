@@ -11,6 +11,7 @@ to the selected robot controller.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -374,6 +375,12 @@ class PrimitiveContext:
         return objects
 
     def finger_contact_force(self, object_id: str) -> tuple[float, float]:
+        if not self._contact_feedback_current():
+            return (0., 0.)
+        cache = getattr(self, "_contact_force_cache", None)
+        if cache is not None and object_id in cache:
+            return cache[object_id]
+        started = perf_counter()
         actor = self.objects[object_id].actor
         # PandaWristCam declares the pad-link attributes but leaves them as
         # ``None`` because its URDF only exposes the regular finger links.
@@ -382,15 +389,23 @@ class PrimitiveContext:
         right_link = getattr(self.agent, "finger2pad_link", None) or self.agent.finger2_link
         left = self.env.scene.get_pairwise_contact_forces(left_link, actor)
         right = self.env.scene.get_pairwise_contact_forces(right_link, actor)
-        return (
+        result = (
             float(torch.linalg.norm(left, dim=-1)[0].item()),
             float(torch.linalg.norm(right, dim=-1)[0].item()),
         )
+        profile = getattr(self.env, "_collection_profile", None)
+        if isinstance(profile, dict):
+            profile["contact_force_read_s"] = profile.get("contact_force_read_s", 0.) + perf_counter() - started
+        if cache is not None:
+            cache[object_id] = result
+        return result
 
     def is_grasping(self, object_id: str) -> bool:
         binding = getattr(self.env, "_grasp_binding", None)
         if binding is not None and binding.bound_object_id == object_id:
             return True
+        if not self._contact_feedback_current():
+            return False
         actor = self.objects[object_id].actor
         result = self.agent.is_grasping(actor)
         if bool(result[0].item()):
@@ -401,6 +416,10 @@ class PrimitiveContext:
         # physical success criterion; this threshold only detects a closed
         # two-finger contact opportunity.
         return left >= 0.05 and right >= 0.05
+
+    def _contact_feedback_current(self):
+        # CPU PhysX retains the previous step's contacts after a reset teleport.
+        return getattr(self.env, "_contact_report_current", True)
 
     def contact_snapshot(self) -> dict[str, Any]:
         """Return post-transition contact labels for dense recording only."""

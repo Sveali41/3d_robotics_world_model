@@ -31,7 +31,7 @@ class WallCabinetEnv(BaseEnv):
     cabinet frame is fixed to a vertical wall, while its door is a physical
     revolute link that opens towards the robot.
 
-    The door starts visibly open at 70 degrees and is not itself a task goal.
+    The optional door starts open at 70 degrees; grasp-only presets omit it.
     The base environment is reward-free so object-interaction rewards can be
     supplied explicitly by a high-level exploration wrapper.
     """
@@ -86,12 +86,18 @@ class WallCabinetEnv(BaseEnv):
         cabinet_item_layout: str | None = None,
         visualize_exploration_region: bool = False,
         centered_initial_tcp: bool = False,
+        cabinet_door: bool = False,
+        cabinet_grid: bool = False,
+        cabinet_grid_layout: str = "legacy_3x4",
         object_shift_xy=(0.0, 0.0),
         **kwargs,
     ):
         if not isinstance(centered_initial_tcp, bool):
             raise ValueError("centered_initial_tcp must be a boolean")
         self.centered_initial_tcp = centered_initial_tcp
+        if not isinstance(cabinet_door, bool):
+            raise ValueError("cabinet_door must be a boolean")
+        self.cabinet_door = cabinet_door
         shift = np.asarray(object_shift_xy, dtype=np.float32)
         if shift.shape != (2,) or not np.isfinite(shift).all():
             raise ValueError("object_shift_xy must be two finite cabinet-local offsets in meters")
@@ -110,6 +116,20 @@ class WallCabinetEnv(BaseEnv):
             "two_upper_second_row",
         }:
             raise ValueError(f"Unknown cabinet_item_layout={cabinet_item_layout!r}")
+        if not isinstance(cabinet_grid, bool):
+            raise ValueError("cabinet_grid must be a boolean")
+        if cabinet_grid and cabinet_item_layout not in {
+            "single_upper_second_row", "two_upper_second_row",
+        }:
+            raise ValueError("cabinet_grid requires a single- or two-item upper-shelf layout")
+        if cabinet_grid and np.any(self.object_shift_xy):
+            raise ValueError("cabinet_grid fixes spawn XY; object_shift_xy must be zero")
+        from domain.robocasa.cabinet_grid import resolve_grid_layout
+        resolve_grid_layout(cabinet_grid_layout)
+        if not cabinet_grid and cabinet_grid_layout != "legacy_3x4":
+            raise ValueError("cabinet_grid_layout requires cabinet_grid")
+        self.cabinet_grid = cabinet_grid
+        self.cabinet_grid_layout = cabinet_grid_layout
         self.cabinet_item_layout = cabinet_item_layout
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
@@ -174,8 +194,6 @@ class WallCabinetEnv(BaseEnv):
 
         wood = self._material([0.63, 0.39, 0.20, 1.0])
         inside = self._material([0.74, 0.55, 0.34, 1.0])
-        door_material = self._material([0.19, 0.43, 0.62, 1.0])
-        handle_material = self._material([0.10, 0.11, 0.12, 1.0])
 
         frame = cabinet_builder.create_link_builder(parent=None)
         frame.set_name("frame")
@@ -198,49 +216,52 @@ class WallCabinetEnv(BaseEnv):
             frame.add_box_collision(part_pose, half_size=half_size)
             frame.add_box_visual(part_pose, half_size=half_size, material=material)
 
-        door = cabinet_builder.create_link_builder(parent=frame)
-        door.set_name("door")
-        door.set_joint_name("door_hinge")
+        if self.cabinet_door:
+            door_material = self._material([0.19, 0.43, 0.62, 1.0])
+            handle_material = self._material([0.10, 0.11, 0.12, 1.0])
+            door = cabinet_builder.create_link_builder(parent=frame)
+            door.set_name("door")
+            door.set_joint_name("door_hinge")
 
-        # SAPIEN revolute joints rotate about their local x-axis.  This
-        # quaternion maps it to -z, so a positive angle swings the door out
-        # towards the robot instead of through the cabinet.
-        hinge_orientation = [0.7071068, 0.0, 0.7071068, 0.0]
-        door.set_joint_properties(
-            type="revolute",
-            limits=[[0.0, self.MAX_OPEN_ANGLE]],
-            pose_in_parent=sapien.Pose(
-                [-0.265, 0.275, 0.0], hinge_orientation
-            ),
-            pose_in_child=sapien.Pose([0.0, 0.0, 0.0], hinge_orientation),
-            friction=0.06,
-            damping=0.20,
-        )
+            # SAPIEN revolute joints rotate about their local x-axis.  This
+            # quaternion maps it to -z, so a positive angle swings the door out
+            # towards the robot instead of through the cabinet.
+            hinge_orientation = [0.7071068, 0.0, 0.7071068, 0.0]
+            door.set_joint_properties(
+                type="revolute",
+                limits=[[0.0, self.MAX_OPEN_ANGLE]],
+                pose_in_parent=sapien.Pose(
+                    [-0.265, 0.275, 0.0], hinge_orientation
+                ),
+                pose_in_child=sapien.Pose([0.0, 0.0, 0.0], hinge_orientation),
+                friction=0.06,
+                damping=0.20,
+            )
 
-        door_pose = sapien.Pose([0.0, -0.275, 0.0])
-        door.add_box_collision(door_pose, half_size=[0.012, 0.27, 0.34])
-        door.add_box_visual(
-            door_pose,
-            half_size=[0.012, 0.27, 0.34],
-            material=door_material,
-        )
+            door_pose = sapien.Pose([0.0, -0.275, 0.0])
+            door.add_box_collision(door_pose, half_size=[0.012, 0.27, 0.34])
+            door.add_box_visual(
+                door_pose,
+                half_size=[0.012, 0.27, 0.34],
+                material=door_material,
+            )
 
-        # A protruding vertical handle near the free edge of the door.
-        handle_pose = sapien.Pose([-0.035, -0.49, 0.0])
-        door.add_box_collision(handle_pose, half_size=[0.025, 0.018, 0.095])
-        door.add_box_visual(
-            handle_pose,
-            half_size=[0.025, 0.018, 0.095],
-            material=handle_material,
-        )
+            # A protruding vertical handle near the free edge of the door.
+            handle_pose = sapien.Pose([-0.035, -0.49, 0.0])
+            door.add_box_collision(handle_pose, half_size=[0.025, 0.018, 0.095])
+            door.add_box_visual(
+                handle_pose,
+                half_size=[0.025, 0.018, 0.095],
+                material=handle_material,
+            )
 
         self.cabinet = cabinet_builder.build("wall_cabinet", fix_root_link=True)
-        self.door_link = self.cabinet.links_map["door"]
-        self.door_joint = self.cabinet.active_joints_map["door_hinge"]
-
-        with torch.device(self.device):
-            handle_offset = torch.tensor([[-0.035, -0.49, 0.0]])
-            self._handle_local_pose = Pose.create_from_pq(p=handle_offset)
+        self.door_link = self.cabinet.links_map.get("door")
+        self.door_joint = self.cabinet.active_joints_map.get("door_hinge")
+        if self.cabinet_door:
+            with torch.device(self.device):
+                handle_offset = torch.tensor([[-0.035, -0.49, 0.0]])
+                self._handle_local_pose = Pose.create_from_pq(p=handle_offset)
 
         if self.cabinet_item_layout == "full":
             self._build_cabinet_items()
@@ -255,6 +276,17 @@ class WallCabinetEnv(BaseEnv):
             self.cabinet_items = []
             self.cabinet_item_types = []
             self._item_spawn_positions = []
+
+        if self.cabinet_grid:
+            from domain.robocasa.cabinet_grid import local_collision_bounds, resolve_grid_layout
+            grid_xy, initial_cells = resolve_grid_layout(self.cabinet_grid_layout)
+            root_pose = self.ROBOT_POSE
+            for item, spawn in zip(self.cabinet_items, self._item_spawn_positions):
+                xy = grid_xy[initial_cells[item.name]]
+                # Legacy locates the collision center; compact locates the native actor origin.
+                center = (local_collision_bounds(item).mean(axis=0)[:2]
+                          if self.cabinet_grid_layout == "legacy_3x4" else np.zeros(2))
+                spawn[:2] = np.asarray(root_pose.p)[:2] + np.asarray(xy) - center
 
         self._two_item_observation_actors = {}
         if self.cabinet_item_layout == "two_upper_second_row":
@@ -831,10 +863,14 @@ class WallCabinetEnv(BaseEnv):
 
     @property
     def handle_position(self):
+        if self.door_link is None:
+            raise RuntimeError("The doorless cabinet has no handle")
         return (self.door_link.pose * self._handle_local_pose).p
 
     @property
     def door_angle(self):
+        if self.door_joint is None:
+            return torch.zeros(self.num_envs, device=self.device)
         return self.door_joint.qpos
 
     def _clear_grasp_binding(self):
@@ -844,6 +880,9 @@ class WallCabinetEnv(BaseEnv):
             self.__dict__.pop("_grasp_binding")
 
     def reset(self, *args, **kwargs):
+        if (self.cabinet_item_layout == "single_upper_second_row"
+                and self.cabinet_grid_layout == "trapezoid_4_3_2_1"):
+            self._contact_report_current = False
         self._clear_grasp_binding()
         return super().reset(*args, **kwargs)
 
@@ -884,6 +923,8 @@ class WallCabinetEnv(BaseEnv):
 
     def _after_simulation_step(self):
         super()._after_simulation_step()
+        if "_contact_report_current" in self.__dict__:
+            self._contact_report_current = True
         binding = self.__dict__.get("_grasp_binding")
         if binding is not None:
             binding.observe_substep(1. / self.sim_freq)
@@ -894,11 +935,12 @@ class WallCabinetEnv(BaseEnv):
         with torch.device(self.device):
             batch_size = len(env_idx)
 
-            initial_angle = torch.full(
-                (batch_size, 1), float(self.INITIAL_OPEN_ANGLE)
-            )
-            self.cabinet.set_qpos(initial_angle)
-            self.cabinet.set_qvel(torch.zeros((batch_size, 1)))
+            if self.cabinet_door:
+                initial_angle = torch.full(
+                    (batch_size, 1), float(self.INITIAL_OPEN_ANGLE)
+                )
+                self.cabinet.set_qpos(initial_angle)
+                self.cabinet.set_qvel(torch.zeros((batch_size, 1)))
 
             for item, spawn_position in zip(
                 self.cabinet_items, self._item_spawn_positions
@@ -926,13 +968,15 @@ class WallCabinetEnv(BaseEnv):
             self.agent.robot.set_pose(self.ROBOT_POSE)
 
     def evaluate(self):
-        return {
+        info = {
             # This is an exploration scene, not a door-opening task. A grasp
             # exploration wrapper can replace this with its own success event.
             "success": torch.zeros_like(self.door_angle, dtype=torch.bool),
             "door_angle": self.door_angle,
-            "handle_position": self.handle_position,
         }
+        if self.cabinet_door:
+            info["handle_position"] = self.handle_position
+        return info
 
     @property
     def motion_planner(self):

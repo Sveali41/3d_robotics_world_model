@@ -304,7 +304,7 @@ def profile(args, payload, config):
     prepare_output(args.output, config, OmegaConf.create({"physics": "optional_physical_smoke_only"}))
     initial_rng = {**payload["rng"], "cuda": []} if args.device == "cpu" else payload["rng"]
     cache_start = time.perf_counter()
-    storage = cabinet.allocate_replay(count)
+    storage = cabinet.allocate_replay(count, state_dim=arrays["states"].shape[-1])
     cached_count = cabinet.append_replay(storage, 0, rows)
     cache_initialization_s = time.perf_counter() - cache_start
     results, csv_rows, checks = [], [], []

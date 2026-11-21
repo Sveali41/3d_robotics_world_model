@@ -82,11 +82,15 @@ def main(argv=None):
         parser.error("--output must be a new directory; refusing overwrite or duplicate launches")
     if not args.image.is_file() or not (args.numpy_shim / "numpy/__init__.py").is_file():
         parser.error("Existing SIF image and verified executable NumPy1.26 shim are required")
-    command = ["apptainer", "exec", str(args.image), "python", "-c",
+    command = ["apptainer", "exec", str(args.image), "env",
+               f"PYTHONPATH={args.numpy_shim.resolve()}:{ROOT}", "python", "-c",
                "import json,sys; from omegaconf import OmegaConf; "
-               "print(json.dumps(OmegaConf.to_container(OmegaConf.load(sys.argv[1]),resolve=True)))",
+               "from exploration.raps.raps_gnn_actor import skill_schema; "
+               "config=OmegaConf.to_container(OmegaConf.load(sys.argv[1]),resolve=True); "
+               "print(json.dumps(dict(config=config, action_dim=skill_schema(config['raps_actor']).action_dim)))",
                str(args.config.resolve())]
-    base = json.loads(subprocess.check_output(command, text=True))
+    resolved = json.loads(subprocess.check_output(command, text=True))
+    base = resolved["config"]
     arms = arm_configs(base, include_heuristic_only=args.include_heuristic_only)
     output.mkdir(parents=True)
     source = output / "source_snapshot"
@@ -104,13 +108,23 @@ def main(argv=None):
                     source_snapshot=str(source), runtime_directory=str(runtime),
                     seed=base["seed"], budget=budget, arms={},
                     comparison=("Collection policy and object heuristic vary across arms; the optional heuristic-only arm "
-                                "also sets RAPS curiosity disagreement weight to zero; independent single environments"),
+                                "also sets RAPS curiosity disagreement weight to zero; matched collection rules"),
+                    cpu_sampling=base.get("cpu_sampling"),
                     action_interface=dict(
                         pick_place_primitives=base["raps_actor"].get("pick_place_primitives", False),
-                        policy_action_dimensions=5 if base["raps_actor"].get("pick_place_primitives", False) else 13,
+                        grasp_only=base["raps_actor"].get("grasp_only", False),
+                        pick_place_grid=base["raps_actor"].get("pick_place_grid", False),
+                        grasp_orientation_candidates=base["raps_actor"].get("grasp_orientation_candidates", False),
+                        policy_action_dimensions=resolved["action_dim"],
                         grasp_retention=(base["raps_actor"].get("grasp_retention", "friction")
                                          if base["raps_actor"].get("pick_place_primitives", False) else None)),
-                    training_budget="Same epochs and actor updates; WM minibatch counts depend on completed skills",
+                    training_budget=("Fixed WM updates and actor updates; bounded per-record dynamic replay"
+                                     if base.get("wm_replay", {}).get("mode") == "bounded_dynamic" else
+                                     "Fixed WM updates and actor updates; protected new/history replay"
+                                     if base.get("wm_replay") is not None else
+                                     "Same epochs and actor updates; WM minibatch counts depend on completed skills"),
+                    wm_replay=base.get("wm_replay"),
+                    wm_training=base.get("wm_training"),
                     limitations="Single seed; shared GPU contention makes wall-time comparisons uncontrolled")
     manifest_path = output / "comparison.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")

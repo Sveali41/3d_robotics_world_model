@@ -114,17 +114,18 @@ def make_env(cfg, arm):
     return wrapped
 
 
-def snapshot(env):
-    context = env.env._context()
+def snapshot(env, *, context=None, convert=True):
+    context = env.env._context() if context is None else context
     raw = env.unwrapped
-    return jsonable({
+    result = {
         "ee_position": context.ee_position,
         "objects": {name: {"position_root": obj.position_root, "position_world": obj.position_world}
                     for name, obj in context.objects.items()},
         "contact_snapshot": context.contact_snapshot(),
         "inside_region": raw.is_ee_inside_exploration_region(),
         "failed_object_ids": list(raw.failed_object_ids()),
-    })
+    }
+    return jsonable(result) if convert else result
 
 
 class ReplayEnv(gym.Env):

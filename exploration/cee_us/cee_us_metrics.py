@@ -49,10 +49,10 @@ def screen(random_summary, curiosity_summary):
             "limitation": "Single seed, fixed layout, privileged state; no grasp or visual-generalization claim"}
 
 
-def _errors(prediction, target, agent_dim=32):
+def _errors(prediction, target, agent_dim=32, n_objects=2):
     """Physical errors; velocity channels are intentionally not mixed into pose errors."""
-    positions = [slice(agent_dim, agent_dim + 3), slice(agent_dim + 12, agent_dim + 15)]
-    rotations = [slice(agent_dim + 3, agent_dim + 6), slice(agent_dim + 15, agent_dim + 18)]
+    positions = [slice(agent_dim + 12 * i, agent_dim + 12 * i + 3) for i in range(n_objects)]
+    rotations = [slice(agent_dim + 12 * i + 3, agent_dim + 12 * i + 6) for i in range(n_objects)]
     position = np.stack([np.linalg.norm(prediction[..., s] - target[..., s], axis=-1)
                          for s in positions], axis=-1)
     angular = []
@@ -68,7 +68,14 @@ def prediction_metrics(backend, replay, horizons=(1, 10, 30), batch_size=16):
     states, next_states = replay["states"], replay["next_states"]
     actions, episodes = replay["actions"], replay["episode_ids"]
     agent_dim = getattr(getattr(backend, "env", None), "agent_dim", 32)
-    physical_indices = np.r_[np.arange(32), np.arange(agent_dim, agent_dim + 24)]
+    n_objects, remainder = divmod(states.shape[-1] - agent_dim, 17)
+    if n_objects < 1 or remainder or next_states.shape != states.shape:
+        raise ValueError("Expected agent state followed by 12 dynamic + 5 static fields per object")
+    declared_objects = getattr(getattr(backend, "env", None), "nObj", n_objects)
+    if declared_objects != n_objects:
+        raise ValueError("Replay object count differs from backend state layout")
+    physical_agent_dim = agent_dim - int(agent_dim in (31, 33))
+    physical_indices = np.r_[np.arange(physical_agent_dim), np.arange(agent_dim, agent_dim + 12 * n_objects)]
     result = {}
     for horizon in horizons:
         starts = [i for i in range(len(states) - horizon + 1)
@@ -89,8 +96,8 @@ def prediction_metrics(backend, replay, horizons=(1, 10, 30), batch_size=16):
             target = np.stack([next_states[i:i + horizon] for i in indices])
             mean = predictions.mean(axis=0)
             baseline = np.broadcast_to(initial[:, None], target.shape)
-            ep, ea = _errors(mean[:, -1], target[:, -1], agent_dim)
-            bp, ba = _errors(baseline[:, -1], target[:, -1], agent_dim)
+            ep, ea = _errors(mean[:, -1], target[:, -1], agent_dim, n_objects)
+            bp, ba = _errors(baseline[:, -1], target[:, -1], agent_dim, n_objects)
             errors.extend(ep); angles.extend(ea)
             baseline_errors.extend(bp); baseline_angles.extend(ba)
             # Same 1.5 cm threshold as the interaction metrics, over this window.
@@ -107,9 +114,9 @@ def prediction_metrics(backend, replay, horizons=(1, 10, 30), batch_size=16):
                  "zero_delta_object_rotation_mae_rad": baseline_angles.mean(axis=0).tolist(),
                  "moved_object_windows": moved.sum(axis=0).tolist(),
                  "moving_position_mae_m": [float(errors[:, j][moved[:, j]].mean())
-                                           if moved[:, j].any() else None for j in range(2)],
+                                           if moved[:, j].any() else None for j in range(n_objects)],
                  "moving_zero_delta_position_mae_m": [float(baseline_errors[:, j][moved[:, j]].mean())
-                                                      if moved[:, j].any() else None for j in range(2)]}
+                                                      if moved[:, j].any() else None for j in range(n_objects)]}
         if horizon == 1:
             valid = np.std(disagreements) > 0 and np.std(actual_errors) > 0
             entry["disagreement_error_pearson"] = (float(np.corrcoef(disagreements, actual_errors)[0, 1])

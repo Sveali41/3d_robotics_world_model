@@ -108,6 +108,28 @@ def test_skill_command_is_explicit_agent_state_and_legacy_layout_is_unchanged():
         encoder.encode()
 
 
+def test_single_cup_state_and_grid_contract():
+    env, mug, _, _ = _env()
+    env.cabinet_item_layout = "single_upper_second_row"
+    env.cabinet_items = [mug]
+    env.cabinet_item_types = ["mug"]
+    env.cabinet_grid = True
+    env.cabinet_grid_layout = "trapezoid_4_3_2_1"
+    encoder = CabinetStateEncoder(env)
+    state = encoder.encode()
+    assert state.shape == (49,)
+    np.testing.assert_allclose(state[44:], [1, 0, .1, .2, .3])
+    contract = encoder.contract()
+    assert contract["dimension"] == 49
+    assert contract["object_names"] == ["cabinet_item_16"]
+    assert contract["object_types"] == ["mug"]
+    assert contract["cabinet_grid"]["initial_cells"] == {"cabinet_item_16": 4}
+    assert not any("cabinet_item_17" in field["name"] for field in contract["fields"])
+    latched = CabinetSkillStateEncoder(env, latched_gripper=True)
+    assert latched.encode().shape == (50,)
+    assert latched.contract()["dimension"] == 50
+
+
 def test_projection_contract_transforms_root_to_cabinet():
     env, _, _, controller = _env()
     rotation = Rotation.from_euler('z', -.3).as_matrix()
@@ -162,3 +184,46 @@ def test_invalid_control_frequency_and_nonfinite_values_fail_clearly():
     env.agent.robot.qpos = np.full(9, np.nan)
     with pytest.raises(ValueError, match="robot qpos.*non-finite"):
         encoder.encode()
+
+
+def test_scene_rebind_refreshes_handles_in_place_and_preserves_command():
+    env, *_ = _env()
+    env.door_joint = None
+    encoder = CabinetSkillStateEncoder(env, latched_gripper=True)
+    encoder.gripper_command = -1.
+    old_controller = encoder.controller
+    rebuilt, mug, _, controller = _env()
+    env.agent = rebuilt.agent
+    env.cabinet_items = rebuilt.cabinet_items
+    identity = id(encoder)
+    encoder.rebind_after_reset()
+    assert id(encoder) == identity
+    assert encoder.controller is controller and encoder.controller is not old_controller
+    assert encoder.objects[0][1] is mug
+    assert encoder.encode()[30] == -1.
+    assert encoder.contract()['agent_dim'] == 31
+
+
+@pytest.mark.parametrize("latched", [False, True])
+@pytest.mark.parametrize("single_cup", [False, True])
+def test_doorless_state_omits_door_fields_and_preserves_remaining_state(latched, single_cup):
+    env, *_ = _env()
+    if single_cup:
+        env.cabinet_item_layout = "single_upper_second_row"
+    legacy = CabinetSkillStateEncoder(env, latched_gripper=latched)
+    before, contract = legacy.encode(), legacy.contract()
+    env.door_joint = None
+    doorless = CabinetSkillStateEncoder(env, latched_gripper=latched)
+    after = doorless.encode()
+    assert len(after) == len(before) - 2
+    np.testing.assert_array_equal(after, np.delete(before, [30, 31]))
+    assert doorless.contract()["agent_dim"] == 30 + int(latched)
+    assert doorless.contract()["dimension"] == len(after)
+    assert sum(np.prod(field["shape"]) for field in doorless.contract()["fields"]) == len(after)
+    assert not any(field["name"].startswith("door_") for field in doorless.contract()["fields"])
+    if latched:
+        assert after[30] == 1.
+        assert doorless.contract()["fields"][6]["name"] == "last_gripper_command"
+    assert doorless.contract()["cabinet_door"] is False
+    assert doorless.contract() != contract
+    assert "cabinet_door" not in contract

@@ -7,6 +7,7 @@ Each model transition is one completed skill. All physical ticks are also kept.
 
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 import random
@@ -21,19 +22,26 @@ from omegaconf import OmegaConf
 import torch
 
 from domain.robocasa.primitives import RAPS_ACTION_SCHEMA, RAPS_COMPACT_ACTION_SCHEMA, RAPS_SPLIT_ACTION_SCHEMA
+from domain.robocasa.grid_pick_place import GridPickPlaceActionSchema
+from domain.robocasa.grasp_orientations import GRASP_ORIENTATION_YAW_PITCH_DEG
 from domain.robocasa.skill_execution import RAPSSkillExecution, PlannedSkillExecution
-from domain.robocasa.pick_place import PICK_PLACE_ACTION_SCHEMA, PlannedPickPlaceSkillExecution, pick_place_contract
+from domain.robocasa.pick_place import (
+    PICK_PLACE_ACTION_SCHEMA, TCP_BOUNDS, PickPlaceActionSchema,
+    PlannedPickPlaceSkillExecution, pick_place_contract,
+)
 from exploration.cee_us.cee_us_backend import CEEUSBackend
 from exploration.cee_us.cee_us_cabinet import (
     ROOT, make_env, prepare_output, replay_arrays, restore_rng, rng_state,
 )
 from exploration.cee_us.cee_us_metrics import interaction_summary, prediction_metrics, screen
+from exploration.raps.cpu_sampling import CpuRoundCollector, sampling_contract
 from exploration.diagnostics.diagnose_cabinet import jsonable, snapshot, write_json
 
 
 SCHEMA = "cabinet-raps-gnn-actor-v1"
 RAPS_REFERENCE_COMMIT = "1c56b0fe367cc32d3ee548f407ac3a9af9e3ce2e"
 DEFAULTS = dict(
+    reconfigure_on_reset=False,
     pick_place_primitives=False, grasp_retention="friction",
     skill_set="legacy10", hidden_size=128, actor_layers=2, critic_layers=3, init_std=1.0,
     imagination_horizon=5, imagination_batch_size=64, updates_per_round=100,
@@ -71,8 +79,49 @@ def reference_components(device):
 
 
 def skill_schema(settings):
+    from domain.robocasa.cabinet_grid import resolve_grid_layout
+    grid_layout = settings.get("grid_layout", "legacy_3x4")
+    resolve_grid_layout(grid_layout)
+    if grid_layout != "legacy_3x4" and not settings.get("pick_place_grid", False):
+        raise ValueError("grid_layout requires pick_place_grid")
+    if not isinstance(settings.get("grasp_orientation_candidates", False), bool):
+        raise ValueError("raps_actor.grasp_orientation_candidates must be boolean")
+    if settings.get("grasp_orientation_candidates", False) and not (
+            settings.get("pick_place_grid", False) and settings.get("pick_place_primitives", False)
+            and settings.get("motion_execution") == "planner"):
+        raise ValueError("grasp_orientation_candidates requires pick_place_grid, pick_place_primitives and planner motion_execution")
+    if not isinstance(settings.get("pick_place_grid", False), bool):
+        raise ValueError("raps_actor.pick_place_grid must be boolean")
+    if settings.get("pick_place_grid", False) and not settings.get("pick_place_primitives", False):
+        raise ValueError("pick_place_grid requires pick_place_primitives")
+    if settings.get("grasp_only", False) and not settings.get("pick_place_primitives", False):
+        raise ValueError("grasp_only requires pick_place_primitives")
+    if "grasp_z_bounds_m" in settings and not settings.get("pick_place_primitives", False):
+        raise ValueError("grasp_z_bounds_m requires pick_place_primitives")
     if settings.get("pick_place_primitives", False):
-        return PICK_PLACE_ACTION_SCHEMA
+        specs = ((PICK_PLACE_ACTION_SCHEMA.spec_by_name["grasp"],)
+                 if settings.get("grasp_only", False) else PICK_PLACE_ACTION_SCHEMA.specs)
+        if "grasp_z_bounds_m" not in settings:
+            if settings.get("pick_place_grid", False):
+                return GridPickPlaceActionSchema(grasp_only=settings.get("grasp_only", False),
+                    grasp_orientation_candidates=settings.get("grasp_orientation_candidates", False),
+                    grid_layout=grid_layout)
+            return PickPlaceActionSchema(specs) if settings.get("grasp_only", False) else PICK_PLACE_ACTION_SCHEMA
+        bounds = np.asarray(settings["grasp_z_bounds_m"], dtype=float)
+        original = TCP_BOUNDS["grasp"][2]
+        if (bounds.shape != (2,) or not np.isfinite(bounds).all()
+                or not original[0] <= bounds[0] < bounds[1] <= original[1]):
+            raise ValueError(f"grasp_z_bounds_m must be an ordered pair within {original}, in root meters")
+        spec = PICK_PLACE_ACTION_SCHEMA.spec_by_name["grasp"]
+        z = replace(spec.parameters[2], scale=float((bounds[1] - bounds[0]) / 2),
+                    center=float((bounds[1] + bounds[0]) / 2))
+        if settings.get("pick_place_grid", False):
+            return GridPickPlaceActionSchema(z, grasp_only=settings.get("grasp_only", False),
+                grasp_orientation_candidates=settings.get("grasp_orientation_candidates", False),
+                grid_layout=grid_layout)
+        grasp = replace(spec, parameters=spec.parameters[:2] + (z,))
+        return PickPlaceActionSchema(tuple(grasp if item.name == "grasp" else item
+                                          for item in specs))
     name = settings.get("skill_set", "legacy10")
     if name == "legacy10":
         return RAPS_ACTION_SCHEMA
@@ -123,6 +172,22 @@ def action_contract(settings):
             upward_retreat_actual_orientation_below_m=0.15)
     if settings.get("disagreement_weight", 1.0) != 1.0:
         contract["disagreement_weight"] = settings["disagreement_weight"]
+    if settings.get("reconfigure_on_reset", False):
+        contract["physics_reset"] = "fresh_scene_on_episode_v1"
+    if settings.get("grasp_target_heuristic", False):
+        contract["grasp_target_heuristic"] = dict(
+            version=2, formula="approach_weight * exp(-min_eligible_object_distance_m / distance_scale_m)",
+            goal="schema_decoded_grasp_XYZ", object_centers="current_imagined_state_root_meters",
+            object_weights="positive_values_select_eligible_objects_only",
+            selected_grasp="replace_endpoint_TCP_progress_heuristic",
+            selected_place="zero_heuristic_curiosity_unchanged", disabled="object_heuristic_is_None")
+    if settings.get("grasp_preflight", False):
+        contract["grasp_preflight"] = dict(version=1,
+            route="open_hand_retreat_align_approach_in_current_scene",
+            proposal="same_policy_rejection_sampling_no_random_fallback",
+            max_candidates=settings.get("grasp_preflight_max_candidates", 32),
+            invalid_preconditions="reject_before_physics", rejected_transitions="audit_only",
+            imagination="unchanged_unfiltered", checked_plans="discard_and_replan_before_execution")
     if settings.get("motion_execution", "ee_delta") == "planner":
         contract["controller"] = "cabinet_shared_mplib_joint_plan_v1"
         contract["motion_execution"] = dict(
@@ -134,6 +199,7 @@ def action_contract(settings):
             endpoint_position_tolerance_m=.002, endpoint_angle_tolerance_deg=.5,
             settling_steps=15, plan_failure="record_without_fallback",
             planning_seed="episode_local_segment_index", intermediate_axes="planner_free",
+            bounded_ik_solver="absolute_central_jacobian_1e-4rad_lsmr_v2",
             legacy_composite_opening="stationary_before_alignment")
         if "split_motion" in contract:
             contract["split_motion"] = dict(frame="controller_root", gripper="preserve_latched_command",
@@ -148,11 +214,66 @@ def action_contract(settings):
     if settings.get("pick_place_primitives", False):
         contract["controller"] = "bounded_fixed_orientation_planned_grasp_place_v1"
         contract.pop("ground_support_threshold_N", None)
-        contract["pick_place"] = pick_place_contract(settings.get("grasp_retention", "friction"))
+        contract["pick_place"] = pick_place_contract(settings.get("grasp_retention", "friction"),
+            grasp_orientation_candidates=settings.get("grasp_orientation_candidates", False))
+        if settings.get("grasp_only", False):
+            contract["grasp_only"] = dict(version=2, primitive_names=list(schema.primitive_names),
+                action_dim=schema.action_dim, reset_after_skill="grasp_success",
+                failure="reset_if_still_holding_else_continue_current_scene",
+                endpoint="before_reset", terminal_flags="environment_only",
+                preparation=dict(version="planned_default_joints_before_each_grasp_v2",
+                    route="open_then_fixed_orientation_exterior_retreat_then_default_joints",
+                    exterior_retreat_tolerance_m=.001,
+                    observation="after_home_before_action_selection", object_reset=False,
+                    controls="counted_nontrainable_return_default_records",
+                    joint_tolerance_rad=.001, joint_speed_tolerance_rad_s=.01,
+                    failure="stop_collection_without_grasp_or_reset_fallback"))
+            contract["pick_place"]["action_dim"] = schema.action_dim
+        if settings.get("pick_place_grid", False):
+            contract["pick_place_grid"] = dict(
+                version=1, xy_root_m=[list(xy) for xy in schema.grid_xy_root_m],
+                branches=list(schema.primitive_names), ordering="row_major_x_depth_then_y_column",
+                grasp_z_root_m=[schema.grasp_z.center - schema.grasp_z.scale,
+                                schema.grasp_z.center + schema.grasp_z.scale],
+                place_z="automatic_existing_geometry_and_lower_shelf_support",
+                action_dim=schema.action_dim, categorical_dim=schema.num_primitives, continuous_dim=1)
+            contract["pick_place"]["action_dim"] = schema.action_dim
+            if schema.grid_layout == "trapezoid_4_3_2_1":
+                parameters = schema.physical_action_schema().spec_by_name["grasp"].parameters
+                contract["pick_place"]["tcp_bounds_root_m"]["grasp"] = [
+                    [parameter.center - parameter.scale, parameter.center + parameter.scale]
+                    for parameter in parameters]
+                contract["pick_place_grid"]["physical_validation"] = "grid_target_envelope; exact_cell_action_encoding"
+                contract["pick_place_grid"]["cup_only_reset_contacts"] = "invalid_until_first_physics_substep; active_binding_checked_separately"
+            if schema.grid_layout != "legacy_3x4":
+                contract["pick_place_grid"]["layout"] = schema.grid_layout
+                contract["pick_place_grid"]["grasp_xy_reference"] = "tcp_root"
+                contract["pick_place_grid"]["place_xy_reference"] = "collision_AABB_center_at_reset_orientation"
+        if settings.get("grasp_orientation_candidates", False):
+            contract["controller"] = "bounded_selected_orientation_planned_grasp_place_v1"
+            contract["grasp_orientation_candidates"] = dict(
+                version=1, yaw_pitch_degrees=[list(GRASP_ORIENTATION_YAW_PITCH_DEG[index])
+                                             for index in schema.grasp_orientation_ids],
+                rotation="Rz(root_yaw) @ Ry(root_pitch) @ R_reset",
+                grasp_argument="orientation_id", ordering="grasp_cell_major_then_orientation_id_then_place_cell",
+                branch_cell_indices=list(schema.branch_cell_indices),
+                branch_orientation_indices=list(schema.branch_orientation_indices),
+                num_grasp_branches=schema.num_grasp_branches,
+                alignment="rotate_to_selected_orientation_only_at_exterior_alignment",
+                approach="fixed_selected_orientation", place="exterior_preplace_to_reset_orientation")
+            if len(schema.grasp_orientation_ids) != len(GRASP_ORIENTATION_YAW_PITCH_DEG):
+                contract["grasp_orientation_candidates"]["orientation_ids"] = list(schema.grasp_orientation_ids)
+            contract["pick_place_grid"]["ordering"] = "grasp_cell_major_then_orientation_id_then_place_cell"
+            contract["pick_place_grid"]["version"] = 2
+        if "grasp_z_bounds_m" in settings:
+            z = schema.grasp_z if settings.get("pick_place_grid", False) else schema.spec_by_name["grasp"].parameters[2]
+            contract["pick_place"]["tcp_bounds_root_m"]["grasp"][2] = [z.center - z.scale, z.center + z.scale]
         if "motion_execution" in contract:
             motion = contract["motion_execution"]
             motion["max_control_steps_per_segment"] = motion.pop("max_control_steps_per_skill")
             motion["target_orientation"] = "shared_reset_orientation_path_and_feedback_audited"
+            if settings.get("grasp_orientation_candidates", False):
+                motion["target_orientation"] = "exterior_alignment_to_selected_grasp_orientation_then_fixed_approach_exterior_preplace_reset"
             motion["intermediate_axes"] = "shared_macro_waypoints_with_checked_joint_paths"
             motion.pop("legacy_composite_opening", None)
     return contract
@@ -189,9 +310,24 @@ class RAPSImaginationActor:
     def __init__(self, backend, settings=None):
         self.backend = backend
         self.settings = {**DEFAULTS, **(settings or {})}
-        unknown = set(self.settings) - set(DEFAULTS)
+        unknown = set(self.settings) - set(DEFAULTS) - {"grasp_preflight", "grasp_preflight_max_candidates", "grasp_target_heuristic", "grasp_z_bounds_m", "grasp_only", "pick_place_grid", "grasp_orientation_candidates", "grid_layout"}
         if unknown:
             raise ValueError(f"Unknown raps_actor settings: {sorted(unknown)}")
+        if not isinstance(self.settings.get("grasp_only", False), bool):
+            raise ValueError("raps_actor.grasp_only must be boolean")
+        if self.settings.get("grasp_only", False) and not self.settings["pick_place_primitives"]:
+            raise ValueError("grasp_only requires pick_place_primitives")
+        if not isinstance(self.settings.get("grasp_target_heuristic", False), bool):
+            raise ValueError("raps_actor.grasp_target_heuristic must be boolean")
+        if self.settings.get("grasp_target_heuristic", False) and not self.settings["pick_place_primitives"]:
+            raise ValueError("grasp_target_heuristic requires pick_place_primitives")
+        if not isinstance(self.settings.get("grasp_preflight", False), bool):
+            raise ValueError("raps_actor.grasp_preflight must be boolean")
+        candidates = self.settings.get("grasp_preflight_max_candidates", 32)
+        if isinstance(candidates, bool) or int(candidates) != candidates or candidates < 1:
+            raise ValueError("raps_actor.grasp_preflight_max_candidates must be a positive integer")
+        if self.settings.get("grasp_preflight", False) and not self.settings["pick_place_primitives"]:
+            raise ValueError("grasp_preflight requires planned pick_place_primitives")
         for name in ("hidden_size", "actor_layers", "critic_layers", "imagination_horizon",
                      "imagination_batch_size", "updates_per_round", "target_update_period"):
             if int(self.settings[name]) != self.settings[name] or self.settings[name] < 1:
@@ -206,7 +342,7 @@ class RAPSImaginationActor:
             raise ValueError("raps_actor.entropy_scale must be finite and nonnegative")
         if not np.isfinite(self.settings["disagreement_weight"]) or self.settings["disagreement_weight"] < 0:
             raise ValueError("raps_actor.disagreement_weight must be finite and nonnegative")
-        for name in ("hold_closed_during_motion", "latched_gripper", "stop_drop_on_support", "grasp_stop_on_contact", "controlled_placement", "pick_place_primitives"):
+        for name in ("hold_closed_during_motion", "latched_gripper", "stop_drop_on_support", "grasp_stop_on_contact", "controlled_placement", "pick_place_primitives", "reconfigure_on_reset"):
             if not isinstance(self.settings[name], bool):
                 raise ValueError(f"{name} must be boolean")
         if self.settings["grasp_retention"] not in {"friction", "constraint"}:
@@ -224,7 +360,8 @@ class RAPSImaginationActor:
         if self.settings["controlled_placement"] and not (
                 self.settings["latched_gripper"] and self.settings["stop_drop_on_support"]):
             raise ValueError("controlled_placement requires latched_gripper and stop_drop_on_support")
-        if backend.env.agent_dim != 32 + int(self.settings["latched_gripper"]):
+        self.physical_agent_dim = backend.env.agent_dim - int(self.settings["latched_gripper"])
+        if self.physical_agent_dim not in (30, 32):
             raise ValueError("GNN agent state must include the enabled gripper-command memory")
         if self.settings["motion_execution"] not in {"ee_delta", "planner"}:
             raise ValueError("motion_execution must be ee_delta or planner")
@@ -303,10 +440,18 @@ class RAPSImaginationActor:
             next_state = predicted.mean(0)
             object_start = self.backend.env.agent_dim
             # The extra command is controller memory, not physical novelty.
-            intrinsic = std[:, :32].sum(-1) + std[:, object_start:].sum(-1)
+            intrinsic = std[:, :self.physical_agent_dim].sum(-1) + std[:, object_start:].sum(-1)
             heuristic = torch.zeros_like(intrinsic)
             if self.backend.object_heuristic is not None:
-                heuristic, _ = self.backend._object_heuristic_scores(state, next_state)
+                if self.settings.get("grasp_target_heuristic", False):
+                    if self.settings.get("pick_place_grid", False):
+                        selected_grasp = action[..., :self.schema.num_grasp_branches].sum(-1) == 1
+                    else:
+                        selected_grasp = action[..., self.schema.primitive_names.index("grasp")] == 1
+                    heuristic = torch.where(selected_grasp,
+                                            self.grasp_target_heuristic(state, action), heuristic)
+                else:
+                    heuristic, _ = self.backend._object_heuristic_scores(state, next_state)
             actions.append(raw)
             reward = self.imagination_reward(state, action, next_state, starts,
                                              intrinsic, heuristic)
@@ -314,13 +459,36 @@ class RAPSImaginationActor:
                 raise FloatingPointError("Invalid imagination reward")
             rewards.append(reward.unsqueeze(-1))
             components.append(torch.stack((std[:, :18].sum(-1), std[:, 18:30].sum(-1),
-                                           std[:, 30:32].sum(-1), std[:, object_start:].sum(-1)), -1))
+                                           std[:, 30:self.physical_agent_dim].sum(-1), std[:, object_start:].sum(-1)), -1))
             heuristics.append(heuristic)
             state = next_state
         states.append(state)
         return dict(states=torch.stack(states), actions=torch.stack(actions),
                     rewards=torch.stack(rewards), components=torch.stack(components),
                     heuristics=torch.stack(heuristics))
+
+    def grasp_target_heuristic(self, state, action):
+        setting = self.backend.object_heuristic
+        if setting is None:
+            return state.new_zeros(state.shape[:-1])
+        if self.settings.get("pick_place_grid", False):
+            branches = action[..., :self.schema.num_primitives].argmax(-1)
+            cells = torch.tensor(self.schema.branch_cell_indices, device=action.device)[branches]
+            xy = action.new_tensor(self.schema.grid_xy_root_m)[cells]
+            z = self.schema.grasp_z.center + self.schema.grasp_z.scale * action[..., -1:].clamp(-1., 1.)
+            goal = torch.cat((xy, z), -1)
+        else:
+            parameters = self.schema.spec_by_name["grasp"].parameters
+            center = action.new_tensor([parameter.center for parameter in parameters])
+            scale = action.new_tensor([parameter.scale for parameter in parameters])
+            goal = center + scale * action[..., self.schema.num_primitives:].clamp(-1., 1.)
+        centers = torch.stack([
+            state[..., self.backend.env.agent_dim + index * self.backend.env.object_dyn_dim:
+                  self.backend.env.agent_dim + index * self.backend.env.object_dyn_dim + 3]
+            for index, name in enumerate(self.backend.object_names)
+            if setting["object_weights"].get(name, 0) > 0], dim=-2)
+        distance = torch.linalg.vector_norm(goal.unsqueeze(-2) - centers, dim=-1).amin(dim=-1)
+        return setting["approach_weight"] * torch.exp(-distance / setting["distance_scale_m"])
 
     def imagination_reward(self, state, action, next_state, starts, intrinsic, heuristic):
         return self.settings["disagreement_weight"] * intrinsic + heuristic
@@ -428,13 +596,18 @@ class RAPSImaginationActor:
 
 class SkillCollector:
     """Collect completed skill endpoints and every real control tick."""
-    def __init__(self, env, encoder, actor, directory):
+    def __init__(self, env, encoder, actor, directory, *, collection_optimizations=False):
         self.env, self.encoder, self.actor = env, encoder, actor
         self.schema = skill_schema(actor.settings)
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.total_steps = self.episode_id = self.skill_id = 0
         self.state = None
+        if not isinstance(collection_optimizations, bool):
+            raise ValueError("collection_optimizations must be boolean")
+        self.collection_optimizations = collection_optimizations
+        self.profile_timings = {}
+        self._context_cache = None
         self.planned_motion = actor.settings.get("motion_execution", "ee_delta") == "planner"
         execution_kwargs = {}
         executor = RAPSSkillExecution
@@ -448,6 +621,9 @@ class SkillCollector:
                 max_control_steps=actor.settings.get("motion_plan_max_steps", 400))
         if actor.settings.get("pick_place_primitives", False):
             execution_kwargs["grasp_retention"] = actor.settings.get("grasp_retention", "friction")
+            execution_kwargs["grasp_orientation_candidates"] = actor.settings.get("grasp_orientation_candidates", False)
+            if actor.settings.get("grid_layout") == "trapezoid_4_3_2_1":
+                execution_kwargs["physical_action_schema"] = self.schema.physical_action_schema()
         self.execution = executor(
             **execution_kwargs,
             latched_gripper=actor.settings.get("latched_gripper", False),
@@ -457,16 +633,208 @@ class SkillCollector:
             hold_closed_during_motion=actor.settings["hold_closed_during_motion"])
 
     def reset(self, seed):
-        self.env.reset(seed=int(seed))
+        started = time.perf_counter()
+        self._context_cache = None
+        if self.actor.settings.get("reconfigure_on_reset", False):
+            # Ordinary pose/velocity reset retains PhysX scene history and can
+            # change the outcome of identical observed state/action pairs.
+            self.env.reset(seed=int(seed), options={"reconfigure": True})
+            self.encoder.rebind_after_reset()
+        else:
+            self.env.reset(seed=int(seed))
+        raw = getattr(self.env, "unwrapped", self.env.env)
+        raw.collection_optimizations = self.collection_optimizations
+        raw._collection_profile = self.profile_timings
         self.episode_id += 1
         self.execution.reset()
         self.encoder.gripper_command = self.execution.gripper_command
         self.state = self.encoder.encode()
+        if self.actor.settings.get("grasp_only", False):
+            self._capture_home()
+        self._add_time("reset_s", started)
+
+    def _capture_home(self):
+        from domain.robocasa.motion_planning import _array
+        raw = self.env.unwrapped
+        self._home_qpos = _array(raw.agent.robot.get_qpos()).reshape(9).copy()
+        tcp = raw.agent.robot.pose.inv() * raw.agent.tcp.pose
+        self._home_position = _array(tcp.p).reshape(3).copy()
+        self._home_quaternion = _array(tcp.q).reshape(4).copy()
+
+    def _home_actions(self):
+        """Physically restore reset joints; keep the current object scene."""
+        from domain.robocasa.motion_planning import MotionPlanExecution, MotionPlanningError, _array
+        raw = self.env.unwrapped
+        def ready():
+            q = _array(raw.agent.robot.get_qpos()).reshape(9)
+            v = _array(raw.agent.robot.get_qvel()).reshape(9)
+            return np.max(np.abs(q-self._home_qpos)) <= .001 and np.max(np.abs(v)) <= .01
+        if ready():
+            self.execution.gripper_command = 1.
+            return
+        if any(self._context().is_grasping(key) for key in self._context().objects):
+            raise MotionPlanningError("home_still_holding", "End the held-object episode before homing")
+        # Open at the measured arm pose before planning with fixed finger width.
+        for _ in range(9):
+            yield np.r_[_array(raw.agent.robot.get_qpos()).reshape(9)[:7], 1.].astype(np.float32)
+        def execute(plan):
+            cursor = MotionPlanExecution(raw, plan, gripper_command=1.,
+                max_steps=self.actor.settings.get("motion_plan_max_steps", 400))
+            while cursor.status == "running":
+                yield cursor.next_action()
+                cursor.record_step()
+            if cursor.status != "success":
+                raise MotionPlanningError("home_tracking_failed", {"status": cursor.status})
+        # Rotate only after a straight withdrawal clears the cup/cabinet interior.
+        from domain.robocasa.pick_place import OUTSIDE_X
+        tcp = raw.agent.robot.pose.inv() * raw.agent.tcp.pose
+        position = _array(tcp.p).reshape(3).copy()
+        if position[0] > OUTSIDE_X + .001:
+            position[0] = OUTSIDE_X
+            retreat = raw.plan_to_pose(position, _array(tcp.q).reshape(4),
+                method="bounded_ik", maintain_orientation=True)
+            yield from execute(retreat)
+        target = self._home_qpos.copy()
+        target[7:] = _array(raw.agent.robot.get_qpos()).reshape(9)[7:]
+        plan = raw.plan_to_pose(self._home_position, self._home_quaternion,
+            target_qpos=target, densify_rrt_path=True)
+        yield from execute(plan)
+        if not ready():
+            raise MotionPlanningError("home_tracking_failed", dict(
+                message="Default joints/velocity not reached; no grasp was started"))
+
+    def _return_default(self, ticks, skills, count, policy, stage, low_log, skill_log, on_step):
+        initial, before, start = self.state.copy(), self._snapshot(), self.total_steps
+        complete = False
+        for low in self._home_actions():
+            current, low_before = self.state.copy(), self._snapshot()
+            self._context_cache = None
+            _, _, terminated, truncated, info = self.env.step(low)
+            self.total_steps += 1
+            self.execution.gripper_command = 1.
+            self.encoder.gripper_command = 1.
+            self.state = self.encoder.encode()
+            if not np.isfinite(self.state).all():
+                raise FloatingPointError("Nonfinite return_default state")
+            record = info["primitive_record"]
+            row = jsonable(dict(step=self.total_steps, stage=stage, policy=policy,
+                episode_id=self.episode_id, skill_id=self.skill_id, skill_type="return_default",
+                state=current, next_state=self.state, requested_action=low,
+                action=record.low_actions[0], full_controller_action=record.full_controller_actions[0],
+                primitive_type="joint_position", duration_low_steps=1, status=record.status,
+                terminated=bool(terminated), truncated=bool(truncated),
+                run_budget_exhausted=len(ticks)+1 == count, parameters_physical={},
+                contact_events=record.contact_events, outcome_metrics=record.outcome_metrics,
+                before=low_before, after=self._snapshot(), reward=info["exploration_reward"], planner={}))
+            ticks.append(row)
+            low_log.write(json.dumps(row, allow_nan=False)+"\n")
+            if on_step is not None:
+                on_step(row)
+            if terminated or truncated:
+                raise RuntimeError("Episode ended during return_default; no grasp started")
+            if len(ticks) == count:
+                break
+        else:
+            complete = True
+        duration = self.total_steps-start
+        if duration:
+            skill = jsonable(dict(skill_id=self.skill_id, episode_id=self.episode_id,
+                stage=stage, policy=policy, primitive_type="return_default",
+                state=initial, next_state=self.state, duration_low_steps=duration,
+                start_step=start, end_step=self.total_steps, trainable=False, completed=complete,
+                terminated=False, truncated=False, status="success" if complete else "budget_truncated",
+                before=before, after=self._snapshot()))
+            skills.append(skill)
+            skill_log.write(json.dumps(skill, allow_nan=False)+"\n")
+            skill_log.flush()
+            self.skill_id += 1
+            self.execution.reset()
+        # Read measured feedback even when no movement was required.
+        self.encoder.gripper_command = self.execution.gripper_command
+        self.state = self.encoder.encode()
+        return complete
+
+    def _add_time(self, name, started):
+        self.profile_timings[name] = self.profile_timings.get(name, 0.) + time.perf_counter() - started
+
+    def _context(self):
+        started = time.perf_counter()
+        try:
+            if not self.collection_optimizations:
+                return self.env.env._context()
+            if self._context_cache is None:
+                self._context_cache = self.env.env._context()
+                if self._context_cache is not None:
+                    self._context_cache._contact_force_cache = {}
+            return self._context_cache
+        finally:
+            self._add_time("context_read_s", started)
+
+    def _snapshot(self):
+        started = time.perf_counter()
+        try:
+            if self.collection_optimizations:
+                return snapshot(self.env, context=self._context(), convert=False)
+            return snapshot(self.env)
+        finally:
+            self._add_time("snapshot_s", started)
+
+    def _propose_action(self, policy):
+        started = time.perf_counter()
+        try:
+            if policy == "random":
+                index = np.random.randint(self.schema.num_primitives)
+                return np.r_[np.eye(self.schema.num_primitives)[index],
+                             np.random.uniform(-1, 1, self.schema.num_parameters)].astype(np.float32)
+            return self.actor.action(self.state)
+        finally:
+            # Some diagnostic fixtures use only the proposal method.
+            if hasattr(self, "profile_timings"):
+                self._add_time("action_proposal_s", started)
+
+    def _select_preflight_action(self, policy, stage):
+        maximum = int(self.actor.settings.get("grasp_preflight_max_candidates", 32))
+        context = self._context()
+        held = any(context.is_grasping(key) for key in context.objects)
+        with (self.directory / "preflight.jsonl").open("a") as audit:
+            for attempt in range(1, maximum + 1):
+                requested = self._propose_action(policy)
+                actual = canonical_action(torch.as_tensor(requested), self.schema).numpy()
+                decoded = self.schema.decode(actual)
+                started = time.perf_counter()
+                if decoded.primitive_type == "grasp":
+                    result = (dict(accepted=False, status="already_holding") if held else
+                              self.execution.preflight_grasp(decoded, context))
+                else:
+                    valid = held and self.execution.gripper_command < 0
+                    result = dict(accepted=valid, status="holding_precondition_met" if valid else "missing_grasp")
+                self._add_time("preflight_s", started)
+                seconds = time.perf_counter() - started
+                conversion_started = time.perf_counter()
+                row = jsonable(dict(
+                    stage=stage, policy=policy, episode_id=self.episode_id, skill_id=self.skill_id,
+                    at_real_step=self.total_steps, candidate=attempt, requested_action=requested,
+                    action=actual, primitive_type=decoded.primitive_type,
+                    seconds=seconds, result=result))
+                self._add_time("log_conversion_s", conversion_started)
+                serialization_started = time.perf_counter()
+                encoded = json.dumps(row, allow_nan=False) + "\n"
+                self._add_time("log_serialization_s", serialization_started)
+                write_started = time.perf_counter()
+                audit.write(encoded)
+                audit.flush()
+                self._add_time("log_write_s", write_started)
+                if result["accepted"]:
+                    return requested, actual, decoded
+        raise RuntimeError(f"No feasible action among {maximum} {policy} proposals; "
+                           "no physics tick executed for rejected candidates. Inspect preflight.jsonl "
+                           "and revise the grasp workspace/planner or policy; no random fallback was used.")
 
     def collect(self, count, policy, *, seed, stage, on_step=None,
                 on_skill_start=None, on_skill_end=None, stop_when=None):
         if count < 1 or policy not in {"random", "curiosity", "task"}:
             raise ValueError("Positive real-step budget and random/curiosity/task policy required")
+        self.profile_timings = {}
         self.reset(seed)
         ticks, skills = [], []
         empty_attempts = 0
@@ -474,50 +842,70 @@ class SkillCollector:
                 (self.directory / "skills.jsonl").open("a") as skill_log:
             while len(ticks) < count:
                 self.skill_id += 1
-                if policy == "random":
-                    index = np.random.randint(self.schema.num_primitives)
-                    requested = np.r_[np.eye(self.schema.num_primitives)[index],
-                                      np.random.uniform(-1, 1, self.schema.num_parameters)].astype(np.float32)
+                if self.actor.settings.get("grasp_only", False):
+                    if not self._return_default(ticks, skills, count, policy, stage,
+                                                low_log, skill_log, on_step):
+                        break
+                if self.actor.settings.get("grasp_preflight", False):
+                    requested, actual, decoded = self._select_preflight_action(policy, stage)
                 else:
-                    requested = self.actor.action(self.state)
-                actual = canonical_action(torch.as_tensor(requested), self.schema).numpy()
-                decoded = self.schema.decode(actual)
-                context = self.env.env._context()
+                    requested = self._propose_action(policy)
+                    actual = canonical_action(torch.as_tensor(requested), self.schema).numpy()
+                    decoded = self.schema.decode(actual)
+                context = self._context()
                 self.execution.start(decoded, context)
                 primitive = self.execution.primitive
-                initial, before = self.state.copy(), snapshot(self.env)
+                initial, before = self.state.copy(), self._snapshot()
                 if on_skill_start is not None:
                     on_skill_start(self.episode_id, self.skill_id, decoded, actual, initial)
                 start = len(ticks)
                 terminated = truncated = False
                 complete = False
                 while len(ticks) < count:
-                    context = self.env.env._context()
+                    context = self._context()
+                    action_started = time.perf_counter()
+                    planning_before = self.profile_timings.get("planner_total_s", 0.)
                     low = self.execution.next_action(context)
+                    self._add_time("execution_action_s", action_started)
+                    self.profile_timings["actual_planning_s"] = self.profile_timings.get("actual_planning_s", 0.) + (
+                        self.profile_timings.get("planner_total_s", 0.) - planning_before)
                     if low is None:
                         complete = True
                         break
-                    current, low_before = self.state.copy(), snapshot(self.env)
+                    current, low_before = self.state.copy(), self._snapshot()
                     if self.actor.settings.get("controlled_placement", False):
                         self.env.env.set_ee_orientation_override(self.execution.orientation_hold)
-                    _, _, terminated, truncated, info = self.env.step(low)
+                    self._context_cache = None
+                    step_started = time.perf_counter()
+                    try:
+                        _, _, terminated, truncated, info = self.env.step(low)
+                    finally:
+                        self._add_time("env_step_s", step_started)
                     record = info["primitive_record"]
                     if record.duration_low_steps != 1:
                         raise RuntimeError("Skill collector requires exactly one recorded control tick")
                     self.total_steps += 1
+                    feedback_started = time.perf_counter()
                     if self.planned_motion:
                         self.execution.record_action(record.low_actions[0], terminated=terminated, truncated=truncated)
                     else:
                         self.execution.record_action(record.low_actions[0])
                     if self.actor.settings.get("pick_place_primitives", False):
-                        self.execution.check_retention(self.env.env._context())
+                        self.execution.check_retention(self._context())
+                    self._add_time("feedback_s", feedback_started)
+                    encoding_started = time.perf_counter()
                     self.encoder.gripper_command = self.execution.gripper_command
                     self.state = self.encoder.encode()
+                    self._add_time("state_encoding_s", encoding_started)
                     if not np.isfinite(self.state).all():
                         raise FloatingPointError("Nonfinite real skill state")
                     # Match compact primitive execution's every-two-step contact feedback.
                     if (len(ticks) - start + 1) % 2 == 0 or terminated or truncated:
-                        self.execution.observe(self.env.env._context())
+                        observe_started = time.perf_counter()
+                        self.execution.observe(self._context())
+                        self._add_time("observation_s", observe_started)
+                    after_snapshot = self._snapshot()
+                    conversion_started = time.perf_counter()
                     row = jsonable(dict(
                         step=self.total_steps, stage=stage, policy=policy, episode_id=self.episode_id,
                         skill_id=self.skill_id, skill_type=decoded.primitive_type,
@@ -533,7 +921,7 @@ class SkillCollector:
                         action_units=("seven_joint_targets_rad_plus_normalized_gripper" if self.planned_motion
                                       else "normalized_controller"), status=record.status,
                         contact_events=record.contact_events, outcome_metrics=record.outcome_metrics,
-                        before=low_before, after=snapshot(self.env), reward=info["exploration_reward"], planner={},
+                        before=low_before, after=after_snapshot, reward=info["exploration_reward"], planner={},
                     ))
                     if self.actor.settings.get("pick_place_primitives", False):
                         row["grasp_retention"] = self.actor.settings.get("grasp_retention", "friction")
@@ -541,12 +929,20 @@ class SkillCollector:
                         row["macro_status"] = primitive.status
                     if self.planned_motion:
                         row["motion_execution"] = self.execution.last_motion_tick
-                    low_log.write(json.dumps(row, allow_nan=False) + "\n")
+                    self._add_time("log_conversion_s", conversion_started)
+                    serialization_started = time.perf_counter()
+                    encoded = json.dumps(row, allow_nan=False) + "\n"
+                    self._add_time("log_serialization_s", serialization_started)
+                    write_started = time.perf_counter()
+                    low_log.write(encoded)
+                    self._add_time("log_write_s", write_started)
                     ticks.append(row)
                     if on_step is not None:
                         on_step(row)
                     if len(ticks) % 32 == 0 or terminated or truncated:
+                        flush_started = time.perf_counter()
                         low_log.flush()
+                        self._add_time("log_write_s", flush_started)
                     if self.actor.settings.get("pick_place_primitives", False) and primitive.done:
                         complete = True
                         break
@@ -559,6 +955,8 @@ class SkillCollector:
                         raise RuntimeError("100 consecutive zero-duration skills; check actor/primitive parameters")
                 else:
                     empty_attempts = 0
+                after_snapshot = self._snapshot()
+                conversion_started = time.perf_counter()
                 skill = jsonable(dict(
                     skill_id=self.skill_id, stage=stage, policy=policy, episode_id=self.episode_id,
                     state=initial, next_state=self.state, requested_action=requested, action=actual,
@@ -569,7 +967,11 @@ class SkillCollector:
                         "terminated" if terminated else "episode_truncated" if truncated else "budget_truncated"),
                     support_stopped_object_ids=self.execution.support_stopped_object_ids,
                     start_step=self.total_steps - duration, end_step=self.total_steps,
-                    before=before, after=snapshot(self.env),
+                    before=before, after=after_snapshot,
+                    object_contact=(_object_contact(before.get("contact_snapshot", {}))
+                                    or _object_contact(after_snapshot.get("contact_snapshot", {}))
+                                    or any(_object_contact(event) for tick in ticks[start:]
+                                           for event in tick["contact_events"])),
                 ))
                 if self.actor.settings.get("pick_place_primitives", False):
                     skill["grasp_retention"] = self.actor.settings.get("grasp_retention", "friction")
@@ -578,16 +980,42 @@ class SkillCollector:
                     if not complete:
                         self.execution.finish_motion(skill["status"])
                     skill["motion_planning"] = self.execution.motion_attempts
-                skill_log.write(json.dumps(skill, allow_nan=False) + "\n")
+                reset_after_grasp = (self.actor.settings.get("grasp_only", False)
+                                     and complete and primitive.status == "success"
+                                     and decoded.primitive_type == "grasp")
+                reset_after_held_failure = (
+                    self.actor.settings.get("grasp_only", False)
+                    and complete and primitive.status != "success"
+                    and decoded.primitive_type == "grasp"
+                    and any(obj["grasped"] for obj in
+                            after_snapshot.get("contact_snapshot", {}).get("objects", {}).values()))
+                if reset_after_grasp:
+                    skill["reset_after_skill"] = "grasp_success"
+                elif reset_after_held_failure:
+                    skill["reset_after_skill"] = "grasp_failure_still_holding"
+                self._add_time("log_conversion_s", conversion_started)
+                serialization_started = time.perf_counter()
+                encoded = json.dumps(skill, allow_nan=False) + "\n"
+                self._add_time("log_serialization_s", serialization_started)
+                write_started = time.perf_counter()
+                skill_log.write(encoded)
                 skill_log.flush()
+                self._add_time("log_write_s", write_started)
                 skills.append(skill)
                 if on_skill_end is not None:
                     on_skill_end(skill)
                 if stop_when is not None and stop_when():
                     break
-                if (terminated or truncated) and len(ticks) < count:
+                if (terminated or truncated or reset_after_grasp or reset_after_held_failure) and len(ticks) < count:
                     self.reset(seed + self.episode_id)
+            close_started = time.perf_counter()
+        self._add_time("log_write_s", close_started)
         return ticks, skills
+
+
+def _object_contact(snapshot):
+    return any(obj.get("grasped", False) or obj.get("left_force", 0) > 0 or obj.get("right_force", 0) > 0
+               for obj in snapshot.get("objects", {}).values())
 
 
 def skill_arrays(skills):
@@ -644,6 +1072,7 @@ def save(path, backend, actor, encoder, config, ticks, skills, *, executor=None)
                     rng=rng_state(), state_contract=encoder.contract(),
                     action_contract=action_contract(actor.settings),
                     config=OmegaConf.to_container(config, resolve=True),
+                    sampling_contract=sampling_contract(config),
                     real_steps=len(ticks), completed_skills=len(arrays["states"]),
                     environment_state_restored=False))
     if executor is not None:
@@ -657,12 +1086,14 @@ def save(path, backend, actor, encoder, config, ticks, skills, *, executor=None)
     return _write_checkpoint(path, payload, arrays, low_arrays, timings)
 
 
-def load(path, backend, actor, encoder):
+def load(path, backend, actor, encoder, *, sampling=None):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("schema") != SCHEMA:
         raise ValueError("Requires a RAPS/GNN actor checkpoint; 4D CEE-US checkpoints are incompatible")
     if payload["state_contract"] != encoder.contract() or not action_contract_matches(payload["action_contract"], actor.settings):
         raise ValueError("Checkpoint state/action/controller contract differs")
+    if payload.get("sampling_contract") != sampling:
+        raise ValueError("Checkpoint sampling contract differs; use its original collection configuration")
     backend.load_state_dict(payload["backend"])
     actor.load_state_dict(payload["actor"])
     restore_rng(payload["rng"])
@@ -717,8 +1148,35 @@ def fit(backend, actor, skills, config, directory, label, *, smoke=False):
     previous_profile = backend.profile_timings
     backend.profile_timings = {}
     try:
+        replay_metrics = None
+        train_options = dict(epochs=1 if smoke else int(config.epochs))
+        if config.get("wm_replay") is not None:
+            from exploration.raps.protected_replay import protected_replay_indices, bounded_dynamic_replay_indices
+            options = _protected_replay_config(config)
+            mode = options.pop("mode", "protected")
+            sampling = dict(
+                agent_dim=backend.env.agent_dim, object_dyn_dim=backend.env.object_dyn_dim,
+                num_objects=backend.env.nObj,
+                batch_size=backend.model.batch_size, **{**options, "updates": 2 if smoke else options["updates"]})
+            if mode == "bounded_dynamic":
+                indices, replay_metrics = bounded_dynamic_replay_indices(
+                    arrays["states"], arrays["next_states"], **sampling)
+            else:
+                valid = [row for row in skills if row["trainable"]]
+                if any("object_contact" not in row for row in valid):
+                    raise ValueError("Protected replay requires object_contact on every macro; "
+                                     "use newly collected records with intermediate contact summaries")
+                indices, replay_metrics = protected_replay_indices(
+                    arrays["states"], arrays["actions"], arrays["next_states"],
+                    new_mask=np.asarray([row["stage"] == label for row in valid], dtype=bool),
+                    contact_mask=np.asarray([row["object_contact"] for row in valid], dtype=bool), **sampling)
+            train_options = dict(epochs=1, training_indices=indices)
         model_metrics, timings["world_model_fit_s"] = _timed(
-            backend, lambda: backend.train(arrays, epochs=1 if smoke else int(config.epochs)))
+            backend, lambda: backend.train(arrays, **train_options))
+        if replay_metrics is not None:
+            if model_metrics["updates"] != (2 if smoke else options["updates"]):
+                raise RuntimeError("WM replay update budget was not honored")
+            model_metrics["replay"] = replay_metrics
         timings.update(backend.profile_timings)
         actor_metrics, timings["actor_critic_s"] = _timed(
             backend, lambda: actor.train(arrays, updates=2 if smoke else None))
@@ -732,13 +1190,44 @@ def fit(backend, actor, skills, config, directory, label, *, smoke=False):
     return result
 
 
+def _protected_replay_config(config):
+    options = dict(config["wm_replay"])
+    mode = options.pop("mode", "protected")
+    if mode not in ("protected", "bounded_dynamic"):
+        raise ValueError("wm_replay.mode must be protected or bounded_dynamic")
+    required = ({"updates", "movement_threshold_m", "z_bin_m", "joint_bin_degrees"}
+                if mode == "protected" else {"updates", "movement_threshold_m"})
+    if set(options) != required:
+        raise ValueError(f"wm_replay {mode} requires exactly {sorted(required)}")
+    if isinstance(options["updates"], bool) or not isinstance(options["updates"], int) or options["updates"] < 1:
+        raise ValueError("wm_replay.updates must be a positive integer")
+    for key in required - {"updates"}:
+        value = options[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not np.isfinite(value) or value <= 0):
+            raise ValueError(f"wm_replay.{key} must be finite and positive")
+    settings = config["raps_actor"]
+    if not (settings.get("grasp_only") and settings.get("pick_place_grid")
+            and settings.get("grid_layout") == "trapezoid_4_3_2_1"
+            and settings.get("grasp_orientation_candidates")
+            and list(settings.get("grasp_z_bounds_m", [])) == [.692, .772]):
+        raise ValueError("Protected replay requires the trapezoid grasp cell/pose/Z action contract")
+    if mode == "protected":
+        options["joint_bin_rad"] = np.deg2rad(options.pop("joint_bin_degrees"))
+    else:
+        options["mode"] = mode
+    return options
+
+
 def summarize(ticks, skills, schema=RAPS_ACTION_SCHEMA):
-    return dict(interactions=interaction_summary(ticks), skill_decisions=len(skills),
+    maintenance = [row for row in skills if row["primitive_type"] == "return_default"]
+    return dict(interactions=interaction_summary(ticks), skill_decisions=len(skills)-len(maintenance),
+                homing_controls=sum(row["duration_low_steps"] for row in maintenance),
                 completed_skills=sum(row["trainable"] for row in skills),
                 incomplete_skills=sum(not row["completed"] for row in skills),
                 per_skill={name: dict(selected=sum(row["primitive_type"] in labels for row in skills),
                                      completed=sum(row["primitive_type"] in labels and row["trainable"] for row in skills))
-                           for name in schema.primitive_names
+                           for name in getattr(schema, "logical_primitive_names", schema.primitive_names)
                            for labels in [(name, "top_grasp") if name == "approach" else (name,)]})
 
 
@@ -749,6 +1238,13 @@ def run(args, config):
         config.collection_policy = getattr(args, "policy", "curiosity")
     policies = ("random", "curiosity") if args.stage == "compare" else (str(config.get("collection_policy", "curiosity")),)
     config.raps_actor = OmegaConf.merge(DEFAULTS, config.get("raps_actor", {}))
+    if config.get("wm_replay") is not None:
+        _protected_replay_config(config)
+    if not isinstance(config.get("collection_optimizations", False), bool):
+        raise ValueError("collection_optimizations must be boolean")
+    collector_options = ({"collection_optimizations": True}
+                         if config.get("collection_optimizations", False) else {})
+    collection_contract = sampling_contract(config)
     if config.raps_actor.pick_place_primitives:
         config.raps_actor.motion_execution = "planner"
         config.action_mode = "joint_position"
@@ -796,12 +1292,21 @@ def run(args, config):
         raise ValueError("evaluate requires --checkpoint")
     torch.set_num_threads(int(config.get("cpu_threads", 1)))
     random.seed(int(config.seed)); np.random.seed(int(config.seed)); torch.manual_seed(int(config.seed))
+    item_layout = config.get("cabinet_item_layout", "two_upper_second_row")
+    if item_layout not in {"single_upper_second_row", "two_upper_second_row"}:
+        raise ValueError(f"Unsupported cabinet_item_layout={item_layout!r}")
+    object_names = (("cabinet_item_16",) if item_layout == "single_upper_second_row"
+                    else ("cabinet_item_16", "cabinet_item_17"))
+    from exploration.cee_us.cee_us_state import cabinet_agent_dim
     backend = CEEUSBackend(device=str(config.device), seed=int(config.seed),
                            action_dim=skill_schema(config.raps_actor).action_dim,
-                           agent_dim=32 + int(config.raps_actor.latched_gripper),
+                           agent_dim=cabinet_agent_dim(config.get("cabinet_door", False),
+                                                       latched_gripper=config.raps_actor.latched_gripper),
+                           num_objects=len(object_names), object_names=object_names,
                            execution=execution,
                            object_heuristic=OmegaConf.to_container(config.object_heuristic, resolve=True)
                            if config.get("object_heuristic") is not None else None,
+                           **dict(config.get("wm_training") or {}),
                            runtime_optimizations=bool(config.get("runtime_optimizations", False)))
     actor = RAPSImaginationActor(backend, OmegaConf.to_container(config.raps_actor, resolve=True))
     from exploration.cee_us.cee_us_state import CabinetSkillStateEncoder
@@ -834,13 +1339,21 @@ def run(args, config):
         if pending_checkpoint is not None and pending_checkpoint.done():
             drain_checkpoint()
         result, seconds = _timed(backend, lambda: collector.collect(*arguments, **keywords))
-        timing(dict(stage="collection", label=keywords["stage"], collection_s=seconds))
+        timing(dict(stage="collection", label=keywords["stage"], collection_s=seconds,
+                    collection_components=dict(getattr(collector, "profile_timings", {})),
+                    nested_components=["context_read_s", "actual_planning_s", "planner_total_s",
+                                       "contact_force_read_s", "planner_geometry_s", "planner_ik_s",
+                                       "planner_path_search_s", "planner_topp_s"]))
         return result
 
     try:
         env, env_config = make_env(
             episode_steps=config.get("episode_steps", 100),
             centered_initial_tcp=config.get("centered_initial_tcp", False),
+            cabinet_door=config.get("cabinet_door", False),
+            cabinet_item_layout=item_layout,
+            cabinet_grid=config.raps_actor.get("pick_place_grid", False),
+            cabinet_grid_layout=config.raps_actor.get("grid_layout", "legacy_3x4"),
             object_shift_xy=getattr(args, "object_shift_xy", (0.0, 0.0)),
             action_mode=expected_mode,
             low_level_episode_steps=(int(config.get("episode_steps", 100))
@@ -848,12 +1361,21 @@ def run(args, config):
         )
         env.reset(seed=int(config.seed))
         encoder = CabinetSkillStateEncoder(env, latched_gripper=actor.settings["latched_gripper"])
+        if encoder.contract()["dimension"] != backend.state_dim or tuple(encoder.object_names) != backend.object_names:
+            raise ValueError("Cabinet state encoder and world model object/state dimensions differ")
+        def new_collector(directory):
+            if collection_contract is not None:
+                return CpuRoundCollector(config, actor, directory,
+                    object_shift_xy=getattr(args, "object_shift_xy", (0., 0.)))
+            return SkillCollector(env, encoder, actor, directory, **collector_options)
         prepare_output(output, config, env_config)
         prepared = True
         write_json(output / "action_contract.json", action_contract(actor.settings))
         write_json(output / "state_contract.json", encoder.contract())
         manifest = json.loads((output / "manifest.json").read_text())
         manifest.update(agent=config.agent, checkpoint_schema=SCHEMA, raps_reference_commit=RAPS_REFERENCE_COMMIT,
+                        sampling_contract=collection_contract,
+                        collection_optimizations=bool(config.get("collection_optimizations", False)),
                         collection_policy=config.get("collection_policy", None),
                         collection_policies=list(policies) if args.stage != "evaluate" else [],
                         episode_steps=env_config.max_ee_steps_per_episode,
@@ -871,19 +1393,36 @@ def run(args, config):
                         ])
         if config.raps_actor.pick_place_primitives:
             manifest.update(
-                action_semantics="5D grasp/place choice plus schema-defined bounded position arguments; completed macro endpoints",
+                action_semantics=(f"{actor.schema.action_dim}D: {actor.schema.num_primitives} row-major grid "
+                                  f"{'/'.join(actor.schema.logical_primitive_names)} branches "
+                                  f"({actor.schema.num_grasp_branches} grasp, cell-major then orientation ID when enabled) "
+                                  "plus shared grasp-only Z; completed macro endpoints"
+                                  if config.raps_actor.get("pick_place_grid", False) else
+                                  "4D constant grasp choice plus bounded XYZ; completed grasp endpoints before lifecycle reset"
+                                  if config.raps_actor.get("grasp_only", False) else
+                                  "5D grasp/place choice plus schema-defined bounded position arguments; completed macro endpoints"),
                 action_dim=actor.schema.action_dim,
                 grasp_retention=actor.settings["grasp_retention"],
-                collection_reset="Every collection call resets physics; unfinished macros are excluded from WM replay")
+                collection_reset=("Success/held failure resets; unheld failure retains objects. Planned default joints before every grasp; observe/select after homing. Homing controls count separately; endpoints retained before homing/reset"
+                                  if config.raps_actor.get("grasp_only", False) else
+                                  "Every collection call resets physics; unfinished macros are excluded from WM replay"))
+        if collection_contract is not None:
+            manifest.update(collection_reset="Fresh CPU scene per stream per collection call; success/held reset, unheld failure retains objects; planned default joints before every grasp",
+                            collection_merge="Stream ID then local order; exact total real-control quota",
+                            collection_updates="All streams finish and merge before WM fit then actor/critic fit",
+                            proposal_device="cpu")
+        if actor.settings["reconfigure_on_reset"]:
+            manifest["physics_reset"] = "fresh_scene_on_episode_v1; rebuild scene and rebind encoder only at existing episode resets"
         write_json(output / "manifest.json", manifest)
         if args.stage == "evaluate":
-            load(args.checkpoint, backend, actor, encoder)
-            collector = SkillCollector(env, encoder, actor, output / "evaluation")
+            load(args.checkpoint, backend, actor, encoder, sampling=collection_contract)
+            collector = new_collector(output / "evaluation")
             ticks, skills = collect(collector, int(config.evaluation_steps), args.policy,
                                               seed=int(config.seed) + 100000, stage="evaluation")
             result = summarize(ticks, skills, actor.schema)
             valid = [row for row in skills if row["trainable"]]
-            result["prediction"] = (prediction_metrics(backend, skill_arrays(valid), horizons=(1, 3, 5))
+            result["prediction"] = (prediction_metrics(backend, skill_arrays(valid),
+                horizons=(1,) if actor.settings.get("grasp_only", False) else (1, 3, 5))
                                     if len(valid) >= 2 else {"status": "insufficient_completed_skills"})
             result.update(policy=args.policy, collection_policy=config.get("collection_policy", None),
                           model_updated=False, actor_updated=False, normalizers_updated=False,
@@ -898,7 +1437,7 @@ def run(args, config):
         start_round = 1
         if resuming:
             ticks, skills, start_round = resume_history(args.checkpoint, config)
-            load(args.checkpoint, backend, actor, encoder)
+            load(args.checkpoint, backend, actor, encoder, sampling=collection_contract)
             initial_episode = ticks[-1]["episode_id"]
             initial_skill = max(row["skill_id"] for row in skills)
             # Keep independent complete JSONL logs; do not modify the source run.
@@ -916,7 +1455,7 @@ def run(args, config):
                             simulation_resume="Physics resets at the next collection round, as in baseline")
             write_json(output / "manifest.json", manifest)
         else:
-            bootstrap = SkillCollector(env, encoder, actor, output / "bootstrap")
+            bootstrap = new_collector(output / "bootstrap")
             ticks, skills = collect(bootstrap, 192 if smoke else int(config.bootstrap_steps), "random",
                                               seed=int(config.seed), stage="bootstrap")
             fit(backend, actor, skills, config, bootstrap.directory, "bootstrap", smoke=smoke)
@@ -928,7 +1467,7 @@ def run(args, config):
             actor.load_state_dict(deepcopy(initial_actor))
             restore_rng(initial_rng)
             history, endpoints = list(ticks), list(skills)
-            collector = SkillCollector(env, encoder, actor, output / policy)
+            collector = new_collector(output / policy)
             collector.episode_id, collector.skill_id = initial_episode, initial_skill
             collector.total_steps = len(ticks)
             rounds = 1 if smoke else int(config.rounds)
@@ -955,7 +1494,7 @@ def run(args, config):
                 restore_rng(random_before)
                 checkpoint(path, history, endpoints)
                 drain_checkpoint()
-                load(path, backend, actor, encoder)
+                load(path, backend, actor, encoder, sampling=collection_contract)
                 np.testing.assert_array_equal(expected, backend.predict(replay["states"][:1], replay["actions"][:1]))
                 np.testing.assert_array_equal(expected_action, actor.action(replay["states"][0]))
             if not smoke and int(config.evaluation_steps) == 0:
@@ -969,7 +1508,8 @@ def run(args, config):
             # that fitting static endpoints validates interaction dynamics.
             valid = [row for row in eval_skills if row["trainable"]]
             if len(valid) >= 2:
-                result["prediction"] = prediction_metrics(backend, skill_arrays(valid), horizons=(1, 3, 5))
+                result["prediction"] = prediction_metrics(backend, skill_arrays(valid),
+                    horizons=(1,) if actor.settings.get("grasp_only", False) else (1, 3, 5))
             else:
                 result["prediction"] = {"status": "insufficient_completed_evaluation_skills"}
             write_json(collector.directory / "evaluation.json", result)

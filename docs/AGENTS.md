@@ -50,3 +50,36 @@ These rules apply to the entire project alongside global instructions. They help
 ## Scope of automation
 
 Agents execute these rules; this is not a file watcher. Agents that follow this file should maintain the log proactively. Manual edits and tools that do not read `AGENTS.md` do not automatically create log entries. Configure other tools to use this file as their project instruction entry point.
+
+## Visualization delivery defaults
+
+- For interactive browser visualizations, provide both a working viewer URL and a self-contained downloadable HTML file that opens locally without the server.
+- For Remote SSH viewers, include the VS Code port-forwarding instruction with the actual port (currently 8766 for the cabinet viewer). Do not assume or claim that forwarding is already configured.
+- Reuse a running viewer server when available. If starting one, detach it from the tool session with redirected standard streams so it survives the turn; verify the requested URL before sharing it.
+- Include brief interaction instructions, such as selecting a cell, rotating the view and changing cameras.
+
+
+## Current cabinet scene default
+
+The user requested doorless cabinet scenes on 2026-11-16. Keep the current
+miniature scene, trapezoid cup preset, uniform collectors and four-baseline
+launches doorless by default (`cabinet_door: false`). Remove the door entity
+and its collision geometry through the existing scene option; hiding its visual
+is insufficient. Historical frozen runs/data retain their actual door settings.
+New doorless WM contracts omit door angle/velocity entirely (30 physical agent
+dimensions, or31 with latched-gripper memory; single-cup skill state48D).
+Do not mix them with historical door-present or zero-reserved doorless
+checkpoints/data. Historical frozen encoders retain their original layouts.
+The current trapezoid preset enables `raps_actor.reconfigure_on_reset: true`:
+rebuild the PhysX scene only at existing episode resets and rebind encoder
+handles in place. Unheld failures retain the current object scene, but every
+grasp-only collection attempt must first physically return the arm to the reset
+default joint configuration through checked motion planning. Encode the WM input
+and select the action only after homing succeeds. Count homing controls in the
+real-step budget, record them as nontrainable `return_default` maintenance, and
+never treat them as a grasp transition. Stop clearly if homing fails; do not
+teleport the robot or reset objects as a fallback. Historical pre-homing data and
+checkpoints retain their old execution contract. Ordinary pose/velocity
+reset and drive-target reset retained a reproducible history-dependent outcome;
+do not silently revert this new collection contract or mix its data with the
+historical reset protocol.

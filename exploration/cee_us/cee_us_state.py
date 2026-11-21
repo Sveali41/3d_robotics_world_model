@@ -13,6 +13,11 @@ OBJECT_NAMES = ("cabinet_item_16", "cabinet_item_17")
 OBJECT_TYPES = ("mug", "bowl")
 
 
+def cabinet_agent_dim(cabinet_door, *, latched_gripper=False):
+    """Physical robot state, optional door, and optional controller memory."""
+    return 30 + 2 * int(cabinet_door) + int(latched_gripper)
+
+
 def _numpy(value, name: str, size: int) -> np.ndarray:
     """Convert ManiSkill's batched Torch values or fixture arrays to a vector."""
     if hasattr(value, "detach"):
@@ -49,6 +54,7 @@ class CabinetStateEncoder:
             raise ValueError("dt must be a finite positive number")
         self.dt = float(dt)
         self.env = env.unwrapped if hasattr(env, "unwrapped") else env
+        self.agent_dim = cabinet_agent_dim(self.env.door_joint is not None)
         control_freq = getattr(self.env, "control_freq", None)
         if control_freq is None or float(control_freq) != 20.0:
             raise ValueError(
@@ -64,8 +70,10 @@ class CabinetStateEncoder:
 
         actors = {getattr(actor, "name", None): actor
                   for actor in getattr(self.env, "cabinet_items", [])}
-        object_names = OBJECT_NAMES
-        object_types = OBJECT_TYPES
+        if getattr(self.env, "cabinet_item_layout", None) == "single_upper_second_row":
+            object_names, object_types = OBJECT_NAMES[:1], OBJECT_TYPES[:1]
+        else:
+            object_names, object_types = OBJECT_NAMES, OBJECT_TYPES
         missing = [name for name in object_names if name not in actors]
         if missing:
             raise ValueError(f"Missing required cabinet actors: {missing}")
@@ -107,6 +115,10 @@ class CabinetStateEncoder:
             raise RuntimeError("Robot controller root moved after encoder initialization")
         return position, rotation
 
+    def rebind_after_reset(self):
+        """A rebuilt physics scene replaces actor, controller and root-link handles."""
+        CabinetStateEncoder.__init__(self, self.env, dt=self.dt)
+
     def encode(self) -> np.ndarray:
         root_position, root_rotation = self._root_transform()
         world_to_root = root_rotation.T
@@ -127,8 +139,6 @@ class CabinetStateEncoder:
             self.env.agent.tcp.angular_velocity, "TCP angular velocity", 3
         )
 
-        door_angle = _numpy(self.env.door_joint.qpos, "door qpos", 1)
-        door_qvel = _numpy(self.env.door_joint.qvel, "door qvel", 1)
         state = [
             *qpos,
             *(qvel * self.dt),
@@ -136,9 +146,10 @@ class CabinetStateEncoder:
             *_euler_xyz(tcp_rotation),
             *(tcp_linear_velocity * self.dt),
             *(tcp_angular_velocity * self.dt),
-            *door_angle,
-            *(door_qvel * self.dt),
         ]
+        if self.env.door_joint is not None:
+            state.extend(_numpy(self.env.door_joint.qpos, "door qpos", 1))
+            state.extend(_numpy(self.env.door_joint.qvel, "door qvel", 1) * self.dt)
 
         for name, actor in self.objects:
             position_world, rotation_world = _pose(actor.pose, f"{name} pose")
@@ -164,7 +175,7 @@ class CabinetStateEncoder:
             state.extend((*one_hot, *self.collision_extents[name]))
 
         result = np.asarray(state, dtype=np.float32)
-        if result.shape != (AGENT_DIM + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),):
+        if result.shape != (self.agent_dim + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),):
             raise ValueError(f"Encoded state has unexpected shape {result.shape}")
         if not np.all(np.isfinite(result)):
             raise ValueError("Encoded state contains non-finite values")
@@ -194,9 +205,12 @@ class CabinetStateEncoder:
             {"name": "tcp_root_euler_xyz", "shape": [3], "units": "rad"},
             {"name": "tcp_root_linear_velocity_dt", "shape": [3], "units": "m per control step"},
             {"name": "tcp_root_angular_velocity_dt", "shape": [3], "units": "rad per control step"},
-            {"name": "door_angle", "shape": [1], "units": "rad"},
-            {"name": "door_qvel_dt", "shape": [1], "units": "rad per control step"},
         ]
+        if self.env.door_joint is not None:
+            fields.extend([
+                {"name": "door_angle", "shape": [1], "units": "rad"},
+                {"name": "door_qvel_dt", "shape": [1], "units": "rad per control step"},
+            ])
         for name in self.object_names:
             fields.append({"name": f"{name}.root_position", "shape": [3], "units": "m"})
             fields.append({"name": f"{name}.root_euler_xyz", "shape": [3], "units": "rad"})
@@ -206,13 +220,13 @@ class CabinetStateEncoder:
             fields.append({"name": f"{name}.type_one_hot_mug_bowl", "shape": [2], "units": "binary"})
             fields.append({"name": f"{name}.collision_mesh_extents", "shape": [3], "units": "m"})
         position, rotation = self._root_position, self._root_rotation
-        return {
+        contract = {
             "dtype": "float32",
-            "dimension": AGENT_DIM + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),
+            "dimension": self.agent_dim + len(self.objects) * (OBJECT_DYN_DIM + OBJECT_STAT_DIM),
             "dt_seconds": self.dt,
             "control_freq_hz": 20,
             "layout": ["agent", "object_dynamics_sorted_by_name", "object_static_sorted_by_name"],
-            "agent_dim": AGENT_DIM,
+            "agent_dim": self.agent_dim,
             "object_dyn_dim": OBJECT_DYN_DIM,
             "object_stat_dim": OBJECT_STAT_DIM,
             "object_names": list(self.object_names),
@@ -224,6 +238,25 @@ class CabinetStateEncoder:
             },
             "collision_meshes": self.collision_metadata,
         }
+        if self.env.door_joint is None:
+            contract["cabinet_door"] = False
+            contract["door_state"] = "absent; no door state dimensions"
+        if getattr(self.env, "cabinet_grid", False):
+            from domain.robocasa.cabinet_grid import resolve_grid_layout
+            layout = getattr(self.env, "cabinet_grid_layout", "legacy_3x4")
+            grid_xy, initial_cells = resolve_grid_layout(layout)
+            contract["cabinet_grid"] = dict(version=1, rows=3, columns=4,
+                xy_root_m=[list(xy) for xy in grid_xy],
+                initial_cells={name: cell for name, cell in initial_cells.items()
+                               if name in self.object_names},
+                initial_xy_reference=("collision_AABB_center; fixed_per_object_on_reset"
+                    if layout == "legacy_3x4" else "native_actor_origin; fixed_per_object_on_reset"),
+                upper_support_root_z_m=.672, lower_support_root_z_m=.330)
+            if layout != "legacy_3x4":
+                contract["cabinet_grid"]["layout"] = layout
+            if layout == "trapezoid_4_3_2_1":
+                contract["cabinet_grid"].update(rows=4, row_sizes=[4, 3, 2, 1])
+        return contract
 
 
 class CabinetSkillStateEncoder(CabinetStateEncoder):
@@ -240,14 +273,14 @@ class CabinetSkillStateEncoder(CabinetStateEncoder):
             return state
         if not np.isfinite(self.gripper_command) or not -1 <= self.gripper_command <= 1:
             raise ValueError("Skill gripper command must be finite and normalized")
-        return np.insert(state, AGENT_DIM, self.gripper_command).astype(np.float32)
+        return np.insert(state, self.agent_dim, self.gripper_command).astype(np.float32)
 
     def contract(self):
         contract = super().contract()
         if self.latched_gripper:
             contract["agent_dim"] += 1
             contract["dimension"] += 1
-            contract["fields"].insert(8, dict(name="last_gripper_command", shape=[1],
+            contract["fields"].insert(8 if self.agent_dim == 32 else 6, dict(name="last_gripper_command", shape=[1],
                                               units="normalized controller command"))
             contract["controller_state"] = "latched_gripper_v1"
         return contract

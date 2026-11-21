@@ -9,6 +9,9 @@ from domain.robocasa.primitives import (
     Primitive, PrimitiveAction, PrimitiveParameter, PrimitiveSpec, RAPSActionSchema,
 )
 from domain.robocasa.skill_execution import RAPSSkillExecution
+from domain.robocasa.grasp_orientations import (
+    grasp_orientation_quaternion, validate_grasp_orientation_id,
+)
 
 CABINET_ORIGIN = (.525, .12, .66)
 XY_MARGIN = .08
@@ -26,6 +29,7 @@ PLACE_XY_BOUNDS = ((.370, .671), (-.070, .310))
 ACTION_BOUNDS = {**TCP_BOUNDS, "place": PLACE_XY_BOUNDS}
 PLACE_CLEARANCE = .04
 PLACE_EDGE_CLEARANCE = .02
+RELEASE_RETRACT_M = .06
 PHASE_BUDGETS = {
     "open": 9, "retreat": 85, "align": 100, "approach": 120, "preplace": 100, "clear": 100, "home_raise": 100,
     "close": 30, "confirm": 12, "lift": 45, "withdraw": 85,
@@ -41,7 +45,7 @@ PICK_PLACE_MACRO_CONTRACT = {
         "on_loss_or_slip": "fail_current_macro_stop_motion_keep_closed",
         "physical_no_drop_guarantee": False, "teleport_or_physics_attachment": False,
     },
-    "version": 5, "coordinates": "controller_root_meters; grasp_tcp_xyz; place_object_collision_aabb_center_xy",
+    "version": 6, "coordinates": "controller_root_meters; grasp_tcp_xyz; place_object_collision_aabb_center_xy",
     "orientation": "fixed_grasp_place; exterior_preplace_transfer_may_rotate",
     "exterior_rrt_pre_TOPP_max_joint_step_rad": .025,
     "orientation_rotation_region": {"stage": "preplace", "tcp_root_x_less_than_m": CABINET_MOUTH_X}, "action_dim": 5,
@@ -74,7 +78,9 @@ PICK_PLACE_MACRO_CONTRACT = {
         "attachment_slip", "grasp_lost", "unexpected_attachment", "unconfirmed_grasp",
         "multiple_grasped_objects", "release_in_progress", "gripper_plan_mismatch", "stale_plan",
         "invalid_support_surface", "invalid_goal", "execution_error", "unsupported", "terminated", "truncated"],
-    "release_clearance_m": .04,
+    "release_retract_m": RELEASE_RETRACT_M,
+    "release_retract_direction": "negative_root_x_at_fixed_z; then exterior_withdraw",
+    "post_release_contacts": "no_finger_payload_collision_exemption",
     "lift_m": .08, "lift_root_z_cap_m": .90, "minimum_object_rise_m": .01,
     "motion_tolerance_m": .012, "approach_speed_normalized": .08,
     "transport_speed_normalized": .25, "descent_speed_normalized": .025,
@@ -98,10 +104,17 @@ PICK_PLACE_MACRO_CONTRACT = {
 }
 
 
-def pick_place_contract(grasp_retention="friction"):
+def pick_place_contract(grasp_retention="friction", *, grasp_orientation_candidates=False):
     if grasp_retention not in {"friction", "constraint"}:
         raise ValueError("grasp_retention must be friction or constraint")
     contract = deepcopy(PICK_PLACE_MACRO_CONTRACT)
+    if grasp_orientation_candidates:
+        contract.update(
+            orientation="selected_discrete_grasp; reset_place; retreat_preserves_measured_orientation",
+            orientation_rotation_region=dict(stages=["align", "preplace"],
+                                             tcp_root_x_less_than_m=CABINET_MOUTH_X),
+            place_geometry="confirmed_tcp_to_object_pose; recompute_bounds_at_reset_place_orientation",
+            grasp_preflight_orientation="same_selected_id_as_execution; no_orientation_fallback")
     if grasp_retention == "constraint":
         retention = contract["grasp_retention"]
         retention.pop("teleport_or_physics_attachment")
@@ -232,7 +245,7 @@ class PickPlaceSkillExecution(RAPSSkillExecution):
         self._place_reference = None
 
     def start(self, action: PrimitiveAction, context):
-        PICK_PLACE_ACTION_SCHEMA.encode(action)  # Reject invalid physical coordinates.
+        getattr(self, "physical_action_schema", PICK_PLACE_ACTION_SCHEMA).encode(action)
         if self.home is None:
             self.home = np.asarray(context.ee_position, dtype=np.float32).copy()
         self.primitive = PickPlacePrimitive(action)
@@ -264,7 +277,7 @@ class PickPlaceSkillExecution(RAPSSkillExecution):
         else:
             self._loss_guard = True
             try:
-                if self._place_reference is None:
+                if self._place_reference is None or getattr(self, "grasp_orientation_candidates", False):
                     self._capture_place_reference(context)
                 if self._held_ids != {self._place_reference["name"]}:
                     raise ValueError("Placement reference does not match the held object")
@@ -291,7 +304,9 @@ class PickPlaceSkillExecution(RAPSSkillExecution):
 
     def _capture_place_reference(self, context):
         planner = context.env.motion_planner
-        attachment = planner.attachment_state()
+        # Reorienting placement changes bounds, not the confirmed relative pose.
+        attachment = (self._place_reference if getattr(self, "grasp_orientation_candidates", False)
+                      and self._place_reference is not None else planner.attachment_state())
         if attachment is None or self._held_ids != {attachment["name"]}:
             raise ValueError("Placement requires one confirmed payload and its measured TCP-relative pose")
         orientation = (self._orientation if hasattr(self, "_orientation") else
@@ -317,7 +332,8 @@ class PickPlaceSkillExecution(RAPSSkillExecution):
         elif stage == "align":
             self._anchor = np.array([OUTSIDE_X, *self.goal[1:]], dtype=np.float32)
         elif stage == "clear":
-            self._anchor[2] = max(float(self.goal[2]), float(self._anchor[2]) + .04)
+            # Withdraw open fingers from the handle before raising the wrist.
+            self._anchor[0] -= RELEASE_RETRACT_M
         elif stage == "preplace":
             self._anchor = np.array(PREPLACE, dtype=np.float32)
         elif stage == "approach":
@@ -489,12 +505,17 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
     """Use checked joint plans for the shared macro's motion phases."""
 
     def __init__(self, *, orientation_target, planning_seed=0, max_control_steps=400,
-                 grasp_retention="friction", **kwargs):
+                 grasp_retention="friction", grasp_orientation_candidates=False,
+                 physical_action_schema=None, **kwargs):
         if (isinstance(max_control_steps, bool) or int(max_control_steps) != max_control_steps
                 or max_control_steps < 1):
             raise ValueError("motion_plan_max_steps must be a positive integer")
         if grasp_retention not in {"friction", "constraint"}:
             raise ValueError("grasp_retention must be friction or constraint")
+        if not isinstance(grasp_orientation_candidates, bool):
+            raise ValueError("grasp_orientation_candidates must be boolean")
+        self.grasp_orientation_candidates = grasp_orientation_candidates
+        self.physical_action_schema = physical_action_schema or PICK_PLACE_ACTION_SCHEMA
         self.grasp_retention = grasp_retention
         self.orientation_target = orientation_target
         self.planning_seed = int(planning_seed)
@@ -515,7 +536,27 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
         self._force_ticks = 0
         self._retention_attachment = None
 
+    def _physical_action(self, action):
+        if getattr(self, "grasp_orientation_candidates", False) and action.primitive_type == "grasp":
+            parameters = dict(action.parameters)
+            if "orientation_id" not in parameters:
+                raise ValueError("Grasp requires orientation_id when grasp_orientation_candidates is enabled")
+            validate_grasp_orientation_id(parameters.pop("orientation_id"))
+            action = PrimitiveAction(action.primitive_type, parameters)
+        getattr(self, "physical_action_schema", PICK_PLACE_ACTION_SCHEMA).encode(action)
+        return action
+
+    def _target_orientation(self, action):
+        orientation = _numpy(self.orientation_target()).reshape(4)
+        if not np.isfinite(orientation).all() or np.linalg.norm(orientation) <= 0:
+            raise ValueError("Planned pick/place requires a finite nonzero reset quaternion")
+        orientation = orientation / np.linalg.norm(orientation)
+        if getattr(self, "grasp_orientation_candidates", False) and action.primitive_type == "grasp":
+            orientation = grasp_orientation_quaternion(orientation, action.parameters["orientation_id"])
+        return orientation
+
     def start(self, action, context):
+        physical_action = self._physical_action(action)
         self.motion_cursor = None
         self.motion_attempts = []
         self.last_motion_tick = {}
@@ -526,13 +567,76 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
         self.raw = context.env
         self.raw.set_grasp_retention(self.grasp_retention)
         self.raw.motion_planner  # Initialize contact tracking before closing.
-        self._orientation = _numpy(self.orientation_target()).reshape(4)
-        if not np.isfinite(self._orientation).all() or np.linalg.norm(self._orientation) <= 0:
-            raise ValueError("Planned pick/place requires a finite nonzero reset quaternion")
-        self._orientation = self._orientation / np.linalg.norm(self._orientation)
-        super().start(action, context)
+        self._selected_orientation = self._target_orientation(action)
+        self._entry_orientation = (self._feedback_orientation().copy()
+            if self.grasp_orientation_candidates else self._selected_orientation.copy())
+        self._orientation = self._entry_orientation.copy()
+        if self.grasp_orientation_candidates and action.primitive_type == "place":
+            self._orientation = self._selected_orientation.copy()
+        super().start(physical_action, context)
+        self.primitive.action = action
+        self.primitive.parameters = dict(action.parameters)
         if action.primitive_type == "grasp" and not self._held_ids:
             self._retention_attachment = None
+
+    def preflight_grasp(self, action, context):
+        """Check the open-hand route through approach without any physics ticks.
+
+        Plans are discarded: settling/opening can change the real start state,
+        so production execution must still replan and retain its safety checks.
+        """
+        from domain.robocasa.motion_planning import MotionPlanningError, _angle
+
+        if action.primitive_type != "grasp":
+            raise ValueError("Grasp preflight requires a grasp action")
+        self._physical_action(action)
+        raw = context.env
+        planner = raw.motion_planner
+        live = _numpy(raw.agent.robot.get_qpos()).reshape(9).copy()
+        virtual = live.copy()
+        virtual[7:] = float(raw.agent._controller_configs["pd_joint_pos"]["gripper"].upper)
+        orientation = self._target_orientation(action)
+        goal = np.asarray([action.parameters[axis] for axis in "xyz"], dtype=float)
+        retreat = np.asarray(context.ee_position, dtype=float).copy()
+        retreat[0] = min(OUTSIDE_X, retreat[0])
+        stages = [("retreat", retreat),
+                  ("align", np.asarray([OUTSIDE_X, *goal[1:]])), ("approach", goal)]
+        reports = []
+        try:
+            if getattr(self, "grasp_orientation_candidates", False):
+                planner.kin.pmodel.compute_forward_kinematics(virtual[planner.pindices])
+                entry_orientation = _numpy(planner.kin.pmodel.get_link_pose(planner.kin.end_link_idx).q).reshape(4)
+            else:
+                entry_orientation = orientation
+            for stage, target in stages:
+                stage_orientation = entry_orientation if stage == "retreat" else orientation
+                rotate_exterior = getattr(self, "grasp_orientation_candidates", False) and stage == "align"
+                planner.kin.pmodel.compute_forward_kinematics(virtual[planner.pindices])
+                pose = planner.kin.pmodel.get_link_pose(planner.kin.end_link_idx)
+                # Match the production stage's position tolerance.
+                if (np.linalg.norm(_numpy(pose.p) - target) <= .012
+                        and _angle(pose.q, stage_orientation) <= .5):
+                    reports.append(dict(stage=stage, status="already_at_target"))
+                    continue
+                try:
+                    plan_kwargs = dict(start_qpos=virtual,
+                        seed=self.planning_seed + self.plan_counter + len(reports),
+                        allowed_contact_objects=tuple(context.objects), maintain_orientation=not rotate_exterior,
+                        method="bounded_ik" if stage == "approach" else "rrt_connect")
+                    if rotate_exterior:
+                        plan_kwargs["densify_rrt_path"] = True
+                    plan = raw.plan_to_pose(target, stage_orientation, **plan_kwargs)
+                    if getattr(self, "grasp_orientation_candidates", False):
+                        self._audit_pose_path(raw, plan, stage_orientation, stage,
+                                              exterior_rotation=rotate_exterior)
+                except MotionPlanningError as exc:
+                    return dict(accepted=False, stage=stage, status=exc.status, detail=exc.detail,
+                                stages=reports)
+                virtual = np.asarray(plan.position[-1], dtype=float).copy()
+                reports.append(dict(stage=stage, status="planned", controls=len(plan.position)))
+            return dict(accepted=True, status="approach_route_feasible", stages=reports)
+        finally:
+            planner.kin.pmodel.compute_forward_kinematics(live[planner.pindices])
 
     def check_retention(self, context):
         from domain.robocasa.motion_planning import MotionPlanningError
@@ -562,6 +666,9 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
             self.motion_attempts[-1]["status"] = status
 
     def _phase(self, stage, context):
+        if self.grasp_orientation_candidates:
+            self._orientation = (self._entry_orientation if stage in {"open", "retreat", "invalid"}
+                                 else self._selected_orientation).copy()
         self.finish_motion("support_stop" if stage == "settle" else "phase_complete")
         self.motion_cursor = None
         self._hold_qpos = None
@@ -592,20 +699,33 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
         return self._hold_action(context, context.ee_position, command)
 
     def _rotation_allowed(self, position):
-        return self.primitive.stage == "preplace" and float(position[0]) < CABINET_MOUTH_X
+        return (self.primitive.stage == "preplace"
+                or self.grasp_orientation_candidates and self.primitive.stage == "align"
+                and self.primitive.name == "grasp") and float(position[0]) < CABINET_MOUTH_X
 
     def _audit_path(self, plan, *, descent_start=None):
+        self._audit_pose_path(self.raw, plan, self._orientation, self.primitive.stage,
+            exterior_rotation=(self.primitive.stage == "preplace"
+                or self.grasp_orientation_candidates and self.primitive.name == "grasp"
+                and self.primitive.stage == "align"), descent_start=descent_start,
+            rotation_allowed=self._rotation_allowed)
+
+    @staticmethod
+    def _audit_pose_path(raw, plan, orientation, stage, *, exterior_rotation=False,
+                         descent_start=None, rotation_allowed=None):
         from domain.robocasa.motion_planning import MotionPlanningError, _angle, _interpolate
 
-        planner = self.raw.motion_planner
+        planner = raw.motion_planner
         maximum_angle = 0.
         for point in _interpolate(np.asarray(plan.position)):
             planner.kin.pmodel.compute_forward_kinematics(point[planner.pindices])
             pose = planner.kin.pmodel.get_link_pose(planner.kin.end_link_idx)
             position = _numpy(pose.p).reshape(3)
-            angle = _angle(pose.q, self._orientation)
+            angle = _angle(pose.q, orientation)
             maximum_angle = max(maximum_angle, angle)
-            if angle > .5 and not self._rotation_allowed(position):
+            allowed = (rotation_allowed(position) if rotation_allowed is not None
+                       else exterior_rotation and float(position[0]) < CABINET_MOUTH_X)
+            if angle > .5 and not allowed:
                 raise MotionPlanningError("orientation_path_violation", {
                     "maximum_allowed_deg": .5, "observed_deg": angle})
             if descent_start is not None:
@@ -621,7 +741,8 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
                 "endpoint_requires_fixed_orientation": True, "observed_deg": angle})
         plan.metadata["fixed_orientation_path_audit"] = {
             "maximum_angle_deg": maximum_angle, "tolerance_deg": .5,
-            "max_joint_step_rad": .01, "exterior_rotation_stage": "preplace"}
+            "max_joint_step_rad": .01,
+            "exterior_rotation_stage": stage if exterior_rotation else "preplace"}
         if descent_start is not None:
             plan.metadata["descent_cartesian_corridor_m"] = .002
 
@@ -650,9 +771,15 @@ class PlannedPickPlaceSkillExecution(PickPlaceSkillExecution):
             self.plan_counter += 1
             self.motion_attempts.append(attempt)
             try:
-                kwargs = dict(seed=attempt["seed"], allowed_contact_objects=tuple(context.objects),
-                              maintain_orientation=self.primitive.stage != "preplace")
-                if self.primitive.stage == "preplace":
+                rotate_exterior = (self.primitive.stage == "preplace"
+                    or self.grasp_orientation_candidates and self.primitive.name == "grasp"
+                    and self.primitive.stage == "align")
+                post_release = (self.primitive.name == "place" and self.primitive.stage in {
+                    "clear", "withdraw", "home_raise", "home_align", "home"})
+                kwargs = dict(seed=attempt["seed"],
+                              allowed_contact_objects=() if post_release else tuple(context.objects),
+                              maintain_orientation=not rotate_exterior)
+                if rotate_exterior:
                     kwargs["densify_rrt_path"] = True
                 if support_surface_root_z is not None:
                     kwargs["support_surface_root_z"] = support_surface_root_z

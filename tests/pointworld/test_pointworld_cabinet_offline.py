@@ -12,15 +12,15 @@ from exploration.pointworld.pointworld_cabinet_offline import (
 )
 
 
-def dataset(tmp_path):
+def dataset(tmp_path, agent_dim=33):
     manifest = []
     for split, episode in (("train", 1), ("test", 5)):
         (tmp_path / split).mkdir()
         for index in range(2):
             key = f"ep{episode}_skill{index}"
-            state = np.zeros(67, np.float32)
+            state = np.zeros(agent_dim + 34, np.float32)
             target = state.copy()
-            target[33] = .02 if split == "test" else .04
+            target[agent_dim] = .02 if split == "test" else .04
             payload = {
                 "episode_id.npy": numpy_bytes(episode),
                 "gnn_state.npy": numpy_bytes(state),
@@ -43,8 +43,9 @@ def dataset(tmp_path):
     return manifest
 
 
-def test_episode_split_and_train_test_isolation(tmp_path):
-    dataset(tmp_path)
+@pytest.mark.parametrize("agent_dim", [31, 33])
+def test_episode_split_and_train_test_isolation(tmp_path, agent_dim):
+    dataset(tmp_path, agent_dim)
     result = audit(tmp_path)
     assert result["ready_for_training"]
     assert result["episode_disjoint"]
@@ -52,8 +53,8 @@ def test_episode_split_and_train_test_isolation(tmp_path):
     train_keys, train = gnn_arrays(tmp_path, "train")
     test_keys, test = gnn_arrays(tmp_path, "test")
     assert not set(train_keys) & set(test_keys)
-    np.testing.assert_array_equal(train["next_states"][:, 33], np.full(2, .04, np.float32))
-    np.testing.assert_array_equal(test["next_states"][:, 33], np.full(2, .02, np.float32))
+    np.testing.assert_array_equal(train["next_states"][:, agent_dim], np.full(2, .04, np.float32))
+    np.testing.assert_array_equal(test["next_states"][:, agent_dim], np.full(2, .02, np.float32))
     assert {episode_split(i, 5) for i in range(1, 11)} == {"train", "test"}
     with pytest.raises(ValueError):
         episode_split(0, 5)
@@ -79,12 +80,13 @@ def test_archive_integrity_and_missing_pair_are_rejected(tmp_path):
         audit(tmp_path)
 
 
-def test_rigid_object_pose_to_common_points():
-    state = np.zeros(67)
-    state[33:36] = [1, 2, 3]
+@pytest.mark.parametrize("agent_dim", [31, 33])
+def test_rigid_object_pose_to_common_points(agent_dim):
+    state = np.zeros(agent_dim + 34)
+    state[agent_dim:agent_dim+3] = [1, 2, 3]
     target = state.copy()
-    target[33:36] += [0, 0, .1]
-    target[38] = np.pi / 2  # XYZ Euler z rotation in radians.
+    target[agent_dim:agent_dim+3] += [0, 0, .1]
+    target[agent_dim+5] = np.pi / 2  # XYZ Euler z rotation in radians.
     initial_points = np.array([[2, 2, 3], [1, 3, 3]])
     expected = np.array([[1, 3, 3.1], [0, 2, 3.1]])
     np.testing.assert_allclose(rigid_object_points(state, target, initial_points, 0), expected, atol=1e-10)

@@ -95,10 +95,11 @@ class PairedRecorder:
         obs = tree_map(lambda x: x.detach().cpu() if isinstance(x, torch.Tensor) else x, obs)
         self.record.append_observation(obs, self.env.env._context())
         door = raw.door_link
-        self.record.object_poses[-1]["cabinet_door"] = {
-            "scene_id": int(door.per_scene_id[0]),
-            "pose": door.pose.to_transformation_matrix()[0].detach().cpu().clone(),
-        }
+        if door is not None:
+            self.record.object_poses[-1]["cabinet_door"] = {
+                "scene_id": int(door.per_scene_id[0]),
+                "pose": door.pose.to_transformation_matrix()[0].detach().cpu().clone(),
+            }
 
     def start(self, episode_id, skill_id, decoded, action, initial):
         from exploration.trajectory_recorder import PrimitiveRecord
@@ -175,13 +176,14 @@ def collect(args):
         config = OmegaConf.create(payload["config"])
     settings = {**DEFAULTS, **OmegaConf.to_container(config.raps_actor, resolve=True)}
     if settings["skill_set"] != "compact6" or not settings["latched_gripper"]:
-        raise ValueError("This paired protocol requires compact6 with the 67D latched-gripper state")
+        raise ValueError("This paired protocol requires compact6 with latched-gripper state")
     torch.set_num_threads(1)
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     if args.output.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output}")
     env, env_config = make_env(episode_steps=int(config.episode_steps),
         centered_initial_tcp=bool(config.centered_initial_tcp),
+        cabinet_door=config.get("cabinet_door", False),
         obs_mode="rgb+position+segmentation",
         sensor_configs={"base_camera": {"width": 320, "height": 180}})
     try:
@@ -190,7 +192,7 @@ def collect(args):
             actor = SimpleNamespace(settings=settings)
         else:
             # Only the frozen actor chooses data; neither old dynamics nor replay train a learner.
-            backend = CEEUSBackend(agent_dim=33, action_dim=12, device=args.device)
+            backend = CEEUSBackend(agent_dim=encoder.contract()["agent_dim"], action_dim=12, device=args.device)
             actor = RAPSImaginationActor(backend, settings)
             if payload["state_contract"] != encoder.contract():
                 raise ValueError("Source state contract differs from paired collection")
@@ -260,6 +262,7 @@ def audit(directory):
     if len(by_key) != sum(bool(r["trainable"]) for r in rows):
         raise ValueError("Duplicate trainable keys in manifest")
     stats = {}
+    state_dim = None
     for split in ("train", "test"):
         count = moved = 0
         per_object = [0, 0]
@@ -270,16 +273,20 @@ def audit(directory):
             if key not in by_key or by_key[key]["split"] != split or int(array(p, "episode_id")) != by_key[key]["episode_id"]:
                 raise ValueError(f"Paired episode/split manifest differs: {key}")
             s, n = array(p, "gnn_state"), array(p, "gnn_next_state")
-            if s.shape != (67,) or n.shape != (67,) or array(p, "skill_action").shape != (12,):
+            if s.shape not in ((65,), (67,)) or n.shape != s.shape or array(p, "skill_action").shape != (12,):
                 raise ValueError(f"Unexpected GNN contract: {key}")
-            if not np.array_equal(s[57:], n[57:]):
+            if state_dim is not None and len(s) != state_dim:
+                raise ValueError("Mixed door state layouts in paired data")
+            state_dim = len(s)
+            agent_dim = state_dim - 34
+            if not np.array_equal(s[agent_dim+24:], n[agent_dim+24:]):
                 raise ValueError(f"Object static attributes changed across skill: {key}")
             if array(p, "camera_base_camera_initial_rgb").shape != (180, 320, 3):
                 raise ValueError(f"PointWorld image contract differs: {key}")
             for field in ("gnn_state", "gnn_next_state", "skill_action", "scene_flows", "robot_flows"):
                 if not np.isfinite(array(p, field)).all():
                     raise FloatingPointError(f"Nonfinite {field}: {key}")
-            active = [np.linalg.norm(n[i:i+3] - s[i:i+3]) >= .015 for i in (33, 45)]
+            active = [np.linalg.norm(n[i:i+3] - s[i:i+3]) >= .015 for i in (agent_dim, agent_dim+12)]
             per_object = [a + int(b) for a, b in zip(per_object, active)]
             moved += int(any(active)); count += 1
         stats[split] = dict(samples=count, episodes=len(sets[split]),
@@ -308,7 +315,7 @@ def train_gnn(args):
         raise FileExistsError(args.output)
     keys, replay = gnn_arrays(args.data, "train")
     torch.set_num_threads(1)
-    backend = CEEUSBackend(agent_dim=33, action_dim=12, seed=args.seed, device=args.device)
+    backend = CEEUSBackend(agent_dim=replay["states"].shape[-1]-34, action_dim=12, seed=args.seed, device=args.device)
     args.output.mkdir(parents=True)
     metrics = backend.train(replay, args.epochs)
     torch.save(dict(schema=SCHEMA, backend=backend.state_dict(), train_keys=keys,
@@ -320,7 +327,7 @@ def train_gnn(args):
 def rigid_object_points(state, target, points, object_index):
     """Express the GNN's endpoint pose prediction on the recorded scene points."""
     from scipy.spatial.transform import Rotation
-    offset = 33 + 12 * object_index
+    offset = len(state) - 34 + 12 * object_index
     initial_rotation = Rotation.from_euler("xyz", state[offset+3:offset+6]).as_matrix()
     predicted_rotation = Rotation.from_euler("xyz", target[offset+3:offset+6]).as_matrix()
     return ((points - state[offset:offset+3]) @ initial_rotation) @ predicted_rotation.T + target[offset:offset+3]
@@ -374,7 +381,8 @@ def evaluate(args):
     checkpoint = torch.load(args.gnn_checkpoint, map_location="cpu", weights_only=False)
     if checkpoint.get("schema") != SCHEMA or checkpoint["manifest_sha256"] != sha256(args.data / "manifest.jsonl"):
         raise ValueError("GNN checkpoint must belong to this paired dataset")
-    backend = CEEUSBackend(agent_dim=33, action_dim=12, seed=0, device=args.device)
+    agent_dim = checkpoint["backend"]["normalizers"]["input_normalizer_agent"]["mean"].shape[-1]
+    backend = CEEUSBackend(agent_dim=agent_dim, action_dim=12, seed=0, device=args.device)
     backend.load_state_dict(checkpoint["backend"])
     model = pw_args = None
     ensemble_path = getattr(args, "pointworld_ensemble", None)
@@ -426,7 +434,7 @@ def evaluate(args):
                 points = truth[0, mask]
                 goal = truth[-1, mask]
                 predicted = rigid_object_points(initial, prediction, points, object_index)
-                offset = 33 + object_index * 12
+                offset = backend.env.agent_dim + object_index * 12
                 row.update(status="evaluated",
                     moving=bool(np.linalg.norm(target[offset:offset+3]-initial[offset:offset+3]) >= .015),
                     gnn_epe_m=float(np.linalg.norm(predicted-goal, axis=-1).mean()),

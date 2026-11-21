@@ -208,10 +208,14 @@ class BatchedCabinetSensor:
         objects_root = torch.stack([local(a.pose.p) for a in self.objects], 1)
         objects_world = torch.stack([a.pose.p for a in self.objects], 1)
         robot = env.agent.robot
+        if env.door_joint is None:
+            door_angle = door_qvel = torch.zeros((env.num_envs, 1), device=env.device, dtype=torch.float64)
+        else:
+            door_angle = env.door_joint.qpos.double().reshape(env.num_envs, 1)
+            door_qvel = env.door_joint.qvel.double().reshape(env.num_envs, 1)
         state = [robot.qpos.double(), robot.qvel.double()*.05, local(tcp.pose.p),
                  euler_xyz(inv @ quaternion_matrix(tcp.pose.q)), vector(tcp.linear_velocity)*.05,
-                 vector(tcp.angular_velocity)*.05, env.door_joint.qpos.double().reshape(env.num_envs, 1),
-                 env.door_joint.qvel.double().reshape(env.num_envs, 1)*.05,
+                 vector(tcp.angular_velocity)*.05, door_angle, door_qvel*.05,
                  gripper_command.double().reshape(-1, 1)]
         for i, actor in enumerate(self.objects):
             state += [objects_root[:, i], euler_xyz(inv @ quaternion_matrix(actor.pose.q)),

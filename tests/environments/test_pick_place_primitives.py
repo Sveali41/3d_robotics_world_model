@@ -168,7 +168,7 @@ def test_grasp_then_place_phase_order_closed_transport_and_safe_home_route():
     assert all(row[1][3] == 1. for row in rows if row[0] in {"clear", "withdraw", "home_raise", "home_align", "home"})
     np.testing.assert_allclose(executor.primitive.requested_goals["preplace"], PREPLACE)
     assert pick_place_contract()["preplace_root_m"] == list(PREPLACE)
-    assert pick_place_contract()["version"] == 5
+    assert pick_place_contract()["version"] == 6
     for phase, _, position in rows:
         if phase in {"align", "home_align"}:
             assert position[0] <= OUTSIDE_X + .012
@@ -380,6 +380,28 @@ def test_planned_unsupported_place_never_opens(monkeypatch):
     rows = run_planned(executor, ctx, support=False)
     assert rows and all(row[1][-1] == -1. for row in rows)
     assert executor.primitive.status == "no_support"
+
+
+@pytest.mark.parametrize("stage", ["clear", "withdraw", "home_raise", "home_align", "home"])
+def test_released_cup_is_an_obstacle_during_egress(monkeypatch, stage):
+    executor, ctx, plans = planned_execution(monkeypatch)
+    ctx.held = True
+    ctx.ee_position[:] = [.45, .15, .40]
+    executor.gripper_command = -1.
+    executor.start(action("place"), ctx)
+    # The support gate releases its retention guard before opening.
+    ctx.held = False
+    executor._loss_guard = False
+    executor._phase(stage, ctx)
+    if stage == "clear":
+        np.testing.assert_allclose(executor._anchor, [.39, .15, .40], atol=1e-7)
+    goal = executor._anchor.copy()
+    if np.linalg.norm(goal-ctx.ee_position) < .012:
+        goal[0] -= .03
+    executor._motion_action(ctx, goal, 1.)
+    assert plans[-1][1]["allowed_contact_objects"] == ()
+    if stage == "clear":
+        assert plans[-1][1]["method"] == "bounded_ik"
 
 
 def test_planned_first_plan_failure_emits_one_closed_hold(monkeypatch):

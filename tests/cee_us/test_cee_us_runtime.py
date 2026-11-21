@@ -58,6 +58,12 @@ def test_cached_replay_append_views_capacity_and_arm_isolation():
     with pytest.raises(ValueError): runner.replay_view(a,14)
 
 
+def test_cached_replay_uses_backend_state_dimension():
+    cache=runner.allocate_replay(3,state_dim=48)
+    assert cache['states'].shape==(3,48)
+    assert cache['next_states'].shape==(3,48)
+
+
 @pytest.mark.parametrize('device',['cpu','cuda'])
 def test_training_batches_gradients_normalizers_and_adam_match(device):
     if device=='cuda' and not torch.cuda.is_available(): pytest.skip('CUDA unavailable')

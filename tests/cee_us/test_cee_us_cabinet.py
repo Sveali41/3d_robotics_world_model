@@ -8,6 +8,7 @@ from exploration.cee_us.cee_us_metrics import prediction_metrics, screen
 
 
 class Model:
+    state_dim = 66
     def __init__(self):
         self.resets = 0
 
@@ -221,3 +222,39 @@ def test_ee_baseline_preserves_recorded_protocol():
     assert config.bootstrap_steps + config.rounds * config.steps_per_round + config.evaluation_steps == 120000
     assert config.object_heuristic.approach_weight == 50.
     assert dict(config.object_heuristic.object_weights) == {'cabinet_item_16': 1., 'cabinet_item_17': 1.}
+
+
+@pytest.mark.parametrize('agent_dim,n_objects', [(30, 1), (31, 1), (31, 2), (33, 1), (33, 2), (32, 2)])
+def test_prediction_metrics_use_actual_object_layout(agent_dim, n_objects):
+    dimension = agent_dim + 17 * n_objects
+    class StaticModel:
+        env = SimpleNamespace(agent_dim=agent_dim, nObj=n_objects)
+        def rollout(self, states, actions):
+            return np.broadcast_to(states[None, :, None],
+                                   (5, len(states), actions.shape[1], dimension)).copy()
+    states = np.zeros((4, dimension))
+    next_states = states.copy()
+    next_states[:, agent_dim] = .02
+    next_states[:, agent_dim + 5] = .1
+    # Static geometry and controller memory must not enter physical pose errors.
+    states[:, agent_dim + 12 * n_objects:] = 9.
+    next_states[:, agent_dim + 12 * n_objects:] = 9.
+    if agent_dim in (31, 33):
+        next_states[:, agent_dim - 1] = 1.
+    replay = dict(states=states, next_states=next_states, actions=np.zeros((4, 31)),
+                  episode_ids=np.repeat([1, 2], 2))
+    result = prediction_metrics(StaticModel(), replay, horizons=(1, 3))
+    entry = result['1']
+    np.testing.assert_allclose(entry['object_position_mae_m'], [.02] + [0.] * (n_objects - 1))
+    np.testing.assert_allclose(entry['object_rotation_mae_rad'], [.1] + [0.] * (n_objects - 1))
+    assert entry['moved_object_windows'] == [4] + [0] * (n_objects - 1)
+    assert entry['moving_position_mae_m'] == [pytest.approx(.02)] + [None] * (n_objects - 1)
+    assert result['3']['windows'] == 0
+
+
+def test_prediction_metrics_reject_mismatched_object_layout():
+    backend = SimpleNamespace(env=SimpleNamespace(agent_dim=33, nObj=2))
+    replay = dict(states=np.zeros((2, 50)), next_states=np.zeros((2, 50)),
+                  actions=np.zeros((2, 31)), episode_ids=np.ones(2))
+    with pytest.raises(ValueError, match='object count differs'):
+        prediction_metrics(backend, replay)

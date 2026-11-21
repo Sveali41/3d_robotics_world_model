@@ -20,6 +20,197 @@ The goal is an experimental workflow connecting 3D interaction, data collection,
 | Household skills | `domain/household/` | PARTNR oracle skill interaction and a Habitat-Sim room viewer |
 | THOR environments | `domain/thor/` | iTHOR / ProcTHOR scene interaction |
 
+The current miniature cabinet and trapezoid cup protocol default to **no door**
+(`cabinet_door: false`), including all four baseline arms and uniform collection.
+This removes both the door entity and its planner collision geometry. Historical
+frozen door-present runs retain their original settings; their checkpoints and
+data are a different environment contract. See [the work log](docs/LOG.md) for
+the 2026-11-16 switch and bounded ID1 validation.
+
+New doorless world-model states also omit door angle and velocity from inputs,
+prediction targets, and intrinsic disagreement. The single-cup skill state is
+48D (31 agent/controller,12 cup dynamics,5 static attributes); the31D grasp
+action is unchanged. Door-present states keep their historical layout. Earlier
+doorless datasets/checkpoints with two reserved zero door channels are likewise
+a different contract and cannot resume in the new model without an explicit
+migration; retain frozen code for their historical evaluation.
+
+The current preset also uses `raps_actor.reconfigure_on_reset: true`. Existing
+episode resets rebuild the PhysX scene and rebind encoder handles; an unheld
+failed grasp continues in the same scene. Ordinary pose/velocity reset retained
+scene history that reproducibly changed a later grasp outcome despite identical
+observed state/action. Drive-target reset alone did not fix it; full scene reset
+reproduced the fresh-scene endpoint exactly. See the
+[reset isolation report](artifacts/uniform_wm_eval_20261116/controlled_fit_diagnosis/native_boundary_probe/reset_context_isolation/report.json).
+This is an explicit new collection contract, not a conversion of historical data.
+
+All current grasp-only baseline and uniform collectors now physically return to
+the reset default joint configuration before each grasp, retaining displaced
+objects after an unheld failure. The policy selects its action and the WM records
+its input only after checked homing succeeds (joint error <=0.001 rad, speed
+<=0.01 rad/s). Homing opens the fingers, withdraws straight to the exterior at
+fixed measured orientation, then plans back to the reset joint configuration;
+the exterior withdrawal prevents a direct return path from sweeping through the
+cup. Homing controls count toward the budget and are logged separately
+as nontrainable `return_default` maintenance; grasp targets remain pre-reset,
+pre-homing endpoints. Homing failures stop collection without a reset fallback.
+The action contract rejects historical checkpoints without this preparation rule;
+old frozen experiments remain unchanged. See the
+[bounded native validation](artifacts/default_before_grasp_20261117/report.json).
+Grasp-only evaluation now reports one-step WM errors: separate homing motions
+between attempts make direct multi-grasp rollouts without homing invalid.
+
+The current [trapezoid preset](configs/raps_gnn_actor_cabinet_grasp_trapezoid.yaml)
+selects bounded dynamic WM replay through `wm_replay`: 100 optimizer
+updates per fit (including bootstrap), retaining model and optimizer state.
+Every historical record remains eligible. Records with endpoint object motion
+of at least15mm receive individual weight `min(4,max(1,Nstatic/Nmoving))`;
+others receive weight1. There is no fixed fresh/contact quota or bin balancing.
+Normalization and actor updates still use all eligible history. Sampling is
+with replacement, followed by the original ensemble trainer's independent
+shuffle; no importance correction is applied. Only completed positive-duration
+macros are eligible. This protocol does not guarantee coverage or no forgetting.
+
+The preset's `wm_training` uses learning rate1e-4 and a shared10mm physical
+XYZ loss scale, retaining normalized auxiliary targets. Backend defaults retain
+the original1e-5 learning rate and upstream loss. The older protected sampler
+remains available through `wm_replay.mode: protected` (or its historical config
+without a mode), with explicit fresh/history and dynamic/contact/static quotas.
+Removing `wm_replay` selects the preserved full-replay epoch protocol. Resume
+requires matching state, action, training configuration, optimizer and RNG.
+See the [controlled diagnosis](artifacts/uniform_wm_eval_20261116/controlled_fit_diagnosis/diagnosis.json)
+for the fitting evidence and remaining generalization/contact limitations.
+
+Historical runs retain their frozen source/configuration and are not silently
+resumed under the new model or sampling protocol. The completed prior
+protected-replay four-arm run is recorded in
+[its comparison manifest](logs/raps_cup_doorless_protected_100k_20261116_161237/comparison.json).
+
+The repaired protocol completed the
+[fresh100k four-arm comparison](logs/raps_cup_doorless_verified_100k_20261117_000922/comparison.json).
+Its effective configs override the preset's198 rounds to48 (98000training plus
+2000evaluation controls per arm). The
+[new cell4 uniform data](artifacts/uniform_cell4_verified_20261117/data/manifest.json)
+use the same48D state and episode scene reconstruction. All four jobs and the
+[final validation](artifacts/wm_verified_retrain_20261117/eval_final_98k/report.json)
+completed successfully. Own moving-sample mean errors are1.35–9.70mm, but uniform
+successful-grasp means remain83.36–126.69mm; this single-seed,43-case evaluation
+does not establish adequate generalization or an intrinsic-exploration benefit.
+
+The fresh LSMR default-home comparison is recorded in
+[its comparison manifest](logs/raps_cup_lsmr_home_100k_20261117_145323/comparison.json)
+and [protocol](artifacts/wm_lsmr_home_20261117_145323/protocol.json).
+It uses the repaired LSMR executor, four fresh100k-control arms with twoCPUstreams
+each, original model/rewards, and newly collected cell4 uniform. Offline matched
+validation targets20k/40k/60k/80k/98k training controls. Previous paused data and
+checkpoints are not imported; input/reward representation changes remain unadopted.
+All four arms completed100000controls/exit0; all five matched validations finished.
+The [final98k WM report](artifacts/wm_lsmr_home_20261117_145323/eval_round_048/report.json)
+uses42uniform transitions (28successful). Mean cup endpoint errors C+H/C/H/R are
+57.04/81.19/56.92/80.80mm; success-only means34.64/115.29/30.88/87.24mm.
+Heuristic arms have lower mean errors here, but adding intrinsic has no demonstrated
+benefit and precision remains inadequate. One seed and a small development grid
+do not establish general ranking. See the saved learning_curve.json for all checkpoints.
+
+An isolated [reward-scale balancing pilot](artifacts/reward_balance_pilot_20261117/README.md)
+completed two matched10k-control arms (16k new physics total). Scaling full-state
+intrinsic relative to heuristic worsened mean uniform cup error from79.07 to152.20mm
+and reduced collection successes from9 to3. This single-seed pilot does not support
+adopting that variant; production reward definitions remain unchanged.
+
+A subsequent [weak-intrinsic pilot](artifacts/reward_weight_pilot_20261117/README.md)
+compared normalized beta0 versus0.1 at10k controls each. Final uniform means were
+113.09 versus112.61mm, collection successes10 versus8, and neither collected
+cell4/ID2. The tiny mean difference does not demonstrate benefit; no default changed.
+
+A subsequent [offline reward/actor audit](artifacts/reward_actor_audit_20261117/README.md)
+found higher-reward alternative poses that the weak-intrinsic actor rarely selects,
+even after integrating each pose's learned Z distribution. Most numerical intrinsic
+still concerns arm/TCP. This is prediction-only evidence, not a new execution or fix.
+
+The [frozen discrete-selection probe](artifacts/discrete_selection_probe_20261117/README.md)
+implements experimental three-pose reranking at unchanged cell/Z and separates a
+cup-only signal counterfactual. Predicted rewards improve on the frozen proposals;
+physical success/generalization are untested and production selection is unchanged.
+
+A [10%conditional pose-mixture pilot](artifacts/pose_mixture_pilot_20261117/README.md)
+completed two matched10k-control arms. The mixture preserves every pose's sampling
+floor in training and collection, but final uniform means79.56/79.28mm show no clear
+accuracy gain; the underlying actor remains concentrated. Production is unchanged.
+
+An [original100k error decomposition](artifacts/wm_error_decomposition_20261118/README.md)
+finds unchanged coarsepose/Zcoverage after20k in heuristic arms and missing
+pose-specific failure/success outcomes. Additional concentrated controls do not
+establish improved generalization; no new training or resume was launched.
+
+The subsequent [paired coverage pilot](artifacts/coverage_pilot_20261118/README.md)
+tests this diagnosis from the same original combination checkpoint: original
+actor collection versus stratified cell4 pose/height collection, 8000 new
+controls and 400 WM/actor updates per arm. Model, loss and historical data stay
+matched; existing development validation is never added to training.
+Both arms completed and passed independent validation. Final development mean
+errors are57.29mm control versus44.71mm coverage; failed-case prediction improves
+but successful-case mean error worsens. This single-seed pilot does not establish
+uniform improvement or change production defaults.
+
+An [all-state evaluation](artifacts/wm_all_state_eval_20261118/report.json) of
+the original four round048 checkpoints covers every48D channel, with
+[group MAE/RMSE](artifacts/wm_all_state_eval_20261118/group_metrics.csv) and
+[per-channel results](artifacts/wm_all_state_eval_20261118/channel_metrics.csv)
+for successful, failed and all development cases. These are component errors
+in stated physical units, not the historical3D cup-distance metric or a
+mixed-unit aggregate. Encoded velocities are divided by the saved0.05s timestep;
+Euler errors retain the original unwrapped component representation. Invariant
+static attributes are copied and their zero error is not learned accuracy.
+The subsequent user-requested [overall MSE](artifacts/wm_all_state_eval_20261118/total_mse.csv)
+also reports raw encoded48D and dynamic43D MSE for each split. It retains mixed
+native units and velocity-dt encoding, and differs from the normalized,
+cup-XYZ-weighted training loss and from mean ensemble-member loss.
+
+A [pure-intrinsic cup-only pilot](artifacts/object_intrinsic_pilot_20261118/README.md)
+completed matched10k-control arms with full versus cup-only disagreement. Uniform
+means159.52/155.61mm and within10mm13/9 show no clear accuracy benefit; cup-only
+visited all three cell4poses but successful experience remained scarce. Production
+is unchanged and the original200k continuation remains paused.
+
+The [100k object-intrinsic comparison](artifacts/object_intrinsic_100k_20261118/README.md)
+is running fresh matched full/cup-only arms after the short pilot; historical four-arm
+continuation remains paused. Check recorded processes before any relaunch.
+
+The superseded paused default-home pilot is recorded in
+[its four-arm manifest](logs/raps_cup_default_home_100k_20261117_143022/comparison.json)
+and [validation protocol](artifacts/wm_default_home_20261117_143022/protocol.json).
+Random stopped at8k after a numerical homing failure; the other three arms are
+paused by user request at12k saved controls. Uniform finished51queries with
+40eligible/24successful transitions; no matched20k validation exists.
+The run started fresh with the earlier IK and exterior-withdrawal homing rule,
+100000 controls per arm, two CPU streams, original48D inputs/rewards, and a new
+cell4 uniform development collection. One-shot offline evaluation targets matched
+20k/40k/60k/80k/98k training checkpoints; the last2000 controls are policy evaluation.
+Representation and reward-normalization experiments remain unadopted; this pilot
+does not test those proposed fixes. Historical failed startup evidence is kept
+separate, and the current source snapshot is immutable.
+
+Current bounded Cartesian IK uses an absolute1e-4rad, joint-limit-aware central
+Jacobian and LSMR trust-region subproblem solver. The former relative finite-difference step became too small near zero
+joint angles for native float32 FK, causing a reproducible false IK failure.
+Position/orientation acceptance remains1mm/0.1degree; all collision checks remain
+active. This changes execution behavior and is versioned in the action contract
+as `bounded_ik_solver: absolute_central_jacobian_1e-4rad_lsmr_v2`. Keep historical data
+and checkpoints with their frozen solver; collect new data under the new contract.
+See the [bounded IK diagnosis](artifacts/ik_micro_boundary_20261117/README.md).
+The later [homing failure diagnosis](artifacts/home_ik_failure_20261117/README.md)
+reproduces a dense trust-region stall at the original200-evaluation cap. LSMR
+passes that full withdrawal and nearby targets with unchanged tolerances/limits;
+[physical replay validation](artifacts/home_ik_repair_validation_20261117/report.json)
+replays708original controls with bitwise-identical states then returns home in114
+controls. Training remains paused; old frozen processes/checkpoints and uniform
+data retain the earlier solver contract and are not silently migrated.
+The [post-IK diagnostic report](artifacts/wm_post_ik_diagnosis_20261117/README.md)
+replays old outliers, tests physically consistent input perturbations, and
+separates fixed-data fitting from reward action rankings. Its input-floor and
+rotation-vector variants are diagnostic copies, not new production defaults.
+
 ## Code map
 
 ```text
@@ -60,6 +251,47 @@ Run commands from the project root. Environments have different dependency and a
 ### Cabinet environments and exploration
 
 Cabinet experiments use the existing `rlPractice` Conda environment. The base configuration is `configs/exploration.yaml`. Its default is `policy=ppo`, so running `python main.py` directly enters training.
+
+The default miniature cabinet scene now uses the ten-cell `trapezoid_4_3_2_1`
+placement layout with only the original cup at cell 4 (body XY `[.410, 0]` m),
+in robot-root coordinates. Set `cabinet_item_layout: two_upper_second_row`
+to restore the cup/bowl pair (bowl at cell 6, `[.410, .240]` m).
+The cell table is defined in [cabinet_grid.py](domain/robocasa/cabinet_grid.py).
+This selects the reset objects and placement; object geometry, spawn height, robot reset,
+door settings and control timing are unchanged. Explicit legacy and compact
+experiment presets retain their layouts. It does not switch the learned action
+schema or integrate the separate per-cell grasp diagnostic routes. Existing CEE-US
+and RAPS presets retain their two-object scene. The fresh
+[cup-only trapezoid preset](configs/raps_gnn_actor_cabinet_grasp_trapezoid.yaml)
+aligns the one-object encoder, world model, actor and four-arm comparison interface.
+For the current trapezoid grid, learned orientation selection now permits only
+IDs 0, 1 and 2 (yaw 0, -15 and +15 degrees, all pitch 0). Grasp-only actions have
+30 cell/orientation branches plus one continuous Z value (31D). Historical legacy
+and compact grid experiments retain their five-pose interfaces.
+The current learning protocol keeps grasp TCP Z at 0.692–0.772 m in the robot-root
+frame; the trapezoid schema defaults to this same range. Its deepest-cell success
+at diagnostic Z0.812 is outside the learning range and does not validate that cell
+under this restricted protocol.
+
+The new preset fixes the cup at cell4 on reset, retains the physical open door,
+and uses the previous baseline's centered robot reset: the miniature scene's
+uncentered reset was rejected for initial hand/sideboard overlap. Its state is50D
+(33 agent/controller +12 cup dynamics +5 cup static); the WM consumes the same31D
+canonical action as the actor and collector. All four arms use identical scene,
+action, retention and control budgets. Use a fresh WM/actor/replay: historical
+67D two-object states and five-pose action checkpoints are incompatible. This
+interface does not establish ten-cell physical coverage or learned success.
+The current preset disables grasp preflight/rejection sampling; proposed actions
+go directly to execution, which retains motion planning and collision checks.
+It now uses two fixed CPU sampling streams on two spawned processes. Each stream
+starts a fresh scene per collection call; real-step quotas and RNG seeds do not
+depend on completion order. Results merge before the existing WM-then-actor
+updates. This is a new sampling protocol and requires fresh artifacts; it does
+not reproduce the historical single-environment data stream. See
+[CPU sampling protocol and validation](docs/pick_place_primitives.md#fixed-cpu-sampling-streams).
+See [default placement details](docs/pick_place_primitives.md#default-miniature-cabinet-placement).
+The [native reset scene viewer](artifacts/cabinet_coverage_20261114/minienv.html)
+shows both objects at these positions, alongside the actual reset robot and door.
 
 The following commands only inspect configuration or command help:
 
@@ -146,7 +378,7 @@ The persistent [grasp-retention and primitive contract](docs/pick_place_primitiv
 
 The experimental `--pick-place-primitives` flag replaces the selected RAPS skill set with two macros and a shared three-slot argument bank (5D action): grasp uses TCP XYZ and place uses object-target XY, with its inactive Z slot zeroed. It defaults to false; `--no-pick-place-primitives` overrides a YAML opt-in. YAML uses `raps_actor.pick_place_primitives: true`. The resolved run enables gripper-command memory and disables the legacy contact/drop/placement hooks, because the macros own those gates. This mode selects the existing joint planner (`motion_execution: planner`, `action_mode: joint_position`), requires a fresh 5D WM/actor and a new output directory. Existing split7 replay/checkpoints are incompatible; strict resume checks remain enabled. The original skill set remains selected when the flag is disabled. To bind a physically confirmed grasp until opening, add `--grasp-retention constraint` (YAML `raps_actor.grasp_retention: constraint`). This CPU-physics mode locks the object's current pose relative to the hand with a native positional constraint and angular drive, then removes it on opening, reset or close. `--grasp-retention friction` preserves contact/friction holding and is the default. Settings, action contracts and recorded rows distinguish these modes; strict resume rejects switching them. Under the previous version 4 TCP-XYZ placement contract, cup and bowl each passed one complete planned grasp/place/release/home example plus 20 postcheck controls; those fixed-layout examples do not validate version 5 object-target placement.
 
-`grasp(x,y,z)` opens, approaches the bounded TCP position with the common reset orientation, closes, confirms continuous grasp, lifts 8 cm and carries to the shared intermediate TCP `[0.18, 0, 0.84]`. `place(x,y)` targets the object collision-AABB center projected onto the lower shelf. The measured confirmed TCP-relative payload geometry compensates XY grasp offset and computes the shelf-touch TCP height. Place preserves closure, retreats through shared preplace TCP `[0.28, 0.15, 0.56]`, approaches 4 cm above the predicted shelf-touch TCP, descends until settled shelf support, opens, clears the object and returns through preplace to the episode's initial TCP. Cabinet-exterior preplace transport may rotate when TCP X<0.29 m, restoring the common fixed orientation at the preplace endpoint; grasp, placement and cabinet-interior motion retain fixed orientation. The interface and route are macro contract version 5; earlier macro checkpoints are incompatible. Return poses are TCP poses, not exact joint configurations. Placement uses actual held-object collision geometry, with no object-type offsets, automatic object selection or teleportation. Missing/lost grasp, unsupported release and timeouts are recorded as failures; failed completed macros remain valid WM endpoints, while budget-truncated macros are excluded.
+`grasp(x,y,z)` opens, approaches the bounded TCP position with the common reset orientation, closes, confirms continuous grasp, lifts 8 cm and carries to the shared intermediate TCP `[0.18, 0, 0.84]`. `place(x,y)` targets the object collision-AABB center projected onto the lower shelf. The measured confirmed TCP-relative payload geometry compensates XY grasp offset and computes the shelf-touch TCP height. Place preserves closure, retreats through shared preplace TCP `[0.28, 0.15, 0.56]`, approaches 4 cm above the predicted shelf-touch TCP, descends until settled shelf support, opens, clears the object and returns through preplace to the episode's initial TCP. Cabinet-exterior preplace transport may rotate when TCP X<0.29 m, restoring the common fixed orientation at the preplace endpoint; grasp, placement and cabinet-interior motion retain fixed orientation. The interface and route are macro contract version 6; supported release now retracts open fingers 6 cm outward at fixed height with strict cup collision checks before exterior withdrawal. Earlier macro checkpoints are incompatible. Return poses are TCP poses, not exact joint configurations. Placement uses actual held-object collision geometry, with no object-type offsets, automatic object selection or teleportation. Missing/lost grasp, unsupported release and timeouts are recorded as failures; failed completed macros remain valid WM endpoints, while budget-truncated macros are excluded.
 
 All coordinates are **robot controller-root meters**, not world coordinates:
 
@@ -622,3 +854,131 @@ Apply only to worktrees that do not already contain these changes. Skip empty pa
 - Update this README when goals, module responsibilities, or main entry points change. Record individual development tasks in [docs/LOG.md](docs/LOG.md).
 - Agents start with root [AGENTS.md](AGENTS.md), then follow [docs/AGENTS.md](docs/AGENTS.md). Commit only when requested, and subsequently record the mapping between log entries and actual Git commits.
 - Write project-owned files in English, including documentation, comments, plans, and logs. Preserve upstream source and generated patches when changing their language would interfere with reproduction.
+
+Optional grasp feasibility filtering uses
+`configs/raps_gnn_actor_cabinet_pick_place_preflight.yaml`. It checks open-hand
+retreat/alignment/approach before physical collection, resamples rejected proposals
+from the same policy, and records zero-control rejections in `preflight.jsonl`.
+It preserves the original preset and does not guarantee physical grasp success.
+See [pick/place preflight semantics and comparison limits](docs/pick_place_primitives.md#optional-grasp-preflight-before-physical-collection).
+
+The fresh [target-reward pick/place preset](configs/raps_gnn_actor_cabinet_pick_place_target.yaml)
+retains both 5D grasp/place actions. It narrows the shared grasp TCP target Z to
+0.692–0.772 m (2–10 cm above the upper support) and enables
+`raps_actor.grasp_target_heuristic: true`: grasp XYZ targets near the nearest
+eligible object's current center receive `50 * exp(-distance_m / 0.1)` instead of
+endpoint-distance progress. Place has zero heuristic and retains curiosity and its execution; successful
+grasps retain their payload for place. Curiosity-only and random disable the heuristic
+through the existing comparison launcher. Use a fresh WM/actor/replay and output
+directory because the Z normalization and reward contract changed. See
+[the height and reward definitions](docs/pick_place_primitives.md#grasp-target-proximity-and-narrower-height).
+
+To explore grasp targets without place, use
+[configs/raps_gnn_actor_cabinet_grasp_only.yaml](configs/raps_gnn_actor_cabinet_grasp_only.yaml).
+Both grasp-only presets now set `cabinet_door: false`, omitting the door, handle
+and hinge from simulation and planning. Historical presets keep their original door.
+The doorless state contract requires a fresh run; no existing run is restarted.
+This opt-in 4D action schema retains the narrowed Z range and target-proximity reward,
+resets after complete successful grasps, and continues the current scene after failures.
+Use a fresh run; dual-action checkpoints are incompatible. The existing comparison
+launcher supports all four arms with the same preset and `--include-heuristic-only`.
+See [grasp-only lifecycle and protocol](docs/pick_place_primitives.md#optional-grasp-only-exploration).
+
+Grasp-only collection engineering optimizations are independently opt-in through
+`collection_optimizations: true` or `--collection-optimizations`.
+`--no-collection-optimizations` overrides YAML; omission retains YAML, default false.
+They cache immutable FCL geometry per planner, refresh poses/groups/attachments on
+every plan, and share collector contexts and raw finger-force values only until
+the next physics step or reset. Shape identity/content/dimension/scale/margin
+changes rebuild geometry; reset/reconfigure replaces the planner. Grasp booleans,
+binding feedback, safety counters, IK solutions and paths remain uncached. The
+optimized logger retains all fields, numeric precision and flush boundaries.
+No simulator substep callback or planner search budget is changed.
+
+[The fast preset](configs/raps_gnn_actor_cabinet_grasp_only_fast.yaml) differs from
+the grasp-only baseline only by enabling collection and existing runtime
+optimizations. It retains 25 WM epochs, 100 actor updates, FP32, batch sizes,
+NumPy sampling, rewards, grasp bounds and physics settings. This command starts
+a **new training run**; use a new directory and do not apply it to a running job:
+
+```bash
+python -m exploration.cee_us.cee_us_cabinet train \
+  --config configs/raps_gnn_actor_cabinet_grasp_only_fast.yaml \
+  --output logs/raps_grasp_only_fast_<unique-name>
+```
+
+Training resume still compares the complete saved configuration strictly.
+Changing either optimization flag requires a separate run; an explicit false
+and a historically absent key remain distinct under this check. The manifest
+records the effective collection option even when absent from old YAML.
+
+`timings.jsonl` collection rows contain `collection_components`: action proposals,
+preflight, actual execution planning, `env.step`, state/context and raw contact
+reads, feedback, observation, snapshots and JSON conversion/serialization/writes.
+Planner geometry, IK, path-search and TOPP timings are also included. These are
+**nested timings**, not additive components: actual planning is inside execution,
+planner total spans preflight and execution, TOPP can be inside path search, and
+contact/context work can be inside env.step, snapshots or feedback. CUDA synchronizes at
+outer stage boundaries, never for individual timers. Existing training/checkpoint
+timings cover replay, upload, normalizers, WM, actor/critic, snapshot and compression.
+
+To reproduce the bounded engineering measurement without a formal training run:
+
+```bash
+python -m exploration.diagnostics.benchmark_grasp_optimizations \
+  --checkpoint <frozen-grasp-only.pt> --output <new-measurement-directory>
+```
+
+The checkpoint requires its sibling `.replay.npz` and `.low_level.npz`. Defaults
+alternate reference, geometry-only, reads-only, runtime-only and combined modes
+in three blocks of 32 physical controls per mode (96 total per mode, hard limit
+300 including warmup). Offline warmup uses zero physics controls. Every measured
+fit uses the same first up-to-251 replay rows, all 25 epochs and 100 actor updates,
+with model/optimizer/normalizer/metrics checked at rtol=1e-5, atol=1e-6 and RNG
+checked exactly. Save completion is included. This is a bounded pipeline proxy:
+it does not measure full grasp throughput, production replay scale or saving
+overlap. Native RRT is unseeded and shared-machine load is recorded; the 10%
+end-to-end target remains unconfirmed. See the actual measurement and provenance
+in `artifacts/grasp_optimizations_20261114/`.
+
+The completed November 14 bounded audit measured total medians of 138.629 s
+reference and 137.957 s combined (0.48% lower), below the observed variability:
+**speedup is unconfirmed**. Geometry construction fell from 0.121 s to 0.024 s,
+while preflight occupied about 98.1% of collection in these short initial segments.
+All paired training/RNG checks passed. These measurements used the historical
+door-present scene and four real failed-grasp replay endpoints with an untrained
+frozen model; another GPU process consumed about 14.1 GiB during measurement.
+They do not establish full-history or current doorless-preset performance.
+See [the complete timing report](artifacts/grasp_optimizations_20261114/report.md).
+
+
+For a shared discrete 3 by 4 XY grid on the upper grasp shelf and lower placement
+shelf, use `configs/raps_gnn_actor_cabinet_pick_place_grid.yaml`. The cup starts in
+row 2, column 1 and the bowl in row 2, column 2; reset preserves these assignments.
+Grasp and place select one of the same 12 XY cells; only grasp Z is continuous.
+All three grid presets enable five learned grasp orientations with
+`raps_actor.grasp_orientation_candidates: true`: yaw/pitch degrees `(0,0)`,
+`(-15,0)`, `(+15,0)`, `(-45,+30)`, `(+45,+30)`, relative to the reset TCP orientation
+as `Rz(root yaw) @ Ry(root pitch) @ R_reset`. The policy selects cell, Z and
+orientation ID; the planner solves the selected pose without moving target XYZ or
+substituting another orientation. Reorientation occurs during exterior alignment;
+entry retains the selected orientation. Grasp-only actions are 61D and dual actions
+73D, including one continuous Z slot. With the option absent or false the earlier
+13D/25D grid schema is preserved. Models and replay must match the selected contract.
+The new `raps_gnn_actor_cabinet_grasp_grid.yaml` and `_fast.yaml` presets retain
+grasp-only exploration. All three omit the cabinet door. Use a fresh model/replay
+and output directory; older presets retain continuous XY behavior. See
+[grid coordinates, initial placement and categorical action contracts](docs/pick_place_primitives.md#shared-discrete-3-by-4-shelf-grid).
+
+For the separate, physically tested compact grasp samples, use
+`configs/raps_gnn_actor_cabinet_grasp_grid_compact.yaml` (or `_fast.yaml`) and
+`configs/raps_gnn_actor_cabinet_pick_place_grid_compact.yaml`. They select
+`raps_actor.grid_layout: compact_3x4`: X `[.375,.405,.435]`, Y `[0,.08,.16,.24]` m.
+Single-cup native trials have completed full grasp/lift/withdrawal at all twelve
+sample positions; these closely spaced samples are not twelve simultaneous cup
+slots. Compact initial XY uses the native actor origin, with cup cell4 and bowl
+cell7. The legacy grid and its initial collision-center convention remain available.
+The production-v6 executor also completed one full lower placement at XY
+`[.435,.24]`; twelve lower destinations remain unverified. See
+[compact protocol and limits](docs/pick_place_primitives.md#compact-reachable-grasp-samples)
+and [native diagnostic evidence](artifacts/cabinet_coverage_20261114/README.md).

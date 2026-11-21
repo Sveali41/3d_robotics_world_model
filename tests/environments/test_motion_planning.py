@@ -1,5 +1,6 @@
 """Native-free checks of the collision planner's safety boundaries."""
 import json
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,13 @@ from domain.robocasa.motion_planning import (
 
 def pose(p=(0., 0., 0.), q=(1., 0., 0., 0.)):
     return SimpleNamespace(p=np.asarray(p), q=np.asarray(q))
+
+
+def test_planning_error_preserves_diagnostics_across_worker_boundary():
+    error = MotionPlanningError("home_tracking_failed", {"status": "tracking_error"})
+    restored = pickle.loads(pickle.dumps(error))
+    assert restored.status == error.status and restored.detail == error.detail
+    assert str(restored) == str(error)
 
 
 @pytest.mark.parametrize("position,quaternion", [

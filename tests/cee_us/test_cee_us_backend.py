@@ -1,5 +1,6 @@
 """Focused CPU checks of the fixed upstream model and iCEM adapter."""
 import json
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -16,6 +17,14 @@ def backend():
                         iterations=3, elites=4, batch_size=4)
 
 
+def test_removed_door_checkpoint_layout_is_rejected_before_loading_weights():
+    legacy = CEEUSBackend(agent_dim=33, hidden_dim=8, attach_icem=False).state_dict()
+    doorless = CEEUSBackend(agent_dim=31, hidden_dim=8, attach_icem=False)
+    with pytest.raises(ValueError, match='door state layout changed'):
+        doorless.load_state_dict(legacy)
+    doorless.load_state_dict(doorless.state_dict())
+
+
 def replay():
     rng = np.random.default_rng(11)
     states = rng.normal(size=(8, 66)).astype(np.float32)
@@ -23,6 +32,82 @@ def replay():
     next_states[:, :56] += rng.normal(size=(8, 56)).astype(np.float32) * .1
     return dict(states=states, actions=rng.uniform(-1, 1, (8, 4)).astype(np.float32),
                 next_states=next_states)
+
+
+def test_physical_position_loss_preserves_auxiliary_and_isotropic_xyz(monkeypatch):
+    backend = CEEUSBackend(agent_dim=31, num_objects=1, hidden_dim=8, attach_icem=False,
+                           position_loss_scale_m=.01)
+    model = backend.model
+    pred_agent = torch.ones(2, 3, 31, requires_grad=True)
+    pred_objects = torch.zeros(2, 3, 1, 12, requires_grad=True)
+    model.output_obj_normalizer.std = torch.tensor([[.02, .04, .08] + [1.] * 9])
+    target_agent, target_objects = torch.zeros_like(pred_agent), torch.zeros_like(pred_objects)
+    monkeypatch.setattr(model, '_process_batch', lambda batch: (None, None, None, None, target_agent, target_objects))
+    monkeypatch.setattr(model.model, 'forward', lambda *args: (pred_agent, pred_objects))
+    with torch.no_grad():
+        pred_objects[..., :3] = torch.tensor([.01 / .02, .01 / .04, .01 / .08])
+        pred_objects[..., 3:] = 2.
+    expected = 2 * ((31 + 9 * 4) / 43 + 1)
+    loss = model.loss({})
+    torch.testing.assert_close(loss, torch.tensor(expected))
+    loss.backward()
+    assert torch.isfinite(pred_objects.grad).all() and torch.count_nonzero(pred_objects.grad) == pred_objects.numel()
+    model.output_obj_normalizer.std *= 2
+    torch.testing.assert_close(model.loss({}), torch.tensor(expected + 6))
+
+
+@pytest.mark.parametrize('optimized', [False, True])
+def test_physical_loss_sampled_training_and_checkpoint_contract(optimized):
+    options = dict(hidden_dim=8, batch_size=4, attach_icem=False, runtime_optimizations=optimized,
+                   learning_rate=1e-4, position_loss_scale_m=.01)
+    backend = CEEUSBackend(**options)
+    before = deepcopy(backend.state_dict())
+    assert backend.train(replay(), 1, training_indices=np.arange(8))['updates'] == 2
+    assert any(not torch.equal(value, backend.state_dict()['model'][key]) for key, value in before['model'].items())
+    backend.load_state_dict(backend.state_dict())
+    default = CEEUSBackend(hidden_dim=8, batch_size=4, attach_icem=False)
+    legacy = default.state_dict()
+    del legacy['training_contract']
+    default.load_state_dict(legacy)
+    with pytest.raises(ValueError, match='training_contract'):
+        backend.load_state_dict(legacy)
+    with pytest.raises(ValueError, match='training_contract'):
+        default.load_state_dict(backend.state_dict())
+
+
+@pytest.mark.parametrize('option', ['learning_rate', 'position_loss_scale_m'])
+@pytest.mark.parametrize('value', [0, -1, float('nan'), float('inf'), True])
+def test_invalid_training_contract(option, value):
+    with pytest.raises(ValueError, match=option):
+        CEEUSBackend(**{option: value})
+
+
+@pytest.mark.parametrize('optimized', [False, True])
+def test_sampled_training_fixed_updates_full_history_normalization(optimized):
+    torch.set_num_threads(1)
+    options = dict(hidden_dim=8, batch_size=4, runtime_optimizations=optimized)
+    backend = CEEUSBackend(**options)
+    reference = CEEUSBackend(**options)
+    data = replay()
+    indices = np.tile(np.array([0, 0, 1, 1]), 3)
+    reference.train(data, epochs=1)
+    metrics = backend.train(data, epochs=1, training_indices=indices)
+    assert metrics['updates'] == 3 and metrics['finitegrad']
+    for name in backend.normalizer_names:
+        expected = getattr(reference.model, name)
+        actual = getattr(backend.model, name)
+        torch.testing.assert_close(actual.mean, expected.mean, rtol=0, atol=0)
+        torch.testing.assert_close(actual.std, expected.std, rtol=0, atol=0)
+    before = deepcopy(backend.state_dict())
+    metrics = backend.train(data, epochs=1, training_indices=indices)
+    assert metrics['updates'] == 3 and metrics['total_updates'] == 6
+    assert all(state['step'] == 6 for state in backend.model.optimizer.state.values())
+    assert any(not torch.equal(value, backend.state_dict()['model'][key])
+               for key, value in before['model'].items())
+    with pytest.raises(ValueError, match='complete minibatches'):
+        backend.train(data, epochs=1, training_indices=indices[:-1])
+    with pytest.raises(ValueError, match='valid one-dimensional'):
+        backend.train(data, epochs=1, training_indices=[999, 0, 0, 0])
 
 
 def test_model_only_backend_matches_icem_backend():

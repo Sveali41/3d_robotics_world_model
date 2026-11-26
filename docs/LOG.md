@@ -2920,3 +2920,16 @@ Records the goal, key changes, validation, and handoff information for each task
 - Validation: AST parsing passed all56pending Python files; yaml.safe_load passed all12pending YAML configs in pinnedSIF with PYTHONNOUSERSITE=1 and original NumPy1.26shim. Pending-file scan found no obvious private-key/token patterns or files above10MiB. git diff --check passed. No full suite, fitting or physics rerun because this task packages already-recorded changes; no new source behavior was introduced.
 - Upstream snapshot check: python3 scripts/snapshot_upstream_patches.py --check cannot verify the uninitialized PointWorld/ManiSkill checkouts. No submodule pointers/content changed. Independently verified all3stored patch SHA256 values and gitlink commits against patches/upstream.json; initialized RAPS checkout is clean and at its pinned commit. Existing patch files retained unchanged, no dependency initialization/download or speculative snapshot rewrite.
 - Commit/push pending at preparation. The exact commit, represented Log-Entry trailers and eventual push outcome will be recorded after the operation; retain post-commit mapping uncommitted according to project rules.
+
+## 2026-11-21 18:05:52 Europe/London — Plan a paired layout curriculum for two-shelf pick and place
+
+- Log ID: 20261121-180552-paired-pick-place-curriculum-plan
+- Git status: Uncommitted. Executor: Codex. Created [the execution plan](plans/paired_pick_place_curriculum.md) at the user's request, to test whether error-conditioned layout editing improves GNN prediction across unseen pick/place and distractor combinations.
+- The plan stages reset-only placement and loaded-route checks, matched layout collection, a masked PPO editor with signed learning progress and bounded novelty, and a matched uniform-edit baseline on sealed layout pairs. It keeps hand-defined interaction labels out of the editor and separates training replay, course scoring, and final evaluation. It retains the existing single-cup baseline and the unfinished cabinet coverage investigation.
+- Validation: a Python document check resolved all six relative links and verified four ordered phases and clean whitespace; git diff --check passed. Documentation only: no code, configuration, attachments or experiment state changed, and no simulation or training was started. The next implementation gate is the dual-object reset and physical pick/carry/place coverage check; full lower-shelf coverage is unverified.
+
+## 2026-11-21 18:15:04 Europe/London — Translate the paired curriculum plan into Chinese
+
+- Log ID: 20261121-181504-paired-curriculum-chinese
+- Git status: Uncommitted. Executor: Codex. Translated [the existing execution plan](plans/paired_pick_place_curriculum.md) into Chinese at the user's request. Preserved its scope, technical protocol, four phases, acceptance gates and links.
+- Validation: a Python document check confirmed six valid relative links, four ordered phases, fifteen checklist items and clean whitespace; git diff --check passed. Documentation only; no code changes, simulation or training. The physical coverage gate remains unverified.
